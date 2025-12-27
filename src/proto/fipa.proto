@@ -1,0 +1,540 @@
+// FIPA-WASM Agent System Protocol Buffer Definitions
+// Version: 0.2.0
+
+syntax = "proto3";
+package fipa.v1;
+
+// =============================================================================
+// Core Agent Types
+// =============================================================================
+
+// Agent identifier with optional addressing information
+message AgentId {
+    // Unique agent name
+    string name = 1;
+    // Transport addresses (e.g., "/ip4/192.168.1.1/tcp/9000")
+    repeated string addresses = 2;
+    // Name resolver services
+    repeated string resolvers = 3;
+}
+
+// =============================================================================
+// FIPA Performatives
+// =============================================================================
+
+// FIPA ACL performative types
+enum Performative {
+    PERFORMATIVE_UNSPECIFIED = 0;
+    PERFORMATIVE_ACCEPT_PROPOSAL = 1;
+    PERFORMATIVE_AGREE = 2;
+    PERFORMATIVE_CANCEL = 3;
+    PERFORMATIVE_CFP = 4;
+    PERFORMATIVE_CONFIRM = 5;
+    PERFORMATIVE_DISCONFIRM = 6;
+    PERFORMATIVE_FAILURE = 7;
+    PERFORMATIVE_INFORM = 8;
+    PERFORMATIVE_INFORM_DONE = 9;
+    PERFORMATIVE_INFORM_IF = 10;
+    PERFORMATIVE_INFORM_REF = 11;
+    PERFORMATIVE_INFORM_RESULT = 12;
+    PERFORMATIVE_NOT_UNDERSTOOD = 13;
+    PERFORMATIVE_PROPAGATE = 14;
+    PERFORMATIVE_PROPOSE = 15;
+    PERFORMATIVE_PROXY = 16;
+    PERFORMATIVE_QUERY_IF = 17;
+    PERFORMATIVE_QUERY_REF = 18;
+    PERFORMATIVE_REFUSE = 19;
+    PERFORMATIVE_REJECT_PROPOSAL = 20;
+    PERFORMATIVE_REQUEST = 21;
+    PERFORMATIVE_REQUEST_WHEN = 22;
+    PERFORMATIVE_REQUEST_WHENEVER = 23;
+    PERFORMATIVE_SUBSCRIBE = 24;
+}
+
+// =============================================================================
+// FIPA Protocol Types
+// =============================================================================
+
+// FIPA interaction protocol identifiers
+enum ProtocolType {
+    PROTOCOL_UNSPECIFIED = 0;
+    PROTOCOL_REQUEST = 1;
+    PROTOCOL_QUERY = 2;
+    PROTOCOL_REQUEST_WHEN = 3;
+    PROTOCOL_CONTRACT_NET = 4;
+    PROTOCOL_ITERATED_CONTRACT_NET = 5;
+    PROTOCOL_PROPOSE = 6;
+    PROTOCOL_BROKERING = 7;
+    PROTOCOL_RECRUITING = 8;
+    PROTOCOL_SUBSCRIBE = 9;
+    PROTOCOL_ENGLISH_AUCTION = 10;
+    PROTOCOL_DUTCH_AUCTION = 11;
+}
+
+// =============================================================================
+// ACL Message
+// =============================================================================
+
+// Complete FIPA ACL message structure
+message AclMessage {
+    // Unique message identifier
+    string message_id = 1;
+
+    // Message performative (required)
+    Performative performative = 2;
+
+    // Sender agent (required)
+    AgentId sender = 3;
+
+    // Receiver agents (at least one required)
+    repeated AgentId receivers = 4;
+
+    // Reply-to agent (if different from sender)
+    optional AgentId reply_to = 5;
+
+    // Protocol being followed
+    optional ProtocolType protocol = 6;
+
+    // Conversation identifier
+    optional string conversation_id = 7;
+
+    // Message ID this replies to
+    optional string in_reply_to = 8;
+
+    // Expected reply message ID
+    optional string reply_with = 9;
+
+    // Reply deadline (Unix timestamp milliseconds)
+    optional int64 reply_by = 10;
+
+    // Content language (e.g., "fipa-sl", "json", "xml")
+    optional string language = 11;
+
+    // Content encoding (e.g., "utf-8", "base64")
+    optional string encoding = 12;
+
+    // Ontology reference
+    optional string ontology = 13;
+
+    // Message content (binary, interpreted per language/encoding)
+    bytes content = 14;
+
+    // User-defined properties
+    map<string, string> user_properties = 15;
+}
+
+// =============================================================================
+// Network Envelope
+// =============================================================================
+
+// Wrapper for network transport
+message MessageEnvelope {
+    // Source node identifier
+    string source_node = 1;
+
+    // Target node identifier (empty for broadcast)
+    string target_node = 2;
+
+    // Monotonic sequence number from source
+    uint64 sequence = 3;
+
+    // Send timestamp (Unix milliseconds)
+    int64 timestamp = 4;
+
+    // Payload type
+    oneof payload {
+        AclMessage acl_message = 10;
+        AgentMigration migration = 11;
+        RegistryUpdate registry_update = 12;
+        ConsensusMessage consensus = 13;
+        HealthPing health_ping = 14;
+    }
+}
+
+// =============================================================================
+// Agent Migration
+// =============================================================================
+
+// Agent capabilities and permissions
+message AgentCapabilities {
+    // Maximum memory in bytes
+    uint64 max_memory_bytes = 1;
+
+    // Maximum execution time per invocation in milliseconds
+    uint64 max_execution_time_ms = 2;
+
+    // Allowed protocols
+    repeated ProtocolType allowed_protocols = 3;
+
+    // Network access level
+    NetworkAccessLevel network_access = 4;
+
+    // Persistent storage quota in bytes
+    uint64 storage_quota_bytes = 5;
+
+    // Whether agent can migrate
+    bool migration_allowed = 6;
+
+    // Whether agent can spawn sub-agents
+    bool spawn_allowed = 7;
+
+    // Allowed network destinations (for RESTRICTED level)
+    repeated string allowed_destinations = 8;
+}
+
+// Network access levels
+enum NetworkAccessLevel {
+    NETWORK_ACCESS_NONE = 0;
+    NETWORK_ACCESS_LOCAL = 1;
+    NETWORK_ACCESS_RESTRICTED = 2;
+    NETWORK_ACCESS_UNRESTRICTED = 3;
+}
+
+// Agent state snapshot
+message AgentState {
+    // Linear memory snapshot
+    bytes memory = 1;
+
+    // Global variable values
+    repeated GlobalValue globals = 2;
+
+    // Conversation state snapshots
+    repeated ConversationSnapshot conversations = 3;
+
+    // Persistent storage data
+    map<string, bytes> storage = 4;
+
+    // Custom agent data
+    bytes custom_data = 5;
+}
+
+// WASM global variable value
+message GlobalValue {
+    string name = 1;
+    oneof value {
+        int32 i32_val = 2;
+        int64 i64_val = 3;
+        uint32 f32_bits = 4;  // IEEE 754 bits
+        uint64 f64_bits = 5;  // IEEE 754 bits
+    }
+}
+
+// Conversation state for migration
+message ConversationSnapshot {
+    string conversation_id = 1;
+    ProtocolType protocol = 2;
+    string state_name = 3;
+    bytes state_data = 4;
+    repeated AclMessage message_history = 5;
+}
+
+// Complete agent migration package
+message AgentMigration {
+    // Agent identifier
+    AgentId agent_id = 1;
+
+    // WASM module bytecode (may be omitted if target has cached copy)
+    optional bytes wasm_module = 2;
+
+    // SHA-256 hash of WASM module (for cache lookup)
+    bytes wasm_hash = 3;
+
+    // Agent state snapshot
+    AgentState state = 4;
+
+    // Agent capabilities
+    AgentCapabilities capabilities = 5;
+
+    // Migration history (list of node IDs)
+    repeated string migration_history = 6;
+
+    // Migration reason
+    MigrationReason reason = 7;
+
+    // Cryptographic signature
+    bytes signature = 8;
+
+    // Signer's public key (Ed25519)
+    bytes public_key = 9;
+
+    // Signature timestamp
+    int64 timestamp = 10;
+}
+
+// Why migration occurred
+enum MigrationReason {
+    MIGRATION_REASON_UNSPECIFIED = 0;
+    MIGRATION_REASON_USER_REQUESTED = 1;
+    MIGRATION_REASON_LOAD_BALANCING = 2;
+    MIGRATION_REASON_NETWORK_OPTIMIZATION = 3;
+    MIGRATION_REASON_FOLLOW_DATA = 4;
+    MIGRATION_REASON_NODE_SHUTDOWN = 5;
+}
+
+// =============================================================================
+// Registry and Discovery
+// =============================================================================
+
+// Registry update message
+message RegistryUpdate {
+    oneof update {
+        AgentRegistration register_agent = 1;
+        AgentDeregistration deregister_agent = 2;
+        ServiceRegistration register_service = 3;
+        ServiceDeregistration deregister_service = 4;
+        NodeAnnouncement announce_node = 5;
+    }
+}
+
+// Register an agent on a node
+message AgentRegistration {
+    AgentId agent_id = 1;
+    string node_id = 2;
+    repeated ServiceDescription services = 3;
+    AgentCapabilities capabilities = 4;
+}
+
+// Deregister an agent
+message AgentDeregistration {
+    AgentId agent_id = 1;
+    string reason = 2;
+}
+
+// Register a service
+message ServiceRegistration {
+    AgentId provider = 1;
+    ServiceDescription service = 2;
+}
+
+// Deregister a service
+message ServiceDeregistration {
+    AgentId provider = 1;
+    string service_name = 2;
+}
+
+// Service description
+message ServiceDescription {
+    string name = 1;
+    string description = 2;
+    repeated ProtocolType protocols = 3;
+    string ontology = 4;
+    map<string, string> properties = 5;
+}
+
+// Node announcement
+message NodeAnnouncement {
+    string node_id = 1;
+    repeated string addresses = 2;
+    NodeCapabilities capabilities = 3;
+    NodeMetrics metrics = 4;
+    int64 timestamp = 5;
+}
+
+// Node capabilities
+message NodeCapabilities {
+    uint32 max_agents = 1;
+    uint64 total_memory = 2;
+    repeated ProtocolType supported_protocols = 3;
+    SecurityLevel security_level = 4;
+    string wasm_runtime_version = 5;
+}
+
+// Security trust levels
+enum SecurityLevel {
+    SECURITY_LEVEL_UNTRUSTED = 0;
+    SECURITY_LEVEL_RESTRICTED = 1;
+    SECURITY_LEVEL_TRUSTED = 2;
+}
+
+// Node runtime metrics
+message NodeMetrics {
+    float cpu_usage_percent = 1;
+    uint64 memory_used_bytes = 2;
+    uint64 memory_available_bytes = 3;
+    uint32 active_agents = 4;
+    uint32 active_conversations = 5;
+    uint64 messages_sent = 6;
+    uint64 messages_received = 7;
+    uint32 average_latency_ms = 8;
+}
+
+// =============================================================================
+// Raft Consensus
+// =============================================================================
+
+// Consensus message wrapper (for libp2p gossip)
+message ConsensusMessage {
+    uint64 term = 1;
+    bytes data = 2;  // Serialized openraft message
+}
+
+// =============================================================================
+// Health Checking
+// =============================================================================
+
+// Health ping for liveness checking
+message HealthPing {
+    string node_id = 1;
+    int64 timestamp = 2;
+    optional NodeMetrics metrics = 3;
+}
+
+// =============================================================================
+// gRPC Service Definitions
+// =============================================================================
+
+// Agent messaging service
+service FipaAgentService {
+    // Send an ACL message to an agent
+    rpc SendMessage(AclMessage) returns (SendMessageResponse);
+
+    // Stream messages for an agent (server streaming)
+    rpc SubscribeMessages(SubscribeRequest) returns (stream AclMessage);
+
+    // Find an agent's location
+    rpc FindAgent(FindAgentRequest) returns (FindAgentResponse);
+
+    // Find agents providing a service
+    rpc FindService(FindServiceRequest) returns (FindServiceResponse);
+
+    // Migrate an agent to this node
+    rpc MigrateAgent(AgentMigration) returns (MigrationResponse);
+
+    // Clone an agent to this node
+    rpc CloneAgent(AgentMigration) returns (MigrationResponse);
+
+    // Request WASM module by hash
+    rpc GetWasmModule(WasmModuleRequest) returns (WasmModuleResponse);
+
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // Get node info
+    rpc GetNodeInfo(NodeInfoRequest) returns (NodeAnnouncement);
+}
+
+// Consensus service for Raft
+service ConsensusService {
+    // Raft vote
+    rpc Vote(VoteRequest) returns (VoteResponse);
+
+    // Raft append entries
+    rpc Append(AppendRequest) returns (AppendResponse);
+
+    // Raft install snapshot
+    rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+}
+
+// New Raft messages for openraft serialized payloads
+message VoteRequest {
+    uint64 term = 1;
+    uint64 candidate_id = 2;
+    optional LogId last_log_id = 3;
+}
+
+message VoteResponse {
+    bool vote_granted = 1;
+    uint64 term = 2;
+    bytes data = 3;  // Serialized openraft VoteResponse
+}
+
+message AppendRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    bytes entries = 3;  // Serialized openraft AppendEntriesRequest
+}
+
+message AppendResponse {
+    bool success = 1;
+    uint64 term = 2;
+    bytes data = 3;  // Serialized openraft AppendEntriesResponse
+}
+
+message SnapshotRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    string snapshot_id = 3;
+    bytes data = 4;  // Serialized openraft InstallSnapshotRequest
+}
+
+message SnapshotResponse {
+    bool success = 1;
+    uint64 term = 2;
+    bytes data = 3;  // Serialized openraft InstallSnapshotResponse
+}
+
+message LogId {
+    uint64 term = 1;
+    uint64 index = 2;
+}
+
+// =============================================================================
+// Service Request/Response Messages
+// =============================================================================
+
+message SendMessageResponse {
+    bool success = 1;
+    string message_id = 2;
+    optional string error = 3;
+}
+
+message SubscribeRequest {
+    AgentId agent_id = 1;
+    optional string filter_conversation = 2;
+    optional ProtocolType filter_protocol = 3;
+}
+
+message FindAgentRequest {
+    AgentId agent_id = 1;
+}
+
+message FindAgentResponse {
+    bool found = 1;
+    optional string node_id = 2;
+    optional NodeAnnouncement node_info = 3;
+}
+
+message FindServiceRequest {
+    string service_name = 1;
+    optional ProtocolType required_protocol = 2;
+    optional string ontology = 3;
+    uint32 max_results = 4;
+}
+
+message FindServiceResponse {
+    repeated ServiceProvider providers = 1;
+}
+
+message ServiceProvider {
+    AgentId agent_id = 1;
+    string node_id = 2;
+    ServiceDescription service = 3;
+    NodeMetrics node_metrics = 4;
+}
+
+message MigrationResponse {
+    bool success = 1;
+    optional string error = 2;
+    optional string new_location = 3;
+}
+
+message WasmModuleRequest {
+    bytes hash = 1;
+}
+
+message WasmModuleResponse {
+    bool found = 1;
+    optional bytes module = 2;
+}
+
+message HealthCheckRequest {
+    bool include_metrics = 1;
+}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    string status = 2;
+    optional NodeMetrics metrics = 3;
+}
+
+message NodeInfoRequest {}

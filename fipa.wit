@@ -1,0 +1,418 @@
+// fipa.wit - WASI Preview 2 Component Model Interface
+// FIPA Agent System WebAssembly Interface Types
+
+package fipa:agent@0.2.0;
+
+/// Core messaging interface for FIPA communication
+interface messaging {
+    /// FIPA ACL performative types
+    enum performative {
+        accept-proposal,
+        agree,
+        cancel,
+        cfp,
+        confirm,
+        disconfirm,
+        failure,
+        inform,
+        inform-done,
+        inform-if,
+        inform-ref,
+        inform-result,
+        not-understood,
+        propagate,
+        propose,
+        proxy,
+        query-if,
+        query-ref,
+        refuse,
+        reject-proposal,
+        request,
+        request-when,
+        request-whenever,
+        subscribe,
+    }
+
+    /// FIPA interaction protocol types
+    enum protocol-type {
+        request,
+        query,
+        request-when,
+        contract-net,
+        iterated-contract-net,
+        propose,
+        brokering,
+        recruiting,
+        subscribe,
+        english-auction,
+        dutch-auction,
+    }
+
+    /// Agent identifier with optional addressing
+    record agent-id {
+        /// Unique agent name
+        name: string,
+        /// Transport addresses
+        addresses: list<string>,
+    }
+
+    /// Complete ACL message structure
+    record acl-message {
+        /// Unique message identifier
+        message-id: string,
+        /// Message performative
+        performative: performative,
+        /// Sending agent
+        sender: agent-id,
+        /// Receiving agents
+        receivers: list<agent-id>,
+        /// Protocol being followed
+        protocol: option<protocol-type>,
+        /// Conversation identifier
+        conversation-id: option<string>,
+        /// Message ID this replies to
+        in-reply-to: option<string>,
+        /// Reply deadline (Unix timestamp ms)
+        reply-by: option<u64>,
+        /// Content language
+        language: option<string>,
+        /// Ontology reference
+        ontology: option<string>,
+        /// Message content (binary)
+        content: list<u8>,
+    }
+
+    /// Messaging error types
+    variant messaging-error {
+        /// Target agent not found
+        agent-not-found(string),
+        /// Protocol not permitted
+        protocol-not-allowed(protocol-type),
+        /// Network communication error
+        network-error(string),
+        /// Operation timed out
+        timeout,
+        /// Invalid message format
+        invalid-message(string),
+        /// Conversation not found
+        conversation-not-found(string),
+    }
+
+    /// Send a message to one or more agents
+    send-message: func(message: acl-message) -> result<string, messaging-error>;
+
+    /// Receive the next available message (non-blocking)
+    receive-message: func() -> option<acl-message>;
+
+    /// Check if messages are available
+    has-messages: func() -> bool;
+
+    /// Start a new conversation with specified protocol
+    start-conversation: func(
+        protocol: protocol-type,
+        participants: list<agent-id>,
+    ) -> result<string, messaging-error>;
+
+    /// Send a reply within an existing conversation
+    reply: func(
+        conversation-id: string,
+        performative: performative,
+        content: list<u8>,
+    ) -> result<string, messaging-error>;
+
+    /// End a conversation
+    end-conversation: func(
+        conversation-id: string,
+    ) -> result<_, messaging-error>;
+
+    /// Find agents by service name
+    find-agents-by-service: func(
+        service-name: string,
+    ) -> result<list<agent-id>, messaging-error>;
+
+    /// Find agents by protocol capability
+    find-agents-by-protocol: func(
+        protocol: protocol-type,
+    ) -> result<list<agent-id>, messaging-error>;
+}
+
+/// Agent lifecycle and identity interface
+interface lifecycle {
+    use messaging.{agent-id};
+
+    /// Agent state
+    enum agent-state {
+        starting,
+        running,
+        paused,
+        migrating,
+        stopping,
+        stopped,
+    }
+
+    /// Get this agent's identifier
+    get-agent-id: func() -> agent-id;
+
+    /// Get current agent state
+    get-state: func() -> agent-state;
+
+    /// Request graceful shutdown
+    request-shutdown: func();
+
+    /// Check if shutdown has been requested
+    is-shutdown-requested: func() -> bool;
+
+    /// Pause agent execution
+    pause: func();
+
+    /// Resume agent execution
+    resume: func();
+}
+
+/// Service registration and discovery interface
+interface services {
+    use messaging.{protocol-type, messaging-error};
+
+    /// Service description
+    record service-description {
+        /// Service name
+        name: string,
+        /// Human-readable description
+        description: string,
+        /// Protocols supported by this service
+        protocols: list<protocol-type>,
+        /// Ontology reference
+        ontology: option<string>,
+        /// Custom properties
+        properties: list<tuple<string, string>>,
+    }
+
+    /// Register a service this agent provides
+    register-service: func(
+        service: service-description,
+    ) -> result<_, messaging-error>;
+
+    /// Deregister a service
+    deregister-service: func(
+        service-name: string,
+    ) -> result<_, messaging-error>;
+
+    /// List services this agent provides
+    list-my-services: func() -> list<service-description>;
+
+    /// Update service description
+    update-service: func(
+        service: service-description,
+    ) -> result<_, messaging-error>;
+}
+
+/// Node and migration interface
+interface migration {
+    use messaging.{agent-id, messaging-error};
+
+    /// Node information
+    record node-info {
+        /// Node identifier
+        id: string,
+        /// Current load (0.0 to 1.0)
+        load: f32,
+        /// Network latency in milliseconds
+        latency-ms: u32,
+        /// Available memory in bytes
+        available-memory: u64,
+        /// Number of active agents
+        active-agents: u32,
+    }
+
+    /// Reason for migration
+    enum migration-reason {
+        user-requested,
+        load-balancing,
+        network-optimization,
+        follow-data,
+        node-shutdown,
+    }
+
+    /// Get current node ID
+    get-current-node: func() -> string;
+
+    /// List available nodes for migration
+    list-nodes: func() -> list<node-info>;
+
+    /// Get information about a specific node
+    get-node-info: func(node-id: string) -> option<node-info>;
+
+    /// Request migration to another node
+    migrate-to: func(
+        node-id: string,
+        reason: migration-reason,
+    ) -> result<_, messaging-error>;
+
+    /// Clone this agent to another node
+    clone-to: func(
+        node-id: string,
+    ) -> result<agent-id, messaging-error>;
+
+    /// Check if migration is in progress
+    is-migrating: func() -> bool;
+
+    /// Get migration history
+    get-migration-history: func() -> list<string>;
+}
+
+/// Persistent storage interface
+interface storage {
+    /// Storage error types
+    variant storage-error {
+        /// Key not found
+        not-found(string),
+        /// Storage quota exceeded
+        quota-exceeded,
+        /// I/O error
+        io-error(string),
+        /// Serialization error
+        serialization-error(string),
+        /// Permission denied
+        permission-denied,
+    }
+
+    /// Store data with a key
+    store: func(key: string, value: list<u8>) -> result<_, storage-error>;
+
+    /// Load data by key
+    load: func(key: string) -> result<list<u8>, storage-error>;
+
+    /// Delete data by key
+    delete: func(key: string) -> result<_, storage-error>;
+
+    /// Check if key exists
+    exists: func(key: string) -> bool;
+
+    /// List all stored keys
+    list-keys: func() -> list<string>;
+
+    /// List keys with prefix
+    list-keys-with-prefix: func(prefix: string) -> list<string>;
+
+    /// Get storage usage in bytes
+    get-usage: func() -> u64;
+
+    /// Get storage quota in bytes
+    get-quota: func() -> u64;
+}
+
+/// Logging interface
+interface logging {
+    /// Log levels
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Write a log message
+    log: func(level: log-level, message: string);
+
+    /// Write a structured log with fields
+    log-structured: func(
+        level: log-level,
+        message: string,
+        fields: list<tuple<string, string>>,
+    );
+
+    /// Check if log level is enabled
+    is-enabled: func(level: log-level) -> bool;
+}
+
+/// Time and scheduling interface
+interface timing {
+    /// Get current timestamp in milliseconds since epoch
+    now: func() -> u64;
+
+    /// Get monotonic time in nanoseconds (for measuring durations)
+    monotonic-now: func() -> u64;
+
+    /// Schedule a timer (returns timer ID)
+    schedule: func(delay-ms: u64) -> u64;
+
+    /// Schedule a repeating timer
+    schedule-repeating: func(interval-ms: u64) -> u64;
+
+    /// Cancel a scheduled timer
+    cancel-timer: func(timer-id: u64) -> bool;
+
+    /// Check if a timer has fired
+    timer-fired: func(timer-id: u64) -> bool;
+
+    /// Get all fired timers and clear them
+    get-fired-timers: func() -> list<u64>;
+}
+
+/// Random number generation interface
+interface random {
+    /// Get random bytes
+    get-random-bytes: func(len: u32) -> list<u8>;
+
+    /// Get random u64
+    get-random-u64: func() -> u64;
+
+    /// Get random f64 in range [0, 1)
+    get-random-f64: func() -> f64;
+}
+
+/// The complete agent world - full featured agent
+world agent {
+    // Standard WASI imports
+    import wasi:io/poll@0.2.0;
+    import wasi:io/streams@0.2.0;
+    import wasi:clocks/monotonic-clock@0.2.0;
+    import wasi:random/random@0.2.0;
+
+    // FIPA-specific imports
+    import messaging;
+    import lifecycle;
+    import services;
+    import migration;
+    import storage;
+    import logging;
+    import timing;
+    import random;
+
+    /// Initialize the agent
+    export init: func();
+
+    /// Run one tick of the agent's main loop
+    /// Returns false to indicate the agent should stop
+    export run: func() -> bool;
+
+    /// Shutdown the agent gracefully
+    export shutdown: func();
+
+    /// Handle an incoming message
+    /// Returns true if the message was handled
+    export handle-message: func(message: messaging.acl-message) -> bool;
+}
+
+/// Minimal agent world for simple/stateless agents
+world minimal-agent {
+    import messaging;
+    import lifecycle;
+    import logging;
+
+    export init: func();
+    export run: func() -> bool;
+    export shutdown: func();
+}
+
+/// Stateless handler world - for pure message handlers
+world stateless-handler {
+    import messaging;
+    import logging;
+
+    /// Handle a message and optionally return a response
+    export handle-message: func(
+        message: messaging.acl-message
+    ) -> option<messaging.acl-message>;
+}
