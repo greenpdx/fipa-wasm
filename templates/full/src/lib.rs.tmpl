@@ -1,0 +1,155 @@
+//! {{agent_name}} - FIPA WASM Agent
+//!
+//! A full-featured FIPA agent with access to all host interfaces:
+//! - messaging: Send/receive ACL messages
+//! - lifecycle: Agent identity and state management
+//! - services: Service registration and discovery
+//! - migration: Node migration and cloning
+//! - storage: Persistent key-value storage
+//! - logging: Structured logging
+//! - timing: Timers and scheduling
+//! - random: Random number generation
+
+wit_bindgen::generate!({
+    world: "agent",
+    path: "wit/fipa.wit",
+});
+
+use exports::fipa::agent::guest::Guest;
+use fipa::agent::messaging::{self, AclMessage, Performative};
+use fipa::agent::lifecycle;
+use fipa::agent::logging::{self, LogLevel};
+use fipa::agent::storage;
+
+/// Agent state - stored in WASM linear memory
+struct {{agent_type}} {
+    initialized: bool,
+    message_count: u64,
+}
+
+impl Default for {{agent_type}} {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            message_count: 0,
+        }
+    }
+}
+
+/// Global agent instance
+static mut AGENT: Option<{{agent_type}}> = None;
+
+fn get_agent() -> &'static mut {{agent_type}} {
+    unsafe {
+        AGENT.get_or_insert_with({{agent_type}}::default)
+    }
+}
+
+impl Guest for {{agent_type}} {
+    /// Initialize the agent - called once on startup
+    fn init() {
+        let agent = get_agent();
+
+        logging::log(LogLevel::Info, &format!("Initializing {{agent_name}}..."));
+
+        // Get our agent ID
+        let id = lifecycle::get_agent_id();
+        logging::log(LogLevel::Info, &format!("Agent ID: {}", id.name));
+
+        // Load any persisted state
+        if let Ok(data) = storage::load("message_count") {
+            if data.len() == 8 {
+                agent.message_count = u64::from_le_bytes(data.try_into().unwrap());
+                logging::log(LogLevel::Debug, &format!("Restored message count: {}", agent.message_count));
+            }
+        }
+
+        agent.initialized = true;
+        logging::log(LogLevel::Info, "{{agent_name}} initialized successfully");
+    }
+
+    /// Main loop tick - called repeatedly
+    /// Return false to stop the agent
+    fn run() -> bool {
+        let agent = get_agent();
+
+        // Check for shutdown request
+        if lifecycle::is_shutdown_requested() {
+            logging::log(LogLevel::Info, "Shutdown requested, stopping...");
+            return false;
+        }
+
+        // Process any pending messages
+        while let Some(msg) = messaging::receive_message() {
+            Self::handle_message(msg);
+        }
+
+        // Agent-specific logic goes here
+        // ...
+
+        true // Continue running
+    }
+
+    /// Graceful shutdown - called before agent stops
+    fn shutdown() {
+        let agent = get_agent();
+
+        logging::log(LogLevel::Info, "Shutting down {{agent_name}}...");
+
+        // Persist state
+        let _ = storage::store("message_count", &agent.message_count.to_le_bytes());
+
+        logging::log(LogLevel::Info, "{{agent_name}} shutdown complete");
+    }
+
+    /// Handle an incoming ACL message
+    /// Return true if message was handled
+    fn handle_message(message: AclMessage) -> bool {
+        let agent = get_agent();
+        agent.message_count += 1;
+
+        logging::log(LogLevel::Debug, &format!(
+            "Received message: {} from {}",
+            message.message_id,
+            message.sender.name
+        ));
+
+        match message.performative {
+            Performative::Request => {
+                // Handle request - send back inform
+                logging::log(LogLevel::Info, "Handling request...");
+
+                let reply = AclMessage {
+                    message_id: format!("reply-{}", message.message_id),
+                    performative: Performative::Inform,
+                    sender: lifecycle::get_agent_id(),
+                    receivers: vec![message.sender.clone()],
+                    protocol: message.protocol,
+                    conversation_id: message.conversation_id.clone(),
+                    in_reply_to: Some(message.message_id.clone()),
+                    reply_by: None,
+                    language: Some("text/plain".to_string()),
+                    ontology: None,
+                    content: b"Request handled".to_vec(),
+                };
+
+                let _ = messaging::send_message(&reply);
+                true
+            }
+            Performative::QueryRef => {
+                // Handle query
+                logging::log(LogLevel::Info, "Handling query...");
+                true
+            }
+            _ => {
+                logging::log(LogLevel::Debug, &format!(
+                    "Unhandled performative: {:?}",
+                    message.performative
+                ));
+                false
+            }
+        }
+    }
+}
+
+export!({{agent_type}});

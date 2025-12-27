@@ -95,6 +95,10 @@ derive_more = { version = "2.0", features = ["display", "from", "into"] }
 tonic-prost-build = "0.14"
 prost-build = "0.14"
 
+[patch.crates-io]
+# Workaround for cc 1.2.51 compatibility issue with target-lexicon
+cc = { git = "https://github.com/rust-lang/cc-rs" }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.19"
@@ -118,6 +122,10 @@ path = "src/bin/agent_node.rs"
 [[bin]]
 name = "fipa-cli"
 path = "src/bin/cli.rs"
+
+[[bin]]
+name = "fipa-agent-new"
+path = "src/bin/agent_new.rs"
 
 [[bench]]
 name = "protocol_bench"

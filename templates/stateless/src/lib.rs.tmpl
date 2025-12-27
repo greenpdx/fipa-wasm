@@ -1,0 +1,72 @@
+//! {{agent_name}} - Stateless FIPA Handler
+//!
+//! A pure message handler with no state. Perfect for:
+//! - Simple request-response patterns
+//! - Stateless services
+//! - Message transformers
+
+wit_bindgen::generate!({
+    world: "stateless-handler",
+    path: "wit/fipa.wit",
+});
+
+use exports::fipa::agent::guest::Guest;
+use fipa::agent::messaging::{AclMessage, AgentId, Performative};
+use fipa::agent::logging::{self, LogLevel};
+
+struct {{agent_type}};
+
+impl Guest for {{agent_type}} {
+    /// Handle a message and optionally return a reply
+    fn handle_message(message: AclMessage) -> Option<AclMessage> {
+        logging::log(LogLevel::Debug, &format!(
+            "Handling {} from {}",
+            message.message_id,
+            message.sender.name
+        ));
+
+        match message.performative {
+            Performative::Request => {
+                // Process request and return response
+                Some(AclMessage {
+                    message_id: format!("reply-{}", message.message_id),
+                    performative: Performative::Inform,
+                    sender: AgentId {
+                        name: "{{agent_name}}".to_string(),
+                        addresses: vec![],
+                    },
+                    receivers: vec![message.sender],
+                    protocol: message.protocol,
+                    conversation_id: message.conversation_id,
+                    in_reply_to: Some(message.message_id),
+                    reply_by: None,
+                    language: Some("text/plain".to_string()),
+                    ontology: None,
+                    content: b"Processed".to_vec(),
+                })
+            }
+            Performative::QueryIf | Performative::QueryRef => {
+                // Handle queries
+                Some(AclMessage {
+                    message_id: format!("reply-{}", message.message_id),
+                    performative: Performative::InformRef,
+                    sender: AgentId {
+                        name: "{{agent_name}}".to_string(),
+                        addresses: vec![],
+                    },
+                    receivers: vec![message.sender],
+                    protocol: message.protocol,
+                    conversation_id: message.conversation_id,
+                    in_reply_to: Some(message.message_id),
+                    reply_by: None,
+                    language: None,
+                    ontology: None,
+                    content: b"Query result".to_vec(),
+                })
+            }
+            _ => None, // No reply for other performatives
+        }
+    }
+}
+
+export!({{agent_type}});

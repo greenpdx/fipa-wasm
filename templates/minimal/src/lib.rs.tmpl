@@ -1,0 +1,72 @@
+//! {{agent_name}} - Minimal FIPA WASM Agent
+//!
+//! A lightweight agent with basic interfaces:
+//! - messaging: Send/receive ACL messages
+//! - lifecycle: Agent identity and state
+//! - logging: Basic logging
+
+wit_bindgen::generate!({
+    world: "minimal-agent",
+    path: "wit/fipa.wit",
+});
+
+use exports::fipa::agent::guest::Guest;
+use fipa::agent::messaging::{self, AclMessage, Performative};
+use fipa::agent::lifecycle;
+use fipa::agent::logging::{self, LogLevel};
+
+struct {{agent_type}};
+
+impl Guest for {{agent_type}} {
+    /// Initialize the agent
+    fn init() {
+        let id = lifecycle::get_agent_id();
+        logging::log(LogLevel::Info, &format!("{{agent_name}} started as {}", id.name));
+    }
+
+    /// Main loop tick
+    fn run() -> bool {
+        // Check for shutdown
+        if lifecycle::is_shutdown_requested() {
+            return false;
+        }
+
+        // Process messages
+        while let Some(msg) = messaging::receive_message() {
+            Self::process_message(msg);
+        }
+
+        true
+    }
+
+    /// Shutdown
+    fn shutdown() {
+        logging::log(LogLevel::Info, "{{agent_name}} shutting down");
+    }
+}
+
+impl {{agent_type}} {
+    fn process_message(msg: AclMessage) {
+        logging::log(LogLevel::Debug, &format!("Message from: {}", msg.sender.name));
+
+        // Echo back for requests
+        if matches!(msg.performative, Performative::Request) {
+            let reply = AclMessage {
+                message_id: format!("reply-{}", msg.message_id),
+                performative: Performative::Inform,
+                sender: lifecycle::get_agent_id(),
+                receivers: vec![msg.sender],
+                protocol: msg.protocol,
+                conversation_id: msg.conversation_id,
+                in_reply_to: Some(msg.message_id),
+                reply_by: None,
+                language: None,
+                ontology: None,
+                content: msg.content, // Echo content
+            };
+            let _ = messaging::send_message(&reply);
+        }
+    }
+}
+
+export!({{agent_type}});

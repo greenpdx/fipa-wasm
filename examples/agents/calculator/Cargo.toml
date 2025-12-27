@@ -1,0 +1,16 @@
+[package]
+name = "calculator-agent"
+version = "0.1.0"
+edition = "2021"
+description = "FIPA Calculator Agent - Demonstrates service registration and query protocol"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.36"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
