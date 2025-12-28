@@ -1,1 +1,0 @@
-/home/svvs/fipa/examples/agents/calculator/target/wasm32-wasip1/debug/calculator_agent.wasm: /home/svvs/fipa/examples/agents/calculator/src/lib.rs /home/svvs/fipa/examples/agents/calculator/wit/fipa.wit
