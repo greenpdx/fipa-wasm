@@ -59,9 +59,22 @@ This system combines:
 - **Recruiting**: Recruiter-assisted agent discovery
 - **Subscribe**: Continuous notifications
 
-## Getting Started
+## Quick Start
 
-### Prerequisites
+### Docker (Recommended)
+
+```bash
+# Start single node
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+### Build from Source
 
 ```bash
 # Install Rust
@@ -72,16 +85,9 @@ rustup target add wasm32-wasip1
 
 # Install wasmtime (optional, for testing)
 curl https://wasmtime.dev/install.sh -sSf | bash
-```
 
-### Building the Library
-
-```bash
 # Build library
 cargo build --release
-
-# Build with runtime support
-cargo build --release --features runtime
 
 # Run tests
 cargo test
@@ -90,12 +96,104 @@ cargo test
 ### Building Example Agents
 
 ```bash
-# Build request handler agent
-cargo build --release --target wasm32-wasip1 --example request_agent
+# Build ping-pong agent
+cd examples/agents/ping-pong
+cargo build --release --target wasm32-wasip1
 
-# Build contractor agent
-cargo build --release --target wasm32-wasip1 --example contractor_agent
+# Build counter agent
+cd examples/agents/counter
+cargo build --release --target wasm32-wasip1
+
+# Build calculator agent
+cd examples/agents/calculator
+cargo build --release --target wasm32-wasip1
 ```
+
+## Endpoints
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 9000 | gRPC | Agent messaging API |
+| 9090 | HTTP | Prometheus metrics |
+
+## gRPC API
+
+### List Services
+
+```bash
+grpcurl -plaintext localhost:9000 list
+```
+
+### Health Check
+
+```bash
+grpcurl -plaintext -d '{"include_metrics": true}' \
+  localhost:9000 fipa.v1.FipaAgentService/HealthCheck
+```
+
+### Get Node Info
+
+```bash
+grpcurl -plaintext -d '{}' \
+  localhost:9000 fipa.v1.FipaAgentService/GetNodeInfo
+```
+
+### Send Message
+
+```bash
+grpcurl -plaintext -d '{
+  "performative": "PERFORMATIVE_REQUEST",
+  "sender": {"name": "client"},
+  "receivers": [{"name": "target-agent"}],
+  "content": "SGVsbG8=",
+  "language": "text/plain"
+}' localhost:9000 fipa.v1.FipaAgentService/SendMessage
+```
+
+### Find Agent
+
+```bash
+grpcurl -plaintext -d '{"agentId": {"name": "my-agent"}}' \
+  localhost:9000 fipa.v1.FipaAgentService/FindAgent
+```
+
+### Find Service
+
+```bash
+grpcurl -plaintext -d '{"serviceName": "calculator", "maxResults": 10}' \
+  localhost:9000 fipa.v1.FipaAgentService/FindService
+```
+
+### Available gRPC Methods
+
+| Method | Description |
+|--------|-------------|
+| `HealthCheck` | Health status with optional metrics |
+| `GetNodeInfo` | Node capabilities and info |
+| `SendMessage` | Send ACL message to agent |
+| `SubscribeMessages` | Stream messages (server streaming) |
+| `FindAgent` | Locate an agent by name |
+| `FindService` | Find agents providing a service |
+| `MigrateAgent` | Migrate agent to this node |
+| `CloneAgent` | Clone agent to this node |
+| `GetWasmModule` | Request WASM module by hash |
+
+## Metrics
+
+Prometheus metrics available at `http://localhost:9090/metrics`:
+
+```bash
+curl localhost:9090/metrics
+```
+
+### Available Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `fipa_agents_spawned_total` | counter | Total agents spawned |
+| `fipa_agents_active` | gauge | Current active agents |
+
+Labels: `agent_type` (system, user)
 
 ## Usage Examples
 
@@ -237,6 +335,38 @@ migrate-to: func(node-id: string) -> result<_, string>;
 
 See `wit/fipa.wit` for the complete interface definition.
 
+## Example Agents
+
+Three example agents in `examples/agents/`:
+
+### Ping-Pong
+Simple echo agent - receives "ping", responds "pong".
+
+### Counter
+Persistent counter with commands: `inc`, `dec`, `get`, `reset`, `add:N`, `set:N`
+
+### Calculator
+Math expression evaluator with service registration: `+`, `-`, `*`, `/`, `%`, `^`, parentheses
+
+## Docker Configuration
+
+### Single Node (default)
+
+```yaml
+services:
+  fipa-node:
+    build: .
+    ports:
+      - "9000:9000"  # gRPC
+      - "9090:9090"  # Metrics
+    environment:
+      - RUST_LOG=info
+```
+
+### Multi-Node Cluster
+
+See commented section in `docker-compose.yml` for 3-node cluster setup with Raft consensus.
+
 ## Security Model
 
 ### Capability-Based Permissions
@@ -261,66 +391,6 @@ WASM provides strong isolation:
 - Controlled host function access
 - Resource limits enforced by runtime
 - No direct system calls
-
-## Integration with CR Monban
-
-This system integrates with CR Monban for intelligent threat detection:
-
-1. **Distributed Analysis**: Agents migrate to attack locations
-2. **Collaborative Detection**: Contract Net for threat intelligence sharing
-3. **Adaptive Response**: Dynamic deployment of countermeasures
-
-## Development Roadmap
-
-### Phase 1: Core WASM Runtime (Weeks 1-3)
-- [x] WASM runtime setup
-- [ ] Basic FIPA host functions
-- [ ] State capture/restore
-- [ ] Simple agent execution
-
-### Phase 2: Protocol Integration (Weeks 4-6)
-- [x] Protocol state machines
-- [ ] Conversation manager
-- [ ] Message routing
-- [ ] Protocol validation
-
-### Phase 3: Migration (Weeks 7-9)
-- [ ] Agent serialization
-- [ ] Migration protocol
-- [ ] Signature verification
-- [ ] State snapshots
-
-### Phase 4: Network Layer (Weeks 10-12)
-- [ ] Inter-node communication
-- [ ] Agent directory
-- [ ] Peer discovery
-- [ ] Message forwarding
-
-### Phase 5: Security (Weeks 13-15)
-- [ ] Resource limiting
-- [ ] Code signing
-- [ ] Capability enforcement
-- [ ] Audit logging
-
-### Phase 6: Production (Weeks 16-18)
-- [ ] Monitoring/metrics
-- [ ] Fault tolerance
-- [ ] Performance optimization
-- [ ] Documentation
-
-## Contributing
-
-Contributions are welcome! Please see CONTRIBUTING.md for guidelines.
-
-## License
-
-This project is licensed under the MIT License - see LICENSE file for details.
-
-## Contact
-
-**Author**: SavageS
-**GitHub**: github.com/greenpdx
-**Project**: CR Monban Integration
 
 ## References
 

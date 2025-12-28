@@ -1,0 +1,40 @@
+# Build artifacts
+target/
+*.wasm
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation (not needed in image)
+docs/
+*.md
+!README.md
+
+# Examples and templates (not needed for node)
+examples/
+templates/
+
+# Test files
+tests/
+*.test.*
+
+# Local config
+.env
+*.local
+data/
+
+# Misc
+.DS_Store
+Thumbs.db

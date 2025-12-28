@@ -1,0 +1,106 @@
+services:
+  # Single node deployment
+  fipa-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fipa-node:latest
+    container_name: fipa-node
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # gRPC
+      - "9090:9090"   # Metrics
+    volumes:
+      - fipa-data:/data
+    environment:
+      - RUST_LOG=info
+    command:
+      - "--node-id=1"
+      - "--name=fipa-node-1"
+      - "--listen=0.0.0.0:9000"
+      - "--data-dir=/data"
+      - "--log-format=json"
+      - "--metrics"
+      - "--metrics-addr=0.0.0.0:9090"
+
+volumes:
+  fipa-data:
+
+# Multi-node cluster configuration
+# Uncomment to run a 3-node cluster
+#
+# services:
+#   node1:
+#     build: .
+#     image: fipa-node:latest
+#     container_name: fipa-node-1
+#     ports:
+#       - "9001:9000"
+#       - "9091:9090"
+#     volumes:
+#       - node1-data:/data
+#     command:
+#       - "--node-id=1"
+#       - "--name=node-1"
+#       - "--listen=0.0.0.0:9000"
+#       - "--data-dir=/data"
+#       - "--log-format=json"
+#       - "--metrics"
+#       - "--consensus"
+#       - "--bootstrap=node2:9000"
+#       - "--bootstrap=node3:9000"
+#     networks:
+#       - fipa-net
+#
+#   node2:
+#     build: .
+#     image: fipa-node:latest
+#     container_name: fipa-node-2
+#     ports:
+#       - "9002:9000"
+#       - "9092:9090"
+#     volumes:
+#       - node2-data:/data
+#     command:
+#       - "--node-id=2"
+#       - "--name=node-2"
+#       - "--listen=0.0.0.0:9000"
+#       - "--data-dir=/data"
+#       - "--log-format=json"
+#       - "--metrics"
+#       - "--consensus"
+#       - "--bootstrap=node1:9000"
+#       - "--bootstrap=node3:9000"
+#     networks:
+#       - fipa-net
+#
+#   node3:
+#     build: .
+#     image: fipa-node:latest
+#     container_name: fipa-node-3
+#     ports:
+#       - "9003:9000"
+#       - "9093:9090"
+#     volumes:
+#       - node3-data:/data
+#     command:
+#       - "--node-id=3"
+#       - "--name=node-3"
+#       - "--listen=0.0.0.0:9000"
+#       - "--data-dir=/data"
+#       - "--log-format=json"
+#       - "--metrics"
+#       - "--consensus"
+#       - "--bootstrap=node1:9000"
+#       - "--bootstrap=node2:9000"
+#     networks:
+#       - fipa-net
+#
+# volumes:
+#   node1-data:
+#   node2-data:
+#   node3-data:
+#
+# networks:
+#   fipa-net:
+#     driver: bridge
