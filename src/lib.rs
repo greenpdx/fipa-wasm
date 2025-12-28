@@ -10,6 +10,8 @@ pub mod behavior;
 pub mod consensus;
 pub mod content;
 pub mod interplatform;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod network;
 pub mod observability;
 pub mod persistence;

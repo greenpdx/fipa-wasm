@@ -116,6 +116,7 @@ default = ["full"]
 full = ["consensus", "metrics"]
 consensus = []
 metrics = []
+mcp = []  # Model Context Protocol server for Claude integration
 
 [lib]
 name = "fipa_wasm_agents"
@@ -136,6 +137,11 @@ path = "src/bin/agent_new.rs"
 [[bin]]
 name = "fipa-tui"
 path = "src/bin/tui.rs"
+
+[[bin]]
+name = "fipa-mcp"
+path = "src/bin/fipa_mcp.rs"
+required-features = ["mcp"]
 
 [[bench]]
 name = "protocol_bench"
