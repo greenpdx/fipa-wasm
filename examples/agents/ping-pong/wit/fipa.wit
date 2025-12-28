@@ -362,14 +362,124 @@ interface random {
     get-random-f64: func() -> f64;
 }
 
+/// Behavior scheduling interface (JADE-style behaviors)
+interface behaviors {
+    /// Behavior types following JADE patterns
+    enum behavior-type {
+        /// Executes once then completes
+        one-shot,
+        /// Repeats indefinitely until blocked
+        cyclic,
+        /// Executes at fixed time intervals
+        ticker,
+        /// Executes once after a delay
+        waker,
+        /// Runs sub-behaviors in sequence
+        sequential,
+        /// Runs sub-behaviors concurrently
+        parallel,
+        /// Finite state machine with named states
+        fsm,
+    }
+
+    /// Behavior completion condition for parallel behaviors
+    enum parallel-completion {
+        /// Complete when all sub-behaviors finish
+        when-all,
+        /// Complete when any sub-behavior finishes
+        when-any,
+        /// Complete when N sub-behaviors finish (use parallel-n in behavior-config)
+        when-n,
+    }
+
+    /// FSM transition definition
+    record fsm-transition {
+        /// Source state name
+        from-state: string,
+        /// Target state name
+        to-state: string,
+        /// Event that triggers this transition
+        event: string,
+    }
+
+    /// Behavior configuration
+    record behavior-config {
+        /// Behavior type
+        behavior-type: behavior-type,
+        /// Tick interval for ticker behavior (ms)
+        tick-interval-ms: option<u64>,
+        /// Wake delay for waker behavior (ms)
+        wake-after-ms: option<u64>,
+        /// Sub-behavior IDs for composite behaviors
+        sub-behaviors: list<u64>,
+        /// Completion condition for parallel behaviors
+        parallel-completion: option<parallel-completion>,
+        /// N value for when-n completion condition
+        parallel-n: option<u32>,
+        /// Initial state for FSM behaviors
+        fsm-initial-state: option<string>,
+        /// Transitions for FSM behaviors
+        fsm-transitions: list<fsm-transition>,
+    }
+
+    /// Behavior status
+    enum behavior-status {
+        /// Behavior is ready to run
+        ready,
+        /// Behavior is currently executing
+        running,
+        /// Behavior is blocked/paused
+        blocked,
+        /// Behavior has completed (done() returned true)
+        done,
+    }
+
+    /// Behavior error types
+    variant behavior-error {
+        /// Behavior ID not found
+        not-found(u64),
+        /// Invalid configuration
+        invalid-config(string),
+        /// Cannot modify running behavior
+        already-running,
+        /// Sub-behavior error
+        sub-behavior-error(string),
+    }
+
+    /// Register a new behavior with the scheduler
+    /// Returns the behavior ID
+    add-behavior: func(name: string, config: behavior-config) -> result<u64, behavior-error>;
+
+    /// Remove a behavior from the scheduler
+    remove-behavior: func(behavior-id: u64) -> result<_, behavior-error>;
+
+    /// Block (pause) a behavior
+    block-behavior: func(behavior-id: u64) -> result<_, behavior-error>;
+
+    /// Restart a blocked behavior
+    restart-behavior: func(behavior-id: u64) -> result<_, behavior-error>;
+
+    /// Get behavior status
+    get-behavior-status: func(behavior-id: u64) -> result<behavior-status, behavior-error>;
+
+    /// Signal behavior completion (call from action() when done)
+    behavior-done: func(behavior-id: u64);
+
+    /// Trigger FSM transition event
+    fsm-event: func(behavior-id: u64, event: string) -> result<string, behavior-error>;
+
+    /// Get current FSM state
+    fsm-current-state: func(behavior-id: u64) -> result<string, behavior-error>;
+
+    /// Reset behavior to initial state
+    reset-behavior: func(behavior-id: u64) -> result<_, behavior-error>;
+
+    /// List all active behaviors
+    list-behaviors: func() -> list<tuple<u64, string, behavior-status>>;
+}
+
 /// The complete agent world - full featured agent
 world agent {
-    // Standard WASI imports
-    import wasi:io/poll@0.2.0;
-    import wasi:io/streams@0.2.0;
-    import wasi:clocks/monotonic-clock@0.2.0;
-    import wasi:random/random@0.2.0;
-
     // FIPA-specific imports
     import messaging;
     import lifecycle;
@@ -379,6 +489,7 @@ world agent {
     import logging;
     import timing;
     import random;
+    import behaviors;
 
     /// Initialize the agent
     export init: func();
@@ -390,9 +501,43 @@ world agent {
     /// Shutdown the agent gracefully
     export shutdown: func();
 
-    /// Handle an incoming message
-    /// Returns true if the message was handled
-    export handle-message: func(message: messaging.acl-message) -> bool;
+    /// Execute a behavior's action
+    /// Called by the scheduler when a behavior should run
+    /// Returns true if the behavior is done (should not be called again)
+    export execute-behavior: func(behavior-id: u64, behavior-name: string) -> bool;
+
+    /// Called before a behavior starts (like JADE onStart)
+    export on-behavior-start: func(behavior-id: u64, behavior-name: string);
+
+    /// Called after a behavior completes (like JADE onEnd)
+    export on-behavior-end: func(behavior-id: u64, behavior-name: string);
+}
+
+/// Behavior-focused agent world
+world behavior-agent {
+    // FIPA-specific imports
+    import messaging;
+    import lifecycle;
+    import services;
+    import storage;
+    import logging;
+    import timing;
+    import behaviors;
+
+    /// Initialize the agent and register behaviors
+    export init: func();
+
+    /// Shutdown the agent gracefully
+    export shutdown: func();
+
+    /// Execute a behavior's action
+    export execute-behavior: func(behavior-id: u64, behavior-name: string) -> bool;
+
+    /// Called before a behavior starts
+    export on-behavior-start: func(behavior-id: u64, behavior-name: string);
+
+    /// Called after a behavior completes
+    export on-behavior-end: func(behavior-id: u64, behavior-name: string);
 }
 
 /// Minimal agent world for simple/stateless agents
@@ -406,13 +551,6 @@ world minimal-agent {
     export shutdown: func();
 }
 
-/// Stateless handler world - for pure message handlers
-world stateless-handler {
-    import messaging;
-    import logging;
-
-    /// Handle a message and optionally return a response
-    export handle-message: func(
-        message: messaging.acl-message
-    ) -> option<messaging.acl-message>;
-}
+// NOTE: stateless-handler world removed as interface.type syntax
+// is not supported in wit-bindgen 0.36. Agents should use
+// messaging::receive_message() instead.

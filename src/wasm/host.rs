@@ -1,6 +1,7 @@
 // wasm/host.rs - Host State for WASM Runtime
 
 use std::collections::{HashMap, VecDeque};
+use crate::behavior::BehaviorScheduler;
 use crate::proto;
 
 /// Host state accessible from WASM through host functions
@@ -47,6 +48,9 @@ pub struct HostState {
     /// Migration history
     pub migration_history: Vec<String>,
 
+    /// Behavior scheduler for JADE-style behaviors
+    pub behavior_scheduler: BehaviorScheduler,
+
     /// Statistics
     pub messages_sent: u64,
     pub messages_received: u64,
@@ -75,6 +79,7 @@ impl HostState {
             shutdown_requested: false,
             is_migrating: false,
             migration_history: vec![],
+            behavior_scheduler: BehaviorScheduler::new(),
             messages_sent: 0,
             messages_received: 0,
             log_count: 0,

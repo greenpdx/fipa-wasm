@@ -32,14 +32,26 @@
 //! }
 //! ```
 
+mod brokering;
 mod contract_net;
+mod dutch_auction;
+mod english_auction;
+mod iterated_contract_net;
+mod propose;
 mod query;
+mod recruiting;
 mod request;
 mod state_machine;
 mod subscribe;
 
+pub use brokering::{BrokeringProtocol, BrokeringState, ProviderInfo, ProviderStatus};
 pub use contract_net::{ContractNetProtocol, ContractNetState, Proposal};
+pub use dutch_auction::{DutchAuctionProtocol, DutchAuctionState, PriceUpdate};
+pub use english_auction::{Bid, EnglishAuctionProtocol, EnglishAuctionState};
+pub use iterated_contract_net::{IteratedContractNetProtocol, IteratedContractNetState, NegotiationRound};
+pub use propose::{ProposeProtocol, ProposeState};
 pub use query::{QueryProtocol, QueryState, QueryType};
+pub use recruiting::{Candidate, RecruitingProtocol, RecruitingState};
 pub use request::{RequestProtocol, RequestState};
 pub use state_machine::{
     create_response, create_state_machine, CompletionData, ConversationBase, ProcessResult,

@@ -1,0 +1,1 @@
+/home/svvs/fipa/examples/agents/behavior-demo/target/wasm32-wasip1/debug/behavior_demo_agent.wasm: /home/svvs/fipa/examples/agents/behavior-demo/src/lib.rs /home/svvs/fipa/examples/agents/behavior-demo/wit/fipa.wit

@@ -6,11 +6,18 @@
 #![doc = include_str!("../README.md")]
 
 pub mod actor;
+pub mod behavior;
 pub mod consensus;
+pub mod content;
+pub mod interplatform;
 pub mod network;
 pub mod observability;
+pub mod persistence;
+pub mod platform;
 pub mod proto;
 pub mod protocol;
+pub mod security;
+pub mod tools;
 pub mod trust;
 pub mod wasm;
 
@@ -33,6 +40,37 @@ pub use observability::{
     record_consensus_commit, record_consensus_election, record_message_latency,
     record_message_received, record_message_sent, record_migration, record_wasm_execution,
     MetricsConfig, MetricsHandle, TracingConfig, TracingFormat,
+};
+
+pub use security::{
+    AuthError, AuthResult, Authenticator, Session, SessionId,
+    AgentCredentials, Certificate, Token, TokenType,
+    Action as SecurityAction, Permission, PermissionCheck, PermissionError, PermissionSet,
+    Resource as SecurityResource,
+    Policy, PolicyEngine, PolicyError, Role as SecurityRole, RoleBinding, SecurityPolicy,
+    SecurityConfig, SecurityManager,
+};
+
+pub use content::{
+    Codec, CodecError, CodecRegistry, ContentElement, ContentError, ContentManager,
+    Concept, Predicate, Action as ContentAction, Term, Ontology, OntologyError,
+    OntologyRegistry, Schema, SchemaField, SchemaType, SlCodec,
+};
+
+pub use persistence::{
+    PersistenceConfig, PersistenceError, PersistenceManager, PersistenceStats,
+    AgentSnapshot as PersistedAgentSnapshot, ConversationSnapshot, PlatformSnapshot,
+    ServiceSnapshot, SnapshotId, SnapshotMetadata,
+    RecoveryEngine, RecoveryError, RecoveryState, RecoveredAgent,
+    FileStorage, MemoryStorage, Storage, StorageError,
+};
+
+pub use interplatform::{
+    Acc, AccConfig, AccError, AccStats,
+    AgentAddress, PlatformAddress, AddressResolver, AddressError,
+    MessageEnvelope, EnvelopeBuilder, TransportInfo,
+    Mtp, MtpConfig, MtpError, MtpRegistry, MtpStatus, HttpMtp,
+    InterplatformConfig, InterplatformError,
 };
 
 // Legacy compatibility - re-export old types with deprecation warnings

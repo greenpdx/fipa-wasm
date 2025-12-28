@@ -15,7 +15,6 @@ wit_bindgen::generate!({
     path: "wit/fipa.wit",
 });
 
-use exports::fipa::agent::guest::Guest;
 use fipa::agent::messaging::{self, AclMessage, Performative, ProtocolType};
 use fipa::agent::lifecycle;
 use fipa::agent::logging::{self, LogLevel};
@@ -64,7 +63,7 @@ impl Guest for CalculatorAgent {
         }
 
         while let Some(msg) = messaging::receive_message() {
-            Self::handle_message(msg);
+            handle_message(msg);
         }
 
         true
@@ -82,19 +81,28 @@ impl Guest for CalculatorAgent {
         }
     }
 
-    fn handle_message(message: AclMessage) -> bool {
-        match message.performative {
-            Performative::QueryRef => {
-                handle_query(&message);
-                true
-            }
-            Performative::Request => {
-                // Also accept requests (more lenient)
-                handle_query(&message);
-                true
-            }
-            _ => false,
+    fn execute_behavior(_behavior_id: u64, _behavior_name: String) -> bool {
+        // Calculator agent doesn't use behaviors
+        true
+    }
+
+    fn on_behavior_start(_behavior_id: u64, _behavior_name: String) {}
+
+    fn on_behavior_end(_behavior_id: u64, _behavior_name: String) {}
+}
+
+fn handle_message(message: AclMessage) -> bool {
+    match message.performative {
+        Performative::QueryRef => {
+            handle_query(&message);
+            true
         }
+        Performative::Request => {
+            // Also accept requests (more lenient)
+            handle_query(&message);
+            true
+        }
+        _ => false,
     }
 }
 

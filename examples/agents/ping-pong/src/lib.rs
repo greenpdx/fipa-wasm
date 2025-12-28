@@ -14,7 +14,6 @@ wit_bindgen::generate!({
     path: "wit/fipa.wit",
 });
 
-use exports::fipa::agent::guest::Guest;
 use fipa::agent::messaging::{self, AclMessage, Performative, ProtocolType};
 use fipa::agent::lifecycle;
 use fipa::agent::logging::{self, LogLevel};
