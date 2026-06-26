@@ -25,20 +25,24 @@
 //! (e.g. `1740` is the noun *entity* and the verb *breathe* — 95 such collisions
 //! between nouns and verbs alone). A bare offset is therefore not a unique UCL.
 //!
-//! Rev 1 resolves this by placing each POS in its own billion-block, all inside
-//! the `0..5_000_000_000` open-seed range (§4.2):
+//! Following the **M2 verification gate** (see `docs/M2_VERIFICATION_GATE.md`),
+//! Rev 1 adopts the *native UNL corpus id layout*: a one-digit POS prefix times
+//! `100_000_000` plus the 8-digit offset, all inside the `0..5_000_000_000`
+//! open-seed range (§4.2):
 //!
-//! | POS  | block base       |
-//! |------|------------------|
-//! | noun | `0`              |
-//! | verb | `1_000_000_000`  |
-//! | adj  | `2_000_000_000`  |
-//! | adv  | `3_000_000_000`  |
+//! | POS  | prefix | block base      |
+//! |------|--------|-----------------|
+//! | noun | `1`    | `100_000_000`   |
+//! | verb | `2`    | `200_000_000`   |
+//! | adj  | `3`    | `300_000_000`   |
+//! | adv  | `4`    | `400_000_000`   |
 //!
-//! The raw offset stays recoverable as `id % 1_000_000_000` and the POS as
-//! `id / 1_000_000_000`, so the manifest's interop hypothesis (do corpus UCLs
-//! equal WordNet offsets?) is still testable — that is the open **M2 verification
-//! gate**, which this collision finding directly informs.
+//! This matches the surviving AESOP corpus's id *format* exactly (its ids are
+//! `pos*1e8 + offset` with pos 1=n/2=v/3=a/4=r). The numeric *values* still
+//! differ, because the corpus offsets are WordNet **3.0** and this seed is
+//! **3.1** (the gate's key finding) — so the layout is corpus-native but direct
+//! numeric interop is not free. The offset is recoverable as `id % 100_000_000`,
+//! the POS as `id / 100_000_000`.
 
 use crate::{ConceptFeatures, KbError, KnowledgeBase};
 use smol_str::SmolStr;
@@ -48,7 +52,9 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use unl_core::{Lang, LexCategory, NodeRef, Relation, RelationTag, Uci, Uw};
 
-const BLOCK: u64 = 1_000_000_000;
+/// POS-prefix block size: one digit of POS times this, plus the 8-digit offset.
+/// Matches the surviving UNL corpora's id layout (`pos*1e8 + offset`).
+const BLOCK: u64 = 100_000_000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum Pos {
@@ -90,25 +96,26 @@ impl Pos {
         }
     }
 
-    fn block(self) -> u64 {
+    /// POS prefix digit, matching the UNL corpus convention (1=n, 2=v, 3=a, 4=r).
+    fn prefix(self) -> u64 {
         match self {
-            Pos::Noun => 0,
-            Pos::Verb => BLOCK,
-            Pos::Adj => 2 * BLOCK,
-            Pos::Adv => 3 * BLOCK,
+            Pos::Noun => 1,
+            Pos::Verb => 2,
+            Pos::Adj => 3,
+            Pos::Adv => 4,
         }
     }
 
     fn ucl(self, offset: u32) -> u64 {
-        self.block() + offset as u64
+        self.prefix() * BLOCK + offset as u64
     }
 
     fn from_ucl(id: u64) -> Option<(Pos, u32)> {
         let pos = match id / BLOCK {
-            0 => Pos::Noun,
-            1 => Pos::Verb,
-            2 => Pos::Adj,
-            3 => Pos::Adv,
+            1 => Pos::Noun,
+            2 => Pos::Verb,
+            3 => Pos::Adj,
+            4 => Pos::Adv,
             _ => return None,
         };
         Some((pos, (id % BLOCK) as u32))
@@ -402,6 +409,17 @@ mod tests {
             .unwrap();
         assert_eq!(f.category, LexCategory::Nominal);
         assert!(f.gloss.is_some_and(|g| !g.is_empty()));
+    }
+
+    #[test]
+    fn ucl_layout_matches_corpus_convention() {
+        // pos*1e8 + offset, pos 1=n/2=v/3=a/4=r (no WordNet needed).
+        assert_eq!(Pos::Noun.ucl(2124272), 102_124_272);
+        assert_eq!(Pos::Verb.ucl(1740), 200_001_740);
+        assert_eq!(Pos::Adj.ucl(980527), 300_980_527);
+        assert_eq!(Pos::Adv.ucl(536227), 400_536_227);
+        assert_eq!(Pos::from_ucl(102_124_272), Some((Pos::Noun, 2124272)));
+        assert_eq!(Pos::from_ucl(500_000_000), None); // outside the WordNet POS prefixes
     }
 
     #[test]

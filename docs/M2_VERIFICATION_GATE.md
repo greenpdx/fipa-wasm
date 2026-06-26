@@ -68,14 +68,16 @@ Options (for the user to weigh):
    our ids are at least structurally UNL-native, accepting that the numeric
    values differ from the 3.0 corpus.
 
-## Current code state
+## Decision taken — Option 3 (Hybrid)
 
-`WordNetKb` (Rev 1) seeds from **3.1** and uses a POS-blocked id scheme at base
-`1e9` (noun `0`, verb `1e9`, adj `2e9`, adv `3e9`) — internally correct and
-collision-free, but **not** aligned to the corpus's `pos*1e8 + offset` layout and
-**not** offset-compatible with the 3.0 corpus. Changing the seed version and/or
-id base is the open decision above; it is isolated to `crates/unl-kb/src/wordnet.rs`
-(the `Pos::block`/`ucl`/`from_ucl` functions) plus the `xtask` download URL.
+`WordNetKb` keeps the **WordNet 3.1** seed but adopts the corpus's native id
+*layout*: `pos_digit * 100_000_000 + offset`, with pos `1=n / 2=v / 3=a / 4=r`
+(`crates/unl-kb/src/wordnet.rs`, `Pos::prefix`/`ucl`/`from_ucl`). Our ids are
+therefore structurally UNL-native and match the corpus *format* exactly; the
+numeric *values* differ from the 3.0 corpus, so direct numeric interop is not
+free. A 3.0→3.1 remap (or seeding 3.0) remains available later if/when numeric
+corpus interop becomes a requirement — both are isolated to the same handful of
+functions plus the `xtask` download URL.
 
 `parse_legacy_document` (the `[D]/[S]/{org}/{unl}` envelope this corpus uses) is
 still unimplemented; the corpus shows it needs node-id suffixes (`102326432:73`),
