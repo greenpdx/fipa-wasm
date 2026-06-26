@@ -21,6 +21,7 @@ fn main() {
     let rest: Vec<String> = args.collect();
     let result = match cmd.as_deref() {
         Some("fetch-wordnet") => fetch_wordnet(rest.iter().any(|a| a == "--force")),
+        Some("fetch-aesop") => fetch_aesop(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
             usage();
@@ -40,6 +41,7 @@ fn main() {
 fn usage() {
     eprintln!("usage: cargo run -p xtask -- <command>");
     eprintln!("  fetch-wordnet [--force]   download + extract WordNet 3.1 to data/kb-seed/");
+    eprintln!("  fetch-aesop               download the AESOP UNL corpus to data/corpus/aesop/");
 }
 
 /// The workspace root, derived from this crate's location (xtask/ -> ..), so the
@@ -75,6 +77,74 @@ fn fetch_wordnet(force: bool) -> Result<(), Box<dyn Error>> {
 
     verify(&dest)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AESOP UNL corpus
+// ---------------------------------------------------------------------------
+
+/// Languages for which the unlarchive.org mirror returns non-empty AESOP graphs.
+const AESOP_LANGS: &[&str] = &["en", "fr", "es", "ru", "pt", "it"];
+
+fn aesop_url(lang: &str) -> String {
+    format!("https://unlarchive.org/unlarium/corpus/export_corpus.php?project=aa1&lang={lang}&unl=ucl")
+}
+
+/// Download the AESOP corpus (the surviving UNLarium example corpus) for each
+/// available language, strip the HTML wrapper, and write clean `[D]...[S]...`
+/// UNL text to data/corpus/aesop/. The corpus carries no explicit open licence,
+/// so it is fetched on demand and gitignored, not vendored.
+fn fetch_aesop() -> Result<(), Box<dyn Error>> {
+    let dir = workspace_root().join("data/corpus/aesop");
+    std::fs::create_dir_all(&dir)?;
+    let mut total = 0usize;
+    for &lang in AESOP_LANGS {
+        print!("Fetching AESOP [{lang}] ... ");
+        let body = ureq::get(&aesop_url(lang)).call()?.into_string()?;
+        let cleaned = clean_corpus_html(&body);
+        let sentences = cleaned.matches("[S:").count();
+        total += sentences;
+        let path = dir.join(format!("aesop_{lang}.unl"));
+        std::fs::write(&path, &cleaned)?;
+        println!("{sentences} sentences -> {}", path.display());
+    }
+    println!("OK: {total} sentences across {} languages", AESOP_LANGS.len());
+    Ok(())
+}
+
+/// Turn the HTML-wrapped export into clean UNL text: `<br />` -> newline, strip
+/// remaining tags, decode the handful of entities that appear, and keep just the
+/// `[D ... [/D]` document envelope.
+fn clean_corpus_html(raw: &str) -> String {
+    let with_newlines = raw
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n");
+
+    let mut text = String::with_capacity(with_newlines.len());
+    let mut in_tag = false;
+    for ch in with_newlines.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+
+    let start = text.find("[D").unwrap_or(0);
+    let end = text.find("[/D]").map(|e| e + 4).unwrap_or(text.len());
+    let mut out = text[start..end].trim().to_string();
+    out.push('\n');
+    out
 }
 
 /// Sanity-check the extracted tree and report what landed.
