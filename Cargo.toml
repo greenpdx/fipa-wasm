@@ -13,6 +13,7 @@ members = [
     "crates/unl-core",
     "crates/unl-parser",
     "crates/unl-kb",
+    "crates/unl-validator",
     "xtask",
 ]
 

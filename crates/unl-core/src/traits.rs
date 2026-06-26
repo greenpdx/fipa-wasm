@@ -50,10 +50,41 @@ impl SemanticGraph for UnlGraph {
 
 /// Equality of meaning, not of surface form. Two graphs are unl-equivalent if
 /// they normalize to the same canonical form ("Peter killed John" ==
-/// "John was killed by Peter"). The implementation lives in `unl-validator`
-/// (normalization is non-trivial); this is only the contract.
+/// "John was killed by Peter").
 pub trait UnlEquivalent {
     fn unl_eq(&self, other: &Self) -> bool;
+}
+
+/// Cheap, KB-free structural equivalence: same entry, same nodes, and the same
+/// *multiset* of relations (order-independent). This is the comparison the
+/// manifest calls cheap once both graphs are normalized — semantic equivalence
+/// is `a.normalize(..).unl_eq(&b.normalize(..))`, with normalization living in
+/// `unl-validator`. (Implemented here because both the trait and `UnlGraph` are
+/// local to this crate; an impl in `unl-validator` would violate the orphan
+/// rule.)
+impl UnlEquivalent for UnlGraph {
+    fn unl_eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+            && self.nodes == other.nodes
+            && relations_multiset_eq(&self.relations, &other.relations)
+    }
+}
+
+fn relations_multiset_eq(a: &[Relation], b: &[Relation]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut used = vec![false; b.len()];
+    'outer: for x in a {
+        for (i, y) in b.iter().enumerate() {
+            if !used[i] && x == y {
+                used[i] = true;
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -90,5 +121,18 @@ mod tests {
         let g = sample();
         assert_eq!(SemanticGraph::nodes(&g).count(), 3);
         assert_eq!(SemanticGraph::relations(&g).count(), 2);
+    }
+
+    #[test]
+    fn unl_eq_is_order_independent() {
+        let a = sample();
+        let mut b = sample();
+        b.relations.reverse();
+        assert!(a.unl_eq(&b));
+
+        // Different relation set => not equivalent.
+        let mut c = sample();
+        c.relations.pop();
+        assert!(!a.unl_eq(&c));
     }
 }

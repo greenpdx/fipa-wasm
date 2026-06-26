@@ -1,0 +1,16 @@
+[package]
+name = "unl-validator"
+version = "0.1.0"
+description = "Deterministic structural + KB-backed validation and normalization for UNL graphs"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+unl-kb = { path = "../unl-kb" }
+serde.workspace = true
+
+[dev-dependencies]
+# Corpus round-trip / smoke tests parse the AESOP fixture.
+unl-parser = { path = "../unl-parser" }
