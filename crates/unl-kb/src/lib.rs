@@ -14,8 +14,10 @@
 //! top, not a change to this trait.
 
 mod mem;
+mod wordnet;
 
 pub use mem::{ConceptSeed, MemKb};
+pub use wordnet::WordNetKb;
 
 use unl_core::{Lang, LexCategory, Relation, RelationTag, Uci};
 
