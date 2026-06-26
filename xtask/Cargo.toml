@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Build tooling: KB data acquisition and generation. Kept out of the runtime
+# dependency graph of the library crates.
+[dependencies]
+ureq = "2"
+flate2 = "1"
+tar = "0.4"

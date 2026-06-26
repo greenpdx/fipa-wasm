@@ -12,6 +12,8 @@ members = [
     "crates/fipa-wasm-agents",
     "crates/unl-core",
     "crates/unl-parser",
+    "crates/unl-kb",
+    "xtask",
 ]
 
 [workspace.package]

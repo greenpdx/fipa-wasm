@@ -1,0 +1,47 @@
+# Small MemKb seed fixture — a WordNet-shaped fragment used by unit tests and as
+# a worked example of the seed format. UCL ids are illustrative (WordNet-style
+# 9-digit offsets in the open-seed range, §4.2). `icl` lists hypernyms by id.
+
+[[concept]]
+ucl = 100015388
+ucn = "animal"
+category = "nominal"
+abstract = false
+gloss = "a living organism characterized by voluntary movement"
+lemmas = ["animal", "creature", "beast"]
+
+[[concept]]
+ucl = 102120997
+ucn = "mammal"
+category = "nominal"
+abstract = false
+gloss = "a warm-blooded vertebrate animal that nourishes its young with milk"
+icl = [100015388]
+lemmas = ["mammal"]
+
+[[concept]]
+ucl = 102075296
+ucn = "carnivore"
+category = "nominal"
+abstract = false
+gloss = "a terrestrial or aquatic flesh-eating mammal"
+icl = [102120997]
+lemmas = ["carnivore"]
+
+[[concept]]
+ucl = 102120000
+ucn = "feline"
+category = "nominal"
+abstract = false
+gloss = "any of various lithe-bodied carnivores"
+icl = [102075296]
+lemmas = ["feline", "felid"]
+
+[[concept]]
+ucl = 102121620
+ucn = "cat"
+category = "nominal"
+abstract = false
+gloss = "a small domesticated feline carnivore kept as a pet"
+icl = [102120000]
+lemmas = ["cat", "kitty"]

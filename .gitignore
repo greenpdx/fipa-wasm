@@ -1,3 +1,7 @@
 target/
 Cargo.lock
 node_modules
+
+# Downloaded WordNet 3.1 database (fetched by `cargo run -p xtask -- fetch-wordnet`;
+# redistributed separately under the WordNet licence, not vendored in git).
+/data/kb-seed/wordnet-3.1/

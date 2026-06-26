@@ -1,0 +1,14 @@
+[package]
+name = "unl-kb"
+version = "0.1.0"
+description = "UNL knowledge base trait and the in-memory MemKb test double"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+thiserror.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+toml = "0.9"
