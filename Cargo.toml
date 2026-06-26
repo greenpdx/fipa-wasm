@@ -11,6 +11,7 @@ resolver = "3"
 members = [
     "crates/fipa-wasm-agents",
     "crates/unl-core",
+    "crates/unl-parser",
 ]
 
 [workspace.package]

@@ -1,0 +1,15 @@
+[package]
+name = "unl-parser"
+version = "0.1.0"
+description = "Parse and serialize the UNL concrete syntaxes (table and list formats)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+thiserror.workspace = true
+smol_str.workspace = true
+
+[dev-dependencies]
+proptest = "1.6"

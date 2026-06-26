@@ -13,43 +13,95 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
-/// A single universal attribute (spec §3.3), grouped by semantic family.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Attr {
+/// Defines the [`Attr`] enum together with the canonical text label of each
+/// variant, single-sourcing the two so they cannot drift. The labels are the
+/// snake_case names mirrored in `data/attributes.toml`, and are what the
+/// `unl-parser` reads/writes after the `@` sigil (e.g. `Attr::Def` ⇄ `@def`).
+macro_rules! define_attrs {
+    ($( $variant:ident = $label:literal ),+ $(,)?) => {
+        /// A single universal attribute (spec §3.3), grouped by semantic family.
+        ///
+        /// `Other` is a forward-compatibility hatch only; its payload must be a
+        /// non-standard label (one not equal to any named variant's label),
+        /// otherwise [`Attr::from_label`] would canonicalize it to the named
+        /// variant and the round-trip would not be identity.
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[non_exhaustive]
+        pub enum Attr {
+            $( $variant, )+
+            /// Any attribute not in this enum, preserved verbatim (e.g. `@foo`).
+            Other(SmolStr),
+        }
+
+        impl Attr {
+            /// The canonical text label (without the `@` sigil).
+            pub fn as_label(&self) -> &str {
+                match self {
+                    $( Attr::$variant => $label, )+
+                    Attr::Other(s) => s.as_str(),
+                }
+            }
+
+            /// Parse a label back to an attribute. Unknown labels become
+            /// [`Attr::Other`] (the set is open at the bottom for forward compat).
+            pub fn from_label(label: &str) -> Attr {
+                match label {
+                    $( $label => Attr::$variant, )+
+                    other => Attr::Other(SmolStr::new(other)),
+                }
+            }
+
+            /// Every named variant (excludes `Other`), for tests and tooling.
+            pub const NAMED: &'static [Attr] = &[ $( Attr::$variant, )+ ];
+        }
+    };
+}
+
+define_attrs! {
     // Time (absolute + relative)
-    Past, Present, Future, Gnomic,
-    Ante, Post, Recent, Remote, Simultaneous, Immediate, Since, Until,
+    Past = "past", Present = "present", Future = "future", Gnomic = "gnomic",
+    Ante = "ante", Post = "post", Recent = "recent", Remote = "remote",
+    Simultaneous = "simultaneous", Immediate = "immediate", Since = "since", Until = "until",
     // Aspect
-    Progressive, Perfect, Perfective, Imperfective, Inceptive, Terminative,
-    Habitual, Iterative, Causative,
+    Progressive = "progressive", Perfect = "perfect", Perfective = "perfective",
+    Imperfective = "imperfective", Inceptive = "inceptive", Terminative = "terminative",
+    Habitual = "habitual", Iterative = "iterative", Causative = "causative",
     // Specification / definiteness
-    Def, Indef, Each, Own, Same, Certain, Only, Both, Either, Wh,
+    Def = "def", Indef = "indef", Each = "each", Own = "own", Same = "same",
+    Certain = "certain", Only = "only", Both = "both", Either = "either", Wh = "wh",
     // Quantification
-    Singular, Plural, Dual, Trial, Quadrual, Paucal, Multal, Total, Universal,
+    Singular = "singular", Plural = "plural", Dual = "dual", Trial = "trial",
+    Quadrual = "quadrual", Paucal = "paucal", Multal = "multal", Total = "total",
+    Universal = "universal",
     // Polarity
-    Affirmative, Negative, Dubitative, Neutral,
+    Affirmative = "affirmative", Negative = "negative", Dubitative = "dubitative",
+    Neutral = "neutral",
     // Voice
-    Active, Passive, Middle, Reflexive, Reciprocal, Anticausative, Impersonal,
+    Active = "active", Passive = "passive", Middle = "middle", Reflexive = "reflexive",
+    Reciprocal = "reciprocal", Anticausative = "anticausative", Impersonal = "impersonal",
     // Person
-    P1, P2, P3,
+    P1 = "p1", P2 = "p2", P3 = "p3",
     // Gender / animacy
-    Male, Female, NeuterGender, Animal, Person, Thing,
+    Male = "male", Female = "female", NeuterGender = "neuter_gender", Animal = "animal",
+    Person = "person", Thing = "thing",
     // Modality
-    Ability, Advice, Belief, Command, Request, Desire, Necessity,
-    Possibility, Obligation, Permission,
+    Ability = "ability", Advice = "advice", Belief = "belief", Command = "command",
+    Request = "request", Desire = "desire", Necessity = "necessity",
+    Possibility = "possibility", Obligation = "obligation", Permission = "permission",
     // Place (location / position / direction)
-    Superior, Inferior, Interior, Exterior, Anterior, Posterior,
-    Adjacent, Proximal, Distal, Destination, Origin, Transversal,
+    Superior = "superior", Inferior = "inferior", Interior = "interior",
+    Exterior = "exterior", Anterior = "anterior", Posterior = "posterior",
+    Adjacent = "adjacent", Proximal = "proximal", Distal = "distal",
+    Destination = "destination", Origin = "origin", Transversal = "transversal",
     // Pragmatics: emotions, register, social deixis, figures of speech
-    Anger, Joy, Pain, Surprise,
-    Formal, Colloquial, Slang, Jargon, Technical,
-    Polite, Familiar, Intimate, Reverential,
-    Metaphor, Metonymy, Hyperbole, Irony,
-    // Conjunctive shorthand used in corpora (e.g. `.@but`, `.@although`)
-    But, Although,
-    /// Any attribute not in this enum, preserved verbatim (e.g. `"@foo"`).
-    Other(SmolStr),
+    Anger = "anger", Joy = "joy", Pain = "pain", Surprise = "surprise",
+    Formal = "formal", Colloquial = "colloquial", Slang = "slang", Jargon = "jargon",
+    Technical = "technical",
+    Polite = "polite", Familiar = "familiar", Intimate = "intimate",
+    Reverential = "reverential",
+    Metaphor = "metaphor", Metonymy = "metonymy", Hyperbole = "hyperbole", Irony = "irony",
+    // Conjunctive shorthand used in corpora (e.g. `@but`, `@although`)
+    But = "but", Although = "although",
 }
 
 /// An ordered list of attributes attached to a UW. Order is preserved (some
@@ -140,5 +192,34 @@ mod tests {
         let l: AttrList = [Attr::Plural, Attr::Def].into_iter().collect();
         assert_eq!(l.len(), 2);
         assert!(l.contains(&Attr::Plural));
+    }
+
+    #[test]
+    fn label_roundtrips_for_every_named_variant() {
+        for a in Attr::NAMED {
+            assert_eq!(Attr::from_label(a.as_label()), a.clone());
+        }
+    }
+
+    #[test]
+    fn named_labels_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for a in Attr::NAMED {
+            assert!(seen.insert(a.as_label()), "duplicate label {}", a.as_label());
+        }
+    }
+
+    #[test]
+    fn unknown_label_becomes_other() {
+        assert_eq!(Attr::from_label("x_foo"), Attr::Other("x_foo".into()));
+        assert_eq!(Attr::Other("x_foo".into()).as_label(), "x_foo");
+    }
+
+    #[test]
+    fn known_label_matches_attributes_toml() {
+        // Spot-check a few labels against data/attributes.toml.
+        assert_eq!(Attr::Def.as_label(), "def");
+        assert_eq!(Attr::NeuterGender.as_label(), "neuter_gender");
+        assert_eq!(Attr::P1.as_label(), "p1");
     }
 }
