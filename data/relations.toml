@@ -1,0 +1,223 @@
+# Universal relations — UNL 2010, spec §4.
+#
+# Source-of-truth documentation for the relation set and its subsumption
+# hierarchy. The `parent` field is the immediate supertype (absent => root) and
+# mirrors `RelationTag::parent()` in unl-core. An agent that does not understand
+# a specific relation may fall back to its parent.
+#
+# Rev 1 encodes the place family (gol/lpl/src/via -> plc) and the boundary-time
+# relations (tmf/tmt -> tim). Remaining subsumption edges are added here and in
+# unl-core together as the full §4.3 hierarchy is transcribed.
+
+scheme = "UNL 2010"
+
+[[relation]] # 1
+tag = "agt"
+name = "agent"
+desc = "The thing that initiates an action."
+
+[[relation]] # 2
+tag = "and"
+name = "conjunction"
+desc = "A conjunctive relation between concepts."
+
+[[relation]] # 3
+tag = "ant"
+name = "antonym"
+desc = "A concept that is the opposite of another."
+
+[[relation]] # 4
+tag = "aoj"
+name = "thing with attribute"
+desc = "A thing that is in a state or has an attribute."
+
+[[relation]] # 5
+tag = "bas"
+name = "basis"
+desc = "The basis for a comparison (degree/extent)."
+
+[[relation]] # 6
+tag = "ben"
+name = "beneficiary"
+desc = "The (un)beneficiary of an event or state."
+
+[[relation]] # 7
+tag = "cnt"
+name = "content"
+desc = "The content or theme of a concept."
+
+[[relation]] # 8
+tag = "con"
+name = "condition"
+desc = "A condition under which an event/state holds."
+
+[[relation]] # 9
+tag = "coo"
+name = "co-occurrence"
+desc = "A co-occurring event or state."
+
+[[relation]] # 10
+tag = "dur"
+name = "duration"
+desc = "The duration of an event or state."
+
+[[relation]] # 11
+tag = "equ"
+name = "equivalence"
+desc = "An equivalent (synonymous) concept."
+
+[[relation]] # 12
+tag = "exp"
+name = "experiencer"
+desc = "The thing that experiences an event/state."
+
+[[relation]] # 13
+tag = "fld"
+name = "field"
+desc = "The semantic field or domain of a concept."
+
+[[relation]] # 14
+tag = "gol"
+name = "goal"
+desc = "The final state or destination (place)."
+parent = "plc"
+
+[[relation]] # 15
+tag = "icl"
+name = "inclusion"
+desc = "A more general concept (hypernym / is-a-kind-of)."
+
+[[relation]] # 16
+tag = "ins"
+name = "instrument"
+desc = "The instrument used to carry out an event."
+
+[[relation]] # 17
+tag = "iof"
+name = "instance of"
+desc = "An instance of a class (named individual)."
+
+[[relation]] # 18
+tag = "lpl"
+name = "logical place"
+desc = "The place where an event/state holds (place)."
+parent = "plc"
+
+[[relation]] # 19
+tag = "man"
+name = "manner"
+desc = "The way an event is carried out or a state holds."
+
+[[relation]] # 20
+tag = "mat"
+name = "material"
+desc = "The material an object is made of."
+
+[[relation]] # 21
+tag = "met"
+name = "method"
+desc = "The method or means of an event."
+
+[[relation]] # 22
+tag = "mod"
+name = "modification"
+desc = "A concept that restricts/modifies another."
+
+[[relation]] # 23
+tag = "nam"
+name = "name"
+desc = "The name of a thing."
+
+[[relation]] # 24
+tag = "obj"
+name = "affected thing"
+desc = "The thing affected by an event/state."
+
+[[relation]] # 25
+tag = "opl"
+name = "affected place"
+desc = "The place of the thing affected by an event."
+
+[[relation]] # 26
+tag = "or"
+name = "disjunction"
+desc = "A disjunctive relation between concepts."
+
+[[relation]] # 27
+tag = "per"
+name = "proportion/rate"
+desc = "Basis of a rate, proportion, or distribution."
+
+[[relation]] # 28
+tag = "plc"
+name = "place"
+desc = "The place where an event or state occurs."
+
+[[relation]] # 29
+tag = "pof"
+name = "part of"
+desc = "A whole of which the concept is a part."
+
+[[relation]] # 30
+tag = "pos"
+name = "possessor"
+desc = "The possessor of a thing."
+
+[[relation]] # 31
+tag = "ptn"
+name = "partner"
+desc = "An indispensable co-participant in an event."
+
+[[relation]] # 32
+tag = "pur"
+name = "purpose"
+desc = "The purpose or objective of an agent/thing."
+
+[[relation]] # 33
+tag = "qua"
+name = "quantity"
+desc = "The quantity or amount of a thing."
+
+[[relation]] # 34
+tag = "res"
+name = "result"
+desc = "The result of an event."
+
+[[relation]] # 35
+tag = "rsn"
+name = "reason"
+desc = "The reason an event or state occurs."
+
+[[relation]] # 36
+tag = "seq"
+name = "sequence"
+desc = "A prior event/state in a sequence."
+
+[[relation]] # 37
+tag = "src"
+name = "source"
+desc = "The initial state or origin (place)."
+parent = "plc"
+
+[[relation]] # 38
+tag = "tim"
+name = "time"
+desc = "The time at which an event/state occurs."
+
+[[relation]] # 39
+tag = "tmf"
+name = "initial time"
+desc = "The time at which an event/state begins (time)."
+parent = "tim"
+
+[[relation]] # 40
+tag = "tmt"
+name = "final time"
+desc = "The time at which an event/state ends (time)."
+parent = "tim"
+
+[[relation]] # 41
+tag = "via"
+name = "intermediate place"
+desc = "An intermediate place/state of an event (place)."
+parent = "plc"

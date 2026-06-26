@@ -1,0 +1,79 @@
+# Universal attributes — UNL 2010, spec §3.3.
+#
+# Documentation companion to the `Attr` enum in unl-core. Attributes are a
+# closed, enumerable set grouped by semantic family. Per the resolved design
+# decision (manifest §2.2) the named variants are enumerated for exhaustiveness
+# checking; `Attr::Other` exists only as a post-2010 forward-compatibility hatch.
+#
+# This file lists the families and the members encoded in Rev 1. Remaining
+# members of each family are added here in lock-step with the enum.
+
+scheme = "UNL 2010"
+
+[family.time]
+desc = "Absolute and relative temporal location."
+attrs = ["past", "present", "future", "gnomic", "ante", "post", "recent",
+         "remote", "simultaneous", "immediate", "since", "until"]
+
+[family.aspect]
+desc = "Internal temporal structure of an event."
+attrs = ["progressive", "perfect", "perfective", "imperfective", "inceptive",
+         "terminative", "habitual", "iterative", "causative"]
+
+[family.specification]
+desc = "Definiteness and specification."
+attrs = ["def", "indef", "each", "own", "same", "certain", "only", "both",
+         "either", "wh"]
+
+[family.quantification]
+desc = "Number and amount."
+attrs = ["singular", "plural", "dual", "trial", "quadrual", "paucal", "multal",
+         "total", "universal"]
+
+[family.polarity]
+desc = "Affirmation, negation, and epistemic stance."
+attrs = ["affirmative", "negative", "dubitative", "neutral"]
+
+[family.voice]
+desc = "Diathesis / argument realization."
+attrs = ["active", "passive", "middle", "reflexive", "reciprocal",
+         "anticausative", "impersonal"]
+
+[family.person]
+desc = "Grammatical person."
+attrs = ["p1", "p2", "p3"]
+
+[family.gender_animacy]
+desc = "Gender and animacy."
+attrs = ["male", "female", "neuter_gender", "animal", "person", "thing"]
+
+[family.modality]
+desc = "Belief, command, request, ability, and related modal force."
+attrs = ["ability", "advice", "belief", "command", "request", "desire",
+         "necessity", "possibility", "obligation", "permission"]
+
+[family.place]
+desc = "Location, position, and direction."
+attrs = ["superior", "inferior", "interior", "exterior", "anterior",
+         "posterior", "adjacent", "proximal", "distal", "destination",
+         "origin", "transversal"]
+
+[family.pragmatics_emotion]
+desc = "Emotional colouring."
+attrs = ["anger", "joy", "pain", "surprise"]
+
+[family.pragmatics_register]
+desc = "Register."
+attrs = ["formal", "colloquial", "slang", "jargon", "technical"]
+
+[family.pragmatics_deixis]
+desc = "Social deixis / politeness."
+attrs = ["polite", "familiar", "intimate", "reverential"]
+
+[family.pragmatics_figures]
+desc = "Figures of speech."
+attrs = ["metaphor", "metonymy", "hyperbole", "irony"]
+
+[family.conjunctive]
+desc = "Conjunctive shorthand used in corpora (e.g. .@but, .@although)."
+attrs = ["but", "although"]

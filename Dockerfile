@@ -24,16 +24,16 @@ ENV PROTOC=/usr/bin/protoc
 # Create app directory
 WORKDIR /build
 
-# Copy source
+# Copy workspace manifest + lockfile, then all member crates. unl-core's
+# manifest must be present for cargo to resolve the workspace graph even when
+# only fipa-node is built. (build.rs, benches/ and README.md now live inside
+# crates/fipa-wasm-agents/.)
 COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-COPY benches/ benches/
-COPY build.rs ./
+COPY crates/ crates/
 COPY fipa.wit ./
-COPY README.md ./
 
 # Build release binary
-RUN cargo build --release --bin fipa-node
+RUN cargo build --release -p fipa-wasm-agents --bin fipa-node
 
 # Strip binary for smaller size
 RUN strip /build/target/release/fipa-node

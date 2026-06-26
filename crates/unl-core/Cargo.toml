@@ -1,0 +1,17 @@
+[package]
+name = "unl-core"
+version = "0.1.0"
+description = "Foundational types for the UNL (Universal Networking Language) semantic hypergraph"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# unl-core depends on nothing but std + serde (plus light helpers). No async, no I/O.
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+smol_str.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0"
