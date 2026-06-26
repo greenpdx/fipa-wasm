@@ -1,0 +1,21 @@
+[package]
+name = "unl-llm"
+version = "0.1.0"
+description = "LLM-assisted UNLization — LLM proposes, validator disposes — over a pluggable reasoning backend (Ollama by default)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+unl-kb = { path = "../unl-kb" }
+unl-validator = { path = "../unl-validator" }
+serde = { workspace = true }
+serde_json = "1.0"
+thiserror.workspace = true
+async-trait = "0.1"
+# Local-LLM transport. rustls (no OpenSSL), matching the rest of the workspace.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
