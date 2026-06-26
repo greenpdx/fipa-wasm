@@ -1,7 +1,7 @@
 //! Fixture tests (canonical spec examples) and the round-trip property tests
 //! that pin the manifest's `parse(serialize(g)) == g` invariant.
 
-use crate::{parse_legacy_document, parse_sentence, serialize_list, serialize_table};
+use crate::{parse_sentence, serialize_list, serialize_table};
 use unl_core::*;
 
 fn uw(uci: Uci, attrs: Vec<Attr>) -> Uw {
@@ -124,9 +124,9 @@ fn null_and_temporary_roundtrip() {
 }
 
 #[test]
-fn deferred_document_formats_report_unsupported() {
+fn xml_document_format_still_unsupported() {
     assert!(matches!(
-        parse_legacy_document("[D]...[/D]"),
+        crate::parse_document("<unl/>"),
         Err(crate::ParseError::Unsupported(_))
     ));
 }

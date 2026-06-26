@@ -22,13 +22,14 @@
 //!   both the trait and the type are foreign to this crate, so the orphan rule
 //!   forbids it. Serialization is exposed as free functions instead; `ToUnl`
 //!   would be implemented in `unl-core` if serialization ever moves there.
-//! - [`parse_document`] (UNL/XML) and [`parse_legacy_document`] (the UNLarium
-//!   plain-text export) return [`ParseError::Unsupported`] — they are blocked on
-//!   access to the surviving corpora so the exact delimiters are matched, not
-//!   guessed.
+//! - [`parse_legacy_document`] now reads the surviving UNLarium `[D]/[S]/{org}/
+//!   {unl}` corpus format (see the `legacy` module); the AESOP corpus is the
+//!   golden fixture. [`parse_document`] (UNL/XML, spec §6) is still stubbed
+//!   ([`ParseError::Unsupported`]) pending an XML sample.
 
 mod error;
 mod grammar;
+mod legacy;
 mod list;
 mod table;
 
@@ -36,6 +37,7 @@ mod table;
 mod tests;
 
 pub use error::ParseError;
+pub use legacy::{parse_legacy_document, serialize_legacy_document};
 pub use list::{parse_list, serialize_list};
 pub use table::{parse_table, serialize_table};
 
@@ -75,9 +77,3 @@ pub fn parse_document(_xml: &str) -> Result<UnlDocument, ParseError> {
     Err(ParseError::Unsupported("UNL/XML document format"))
 }
 
-/// Parse the legacy plain-text document format (`[D]...[S]...{org}...{unl}...`)
-/// emitted by the UNLarium corpus export. **Not yet implemented** — see the
-/// crate-level deviations note.
-pub fn parse_legacy_document(_text: &str) -> Result<UnlDocument, ParseError> {
-    Err(ParseError::Unsupported("legacy UNLarium document format"))
-}
