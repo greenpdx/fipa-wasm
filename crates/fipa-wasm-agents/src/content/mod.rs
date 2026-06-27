@@ -41,6 +41,8 @@
 //! let decoded = manager.decode("fipa-sl", &encoded)?;
 //! ```
 
+/// Typed-block container (resource-fork style) for agent bundles and messages.
+pub mod block;
 pub mod codec;
 pub mod ontology;
 pub mod sl_codec;
