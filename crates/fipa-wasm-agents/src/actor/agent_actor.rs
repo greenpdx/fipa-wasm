@@ -42,6 +42,10 @@ pub struct AgentActor {
     /// `None` => no content-language verification (deliver as-is).
     verifier: Option<Arc<dyn crate::content::verify::ContentVerifier>>,
 
+    /// Outbound packager: validates + packages the agent's emitted sends.
+    /// `None` => the agent's `send-unl` emits are dropped.
+    outbound: Option<Arc<dyn crate::content::verify::OutboundPackager>>,
+
     /// Runtime state
     state: AgentRuntimeState,
 
@@ -78,6 +82,7 @@ impl AgentActor {
             network: None,
             registry: None,
             verifier: None,
+            outbound: None,
             state: AgentRuntimeState::Starting,
             stats: AgentStats::default(),
             start_time: Instant::now(),
@@ -111,6 +116,38 @@ impl AgentActor {
     ) -> Self {
         self.verifier = Some(verifier);
         self
+    }
+
+    /// Attach the outbound packager that validates + packages the agent's
+    /// emitted `send-unl` messages before transmission.
+    pub fn with_outbound_packager(
+        mut self,
+        packager: Arc<dyn crate::content::verify::OutboundPackager>,
+    ) -> Self {
+        self.outbound = Some(packager);
+        self
+    }
+
+    /// Drain the messages the agent emitted via `send-unl`, validate + package
+    /// each against the receiver, and transmit. Dropped (with a warning) if the
+    /// receiver would not understand it.
+    fn flush_outbound(&mut self, ctx: &mut Context<Self>) {
+        let Some(packager) = self.outbound.clone() else {
+            return;
+        };
+        for intent in self.runtime.take_unl_sends() {
+            match packager.package(&self.agent_id.name, &intent.receiver, &intent.unl, &intent.body)
+            {
+                Ok(msg) => {
+                    let _ = self.send_message(msg, ctx);
+                }
+                Err(reason) => warn!(
+                    agent = %self.agent_id.name,
+                    receiver = %intent.receiver,
+                    "dropping outbound message: {}", reason,
+                ),
+            }
+        }
     }
 
     /// Process messages from the mailbox
@@ -164,6 +201,8 @@ impl AgentActor {
                         error!(agent = %self.agent_id.name, "agent config(UNL, body) failed: {}", e);
                         self.stats.errors += 1;
                     }
+                    // The agent may have emitted replies during config — ship them.
+                    self.flush_outbound(ctx);
                     return Ok(());
                 }
                 Ok(None) => {} // not decoded content — fall through to the raw path

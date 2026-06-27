@@ -2,15 +2,15 @@
 
 use actix::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::actor::messages::*;
 use crate::actor::AgentActor;
 use crate::content::block::{BlockFile, TAG_WASM};
-use crate::content::unl::UnlVerifier;
-use crate::content::verify::ContentVerifier;
+use crate::content::unl::{vocabulary_from_bundle, UnlPackager, UnlVerifier, VocabRegistry};
+use crate::content::verify::{ContentVerifier, OutboundPackager};
 use crate::proto;
 use crate::wasm::WasmRuntime;
 
@@ -32,6 +32,13 @@ pub struct Supervisor {
     /// Per-agent verifier overrides, keyed by agent name (each agent ships its
     /// own vocabulary). Takes precedence over the default.
     agent_verifiers: HashMap<String, Arc<dyn ContentVerifier>>,
+
+    /// Shared registry of agents' vocabularies, so the node can check an
+    /// outgoing message against the receiver. Populated at spawn from UNL blocks.
+    vocab_registry: Arc<RwLock<VocabRegistry>>,
+
+    /// Outbound packager shared by spawned agents (validate + package sends).
+    outbound: Arc<dyn OutboundPackager>,
 
     /// Node ID for this supervisor
     node_id: String,
@@ -61,12 +68,17 @@ struct SupervisedAgent {
 impl Supervisor {
     /// Create a new supervisor
     pub fn new(node_id: String) -> Self {
+        let vocab_registry = Arc::new(RwLock::new(VocabRegistry::new()));
+        let outbound: Arc<dyn OutboundPackager> =
+            Arc::new(UnlPackager::new(vocab_registry.clone()));
         Self {
             agents: HashMap::new(),
             network: None,
             registry: None,
             default_verifier: None,
             agent_verifiers: HashMap::new(),
+            vocab_registry,
+            outbound,
             node_id,
         }
     }
@@ -178,11 +190,23 @@ impl Supervisor {
             actor = actor.with_registry(registry.clone());
         }
 
+        // Register the agent's own vocabulary so other agents' outgoing messages
+        // can be checked against it (the receiver-side of the send pipeline).
+        if let Some(b) = &bundle
+            && let Some(Ok(vocab)) = vocabulary_from_bundle(b)
+            && let Ok(mut reg) = self.vocab_registry.write()
+        {
+            reg.register(agent_name.clone(), vocab);
+        }
+
         // Verifier precedence: operator override > the agent's own UNL block
         // (its declared rules) > the supervisor default.
         if let Some(verifier) = self.select_verifier(&agent_name, bundle.as_ref()) {
             actor = actor.with_content_verifier(verifier);
         }
+
+        // The shared outbound packager (validate + package the agent's sends).
+        actor = actor.with_outbound_packager(self.outbound.clone());
 
         let addr = actor.start();
 

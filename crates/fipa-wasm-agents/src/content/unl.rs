@@ -25,7 +25,9 @@
 use crate::content::block::{BlockFile, TAG_DATA, TAG_UNL};
 use crate::content::verify::ContentVerifier;
 use crate::proto::{AclMessage, AgentId, Performative};
+use crate::content::verify::OutboundPackager;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use unl_core::UnlGraph;
 use unl_kb::Vocabulary;
 use unl_validator::Diagnostic;
@@ -66,15 +68,51 @@ impl UnlVerifier {
     /// (process). Returns `None` if the bundle has no UNL block (the agent
     /// declares no UNL rules), `Some(Err)` if the block is malformed.
     pub fn from_bundle(bundle: &BlockFile) -> Option<Result<UnlVerifier, serde_json::Error>> {
-        let bytes = bundle.get(TAG_UNL)?;
-        Some(serde_json::from_slice::<Vocabulary>(bytes).map(UnlVerifier::new))
+        Some(vocabulary_from_bundle(bundle)?.map(UnlVerifier::new))
     }
+}
+
+/// Deserialize an agent's [`Vocabulary`] from its `UNL ` block. `None` if the
+/// bundle has no UNL block.
+pub fn vocabulary_from_bundle(bundle: &BlockFile) -> Option<Result<Vocabulary, serde_json::Error>> {
+    let bytes = bundle.get(TAG_UNL)?;
+    Some(serde_json::from_slice::<Vocabulary>(bytes))
 }
 
 /// Serialize a vocabulary into the bytes of an agent's `UNL ` block (the
 /// authoring side — produces the rules an agent ships).
 pub fn vocabulary_block(vocab: &Vocabulary) -> Vec<u8> {
     serde_json::to_vec(vocab).expect("Vocabulary serializes")
+}
+
+/// The UNL outbound packager: validate the agent's emitted UNL against the
+/// receiver's vocabulary (in the shared registry), then package it. The UNL
+/// implementation of the content-agnostic [`OutboundPackager`] seam.
+pub struct UnlPackager {
+    registry: Arc<RwLock<VocabRegistry>>,
+}
+
+impl UnlPackager {
+    pub fn new(registry: Arc<RwLock<VocabRegistry>>) -> Self {
+        UnlPackager { registry }
+    }
+}
+
+impl OutboundPackager for UnlPackager {
+    fn package(
+        &self,
+        sender: &str,
+        receiver: &str,
+        unl: &[u8],
+        body: &[u8],
+    ) -> Result<AclMessage, String> {
+        let text = std::str::from_utf8(unl).map_err(|_| "outgoing UNL is not UTF-8".to_string())?;
+        let graph = unl_parser::parse_sentence(text).map_err(|e| e.to_string())?;
+        let registry = self.registry.read().map_err(|_| "vocab registry poisoned".to_string())?;
+        package_outbound(sender, receiver, &graph, body, &registry).map_err(|diags| {
+            format!("receiver '{receiver}' would not understand ({} issue(s))", diags.len())
+        })
+    }
 }
 
 impl ContentVerifier for UnlVerifier {

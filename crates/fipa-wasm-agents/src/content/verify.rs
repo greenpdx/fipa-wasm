@@ -33,6 +33,22 @@ pub trait ContentVerifier: Send + Sync {
     }
 }
 
+/// Packages an agent's emitted send into a transmittable message, validating it
+/// against the receiver first. Content-agnostic; UNL is one implementation
+/// (`content::unl::UnlPackager`). The symmetric outbound counterpart of
+/// [`ContentVerifier`].
+pub trait OutboundPackager: Send + Sync {
+    /// `Ok(msg)` = ready to transmit; `Err(reason)` = do not transmit (e.g. the
+    /// receiver would not understand it).
+    fn package(
+        &self,
+        sender: &str,
+        receiver: &str,
+        unl: &[u8],
+        body: &[u8],
+    ) -> Result<AclMessage, String>;
+}
+
 /// Build the `not-understood` reply for a message that could not be vetted —
 /// threaded back to the original sender, echoing the conversation. Purely a
 /// FIPA-envelope operation; carries no content and no content language.
