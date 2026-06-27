@@ -44,6 +44,8 @@
 pub mod codec;
 pub mod ontology;
 pub mod sl_codec;
+/// UNL semantic content language bridge (the unl-* stack + unl-fipa).
+pub mod unl;
 
 pub use codec::{Codec, CodecError, CodecRegistry};
 pub use ontology::{

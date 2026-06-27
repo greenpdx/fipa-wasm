@@ -97,6 +97,15 @@ parking_lot = "0.12"
 bytes = "1.9"
 derive_more = { version = "2.0", features = ["display", "from", "into"] }
 
+# UNL semantic content language (the unl-* stack). unl-fipa pulls
+# unl-core/parser/validator/kb/a2a transitively; the others are referenced
+# directly by the content/unl bridge. None of these pull the LLM/HTTP stack.
+unl-fipa = { path = "../unl-fipa" }
+unl-core = { path = "../unl-core" }
+unl-kb = { path = "../unl-kb" }
+unl-parser = { path = "../unl-parser" }
+unl-validator = { path = "../unl-validator" }
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 prost-build = "0.14"
