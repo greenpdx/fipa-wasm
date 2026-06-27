@@ -13,10 +13,12 @@
 //! validator consumes it. Remote/async KBs are a separate concern layered on
 //! top, not a change to this trait.
 
+mod graph_kb;
 mod mem;
 mod sled_kb;
 mod wordnet;
 
+pub use graph_kb::GraphKb;
 pub use mem::{ConceptSeed, MemKb};
 pub use sled_kb::{BuildStats, SledKb};
 pub use wordnet::WordNetKb;
