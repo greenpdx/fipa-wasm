@@ -145,6 +145,30 @@ async fn exhausted_repairs_returns_structured_error() {
     assert!(matches!(err, LlmError::Decode(_)));
 }
 
+/// A grounder that always returns a fixed concept (stands in for a vector index).
+struct FixedGrounder(Vec<Uci>);
+
+#[async_trait]
+impl SemanticGrounder for FixedGrounder {
+    async fn related_concepts(&self, _context: &str, _k: usize) -> Result<Vec<Uci>, LlmError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn unlize_with_semantic_grounder() {
+    let backend = MockBackend::new(vec![
+        r#"{"nodes":[{"id":"01","uw":"cat"},{"id":"02","uw":"animal"}],
+            "relations":[{"rel":"icl","from":"01","to":"02"}],"entry":"01"}"#,
+    ]);
+    // Grounder is invoked during prompt construction; pipeline still validates.
+    let unlizer = LlmUnlizer::new(backend, kb())
+        .with_grounder(Box::new(FixedGrounder(vec![Uci::ucl(102121620)])));
+    let out = unlizer.unlize("a cat is an animal", Lang::ENG).await.unwrap();
+    assert!(out.residual_diagnostics.is_empty());
+    assert_eq!(out.graph.relations[0].tag, RelationTag::Icl);
+}
+
 #[tokio::test]
 async fn null_proform_decodes() {
     let backend = MockBackend::new(vec![

@@ -22,6 +22,7 @@
 //! 5. **Repair** — feed diagnostics back for up to N bounded retries; surviving
 //!    structural errors are returned as residuals, not swallowed.
 
+mod embed;
 mod error;
 mod ollama;
 mod unlizer;
@@ -29,6 +30,7 @@ mod unlizer;
 #[cfg(test)]
 mod tests;
 
+pub use embed::{Embedder, OllamaEmbedder, SemanticGrounder, VectorGrounder, VectorIndex};
 pub use error::LlmError;
 pub use ollama::OllamaBackend;
 pub use unlizer::LlmUnlizer;

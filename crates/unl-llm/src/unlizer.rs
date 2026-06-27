@@ -1,6 +1,6 @@
 //! [`LlmUnlizer`] — the validate-and-repair pipeline (manifest §6).
 
-use crate::{LlmError, Prompt, ReasoningBackend, Unlization, Unlizer};
+use crate::{LlmError, Prompt, ReasoningBackend, SemanticGrounder, Unlization, Unlizer};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -15,12 +15,13 @@ pub struct LlmUnlizer<B, K> {
     backend: B,
     kb: K,
     max_repairs: usize,
+    grounder: Option<Box<dyn SemanticGrounder>>,
 }
 
 impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
-    /// Build with a default of 2 repair attempts.
+    /// Build with a default of 2 repair attempts and exact-only grounding.
     pub fn new(backend: B, kb: K) -> Self {
-        LlmUnlizer { backend, kb, max_repairs: 2 }
+        LlmUnlizer { backend, kb, max_repairs: 2, grounder: None }
     }
 
     /// Set the maximum number of repair retries fed back to the model.
@@ -29,9 +30,18 @@ impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
         self
     }
 
-    /// Grounding: candidate UCLs for each whitespace token, as hints. (Real
-    /// lemmatization is deferred; tokenization suffices for Rev 1.)
-    fn grounding(&self, text: &str, lang: Lang) -> String {
+    /// Augment exact KB grounding with embedding-based semantic retrieval
+    /// (the vector-index lever — see [`crate::VectorGrounder`]).
+    pub fn with_grounder(mut self, grounder: Box<dyn SemanticGrounder>) -> Self {
+        self.grounder = Some(grounder);
+        self
+    }
+
+    /// Grounding: candidate UCLs for each whitespace token, as hints, plus —
+    /// when a [`SemanticGrounder`] is configured — concepts retrieved by meaning
+    /// for the whole sentence. (Real lemmatization is deferred; tokenization
+    /// suffices for Rev 1.)
+    async fn grounding(&self, text: &str, lang: Lang) -> String {
         let mut lines = Vec::new();
         for token in text.split_whitespace() {
             let lemma = token.trim_matches(|c: char| !c.is_alphanumeric());
@@ -53,6 +63,21 @@ impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
                 }
             }
         }
+        if let Some(grounder) = &self.grounder
+            && let Ok(concepts) = grounder.related_concepts(text, 5).await
+        {
+            let ids: Vec<String> = concepts
+                .iter()
+                .filter_map(|u| match u {
+                    Uci::Ucl { id, .. } => Some(id.to_string()),
+                    _ => None,
+                })
+                .collect();
+            if !ids.is_empty() {
+                lines.push(format!("  (semantically related: {})", ids.join(", ")));
+            }
+        }
+
         if lines.is_empty() {
             "  (no KB candidates found; use readable headwords as UWs)".to_string()
         } else {
@@ -60,7 +85,7 @@ impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
         }
     }
 
-    fn base_prompt(&self, text: &str, lang: Lang) -> Prompt {
+    async fn base_prompt(&self, text: &str, lang: Lang) -> Prompt {
         let rels: Vec<&str> = RelationTag::ALL.iter().map(|t| t.as_str()).collect();
         let system = format!(
             "You convert a natural-language sentence into a UNL (Universal Networking \
@@ -79,7 +104,7 @@ impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
         let user = format!(
             "Language: {lang}\nSentence: {text}\n\nKB candidate concepts (lemma: ids):\n{hints}\n\n\
              Produce the UNL graph JSON.",
-            hints = self.grounding(text, lang)
+            hints = self.grounding(text, lang).await
         );
         Prompt {
             system,
@@ -92,7 +117,7 @@ impl<B: ReasoningBackend, K: KnowledgeBase> LlmUnlizer<B, K> {
 #[async_trait]
 impl<B: ReasoningBackend, K: KnowledgeBase + Send + Sync> Unlizer for LlmUnlizer<B, K> {
     async fn unlize(&self, text: &str, lang: Lang) -> Result<Unlization, LlmError> {
-        let base = self.base_prompt(text, lang);
+        let base = self.base_prompt(text, lang).await;
         let mut prompt = base.clone();
         let mut last_error: Option<String> = None;
 
