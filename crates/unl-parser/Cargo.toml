@@ -10,6 +10,7 @@ repository.workspace = true
 unl-core = { path = "../unl-core" }
 thiserror.workspace = true
 smol_str.workspace = true
+quick-xml = "0.36"
 
 [dev-dependencies]
 proptest = "1.6"

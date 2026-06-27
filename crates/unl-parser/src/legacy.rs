@@ -178,7 +178,7 @@ fn lang_from_code(code: &str) -> Result<Lang, ParseError> {
 // {unl} graph block
 // ---------------------------------------------------------------------------
 
-fn parse_legacy_graph(block: &str) -> Result<UnlGraph, ParseError> {
+pub(crate) fn parse_legacy_graph(block: &str) -> Result<UnlGraph, ParseError> {
     let mut g = UnlGraph::new();
     for line in block.lines() {
         let line = line.trim();
@@ -190,7 +190,7 @@ fn parse_legacy_graph(block: &str) -> Result<UnlGraph, ParseError> {
     Ok(g)
 }
 
-fn serialize_legacy_graph(g: &UnlGraph) -> String {
+pub(crate) fn serialize_legacy_graph(g: &UnlGraph) -> String {
     let mut out = String::new();
     for rel in &g.relations {
         out.push_str(rel.tag.as_str());

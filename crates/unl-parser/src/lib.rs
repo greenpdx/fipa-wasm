@@ -22,16 +22,18 @@
 //!   both the trait and the type are foreign to this crate, so the orphan rule
 //!   forbids it. Serialization is exposed as free functions instead; `ToUnl`
 //!   would be implemented in `unl-core` if serialization ever moves there.
-//! - [`parse_legacy_document`] now reads the surviving UNLarium `[D]/[S]/{org}/
+//! - [`parse_legacy_document`] reads the surviving UNLarium `[D]/[S]/{org}/
 //!   {unl}` corpus format (see the `legacy` module); the AESOP corpus is the
-//!   golden fixture. [`parse_document`] (UNL/XML, spec §6) is still stubbed
-//!   ([`ParseError::Unsupported`]) pending an XML sample.
+//!   golden fixture. [`parse_document`] / [`serialize_document`] handle the
+//!   UNL/XML document format (spec §6, `quick-xml`), with the graph body in the
+//!   legacy inline serialization.
 
 mod error;
 mod grammar;
 mod legacy;
 mod list;
 mod table;
+mod xml;
 
 #[cfg(test)]
 mod tests;
@@ -40,8 +42,9 @@ pub use error::ParseError;
 pub use legacy::{parse_legacy_document, serialize_legacy_document};
 pub use list::{parse_list, serialize_list};
 pub use table::{parse_table, serialize_table};
+pub use xml::{parse_document, serialize_document};
 
-use unl_core::{UnlDocument, UnlFormat, UnlGraph};
+use unl_core::{UnlFormat, UnlGraph};
 
 /// Parse a single UNL sentence in table or list format. Auto-detects: the
 /// presence of a `[W]` block means list format, otherwise table.
@@ -69,11 +72,5 @@ pub fn to_table(graph: &UnlGraph) -> String {
 /// Convenience: serialize to list format.
 pub fn to_list(graph: &UnlGraph) -> String {
     serialize_list(graph)
-}
-
-/// Parse a full UNL/XML document (spec §6). **Not yet implemented** — see the
-/// crate-level deviations note.
-pub fn parse_document(_xml: &str) -> Result<UnlDocument, ParseError> {
-    Err(ParseError::Unsupported("UNL/XML document format"))
 }
 

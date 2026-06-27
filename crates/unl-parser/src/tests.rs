@@ -123,13 +123,6 @@ fn null_and_temporary_roundtrip() {
     assert_eq!(parse_sentence(&text).unwrap(), g);
 }
 
-#[test]
-fn xml_document_format_still_unsupported() {
-    assert!(matches!(
-        crate::parse_document("<unl/>"),
-        Err(crate::ParseError::Unsupported(_))
-    ));
-}
 
 #[test]
 fn syntax_error_reports_offset() {
