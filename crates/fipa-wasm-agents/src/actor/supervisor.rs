@@ -2,6 +2,7 @@
 
 use actix::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +21,10 @@ pub struct Supervisor {
 
     /// Actor registry
     registry: Option<Addr<super::ActorRegistry>>,
+
+    /// Knowledge base passed to every spawned agent for UNL content
+    /// verification. `None` => agents run without content verification.
+    unl_kb: Option<Arc<dyn unl_kb::KnowledgeBase + Send + Sync>>,
 
     /// Node ID for this supervisor
     node_id: String,
@@ -53,6 +58,7 @@ impl Supervisor {
             agents: HashMap::new(),
             network: None,
             registry: None,
+            unl_kb: None,
             node_id,
         }
     }
@@ -66,6 +72,15 @@ impl Supervisor {
     /// Set the registry
     pub fn with_registry(mut self, registry: Addr<super::ActorRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Set the knowledge base every spawned agent uses to verify UNL content.
+    pub fn with_knowledge_base(
+        mut self,
+        kb: Arc<dyn unl_kb::KnowledgeBase + Send + Sync>,
+    ) -> Self {
+        self.unl_kb = Some(kb);
         self
     }
 
@@ -101,6 +116,10 @@ impl Supervisor {
 
         if let Some(registry) = &self.registry {
             actor = actor.with_registry(registry.clone());
+        }
+
+        if let Some(kb) = &self.unl_kb {
+            actor = actor.with_knowledge_base(kb.clone());
         }
 
         let addr = actor.start();
