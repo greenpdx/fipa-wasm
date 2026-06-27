@@ -11,3 +11,4 @@ publish = false
 ureq = "2"
 flate2 = "1"
 tar = "0.4"
+unl-kb = { path = "../crates/unl-kb" }

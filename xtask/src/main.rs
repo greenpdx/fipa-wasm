@@ -22,6 +22,7 @@ fn main() {
     let result = match cmd.as_deref() {
         Some("fetch-wordnet") => fetch_wordnet(rest.iter().any(|a| a == "--force")),
         Some("fetch-aesop") => fetch_aesop(),
+        Some("build-kb") => build_kb(),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
             usage();
@@ -42,6 +43,33 @@ fn usage() {
     eprintln!("usage: cargo run -p xtask -- <command>");
     eprintln!("  fetch-wordnet [--force]   download + extract WordNet 3.1 to data/kb-seed/");
     eprintln!("  fetch-aesop               download the AESOP UNL corpus to data/corpus/aesop/");
+    eprintln!("  build-kb                  compile the embedded SledKb from the WordNet seed");
+}
+
+/// Compile the embedded knowledge base (SledKb) from the WordNet 3.1 seed.
+fn build_kb() -> Result<(), Box<dyn Error>> {
+    use unl_kb::{SledKb, WordNetKb};
+
+    let root = workspace_root();
+    let dict = root.join("data/kb-seed/wordnet-3.1/dict");
+    let out = root.join("data/kb-seed/unl-kb.sled");
+    if !dict.join("data.noun").exists() {
+        return Err(format!(
+            "WordNet not found at {} — run `cargo run -p xtask -- fetch-wordnet` first",
+            dict.display()
+        )
+        .into());
+    }
+    println!("Compiling embedded KB from {} ...", dict.display());
+    let wordnet = WordNetKb::open(&dict)?;
+    let (_kb, stats) = SledKb::build_from_wordnet(&wordnet, &out)?;
+    println!(
+        "OK: {} concepts, {} lemmas -> {}",
+        stats.concepts,
+        stats.lemmas,
+        out.display()
+    );
+    Ok(())
 }
 
 /// The workspace root, derived from this crate's location (xtask/ -> ..), so the

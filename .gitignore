@@ -9,3 +9,6 @@ node_modules
 # Downloaded AESOP UNL corpus (fetched by `cargo run -p xtask -- fetch-aesop`).
 # No explicit open licence (UNDL Foundation terms), so fetched on demand, not vendored.
 /data/corpus/
+
+# Compiled embedded KB (built by `cargo run -p xtask -- build-kb` from the WordNet seed).
+/data/kb-seed/unl-kb.sled/

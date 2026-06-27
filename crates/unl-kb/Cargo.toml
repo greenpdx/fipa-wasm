@@ -12,3 +12,11 @@ thiserror.workspace = true
 serde.workspace = true
 smol_str.workspace = true
 toml = "0.9"
+serde_json = "1.0"
+# Embedded store (fulfils the manifest's "RocksKb" role). Pure-Rust; RocksDB
+# needs libclang, which the workspace deliberately avoids — same choice as
+# fipa-wasm-agents.
+sled = "0.34"
+
+[dev-dependencies]
+tempfile = "3"

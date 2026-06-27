@@ -366,6 +366,57 @@ fn concept_relation(tag: RelationTag, source: &Uci, target: Uci) -> Relation {
     }
 }
 
+impl WordNetKb {
+    /// Stream every synset across all four POS data files, calling `f` with the
+    /// concept's UCL id, features, and UNL-mapped links (relation + target UCL).
+    /// Used to compile the embedded [`crate::SledKb`].
+    pub(crate) fn for_each_concept(
+        &self,
+        mut f: impl FnMut(u64, ConceptFeatures, Vec<(RelationTag, u64)>),
+    ) -> Result<(), KbError> {
+        for pos in Pos::ALL {
+            let path = self.dict.join(format!("data.{}", pos.suffix()));
+            let content =
+                std::fs::read_to_string(&path).map_err(|e| KbError::Storage(e.to_string()))?;
+            for line in content.lines() {
+                if line.starts_with("  ") || line.is_empty() {
+                    continue;
+                }
+                let Some(offset) = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|t| t.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let syn = parse_synset(line)?;
+                let features = ConceptFeatures {
+                    category: pos.lex_category(),
+                    abstract_: false,
+                    gloss: Some(syn.gloss),
+                };
+                let links = syn
+                    .links
+                    .iter()
+                    .map(|&(tag, tpos, toff)| (tag, tpos.ucl(toff)))
+                    .collect();
+                f(pos.ucl(offset), features, links);
+            }
+        }
+        Ok(())
+    }
+
+    /// The loaded lemma index as `(lemma, [ucl ids])` pairs.
+    pub(crate) fn index_entries(&self) -> impl Iterator<Item = (&str, Vec<u64>)> {
+        self.index.iter().map(|(lemma, senses)| {
+            (
+                lemma.as_str(),
+                senses.iter().map(|&(pos, off)| pos.ucl(off)).collect(),
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
