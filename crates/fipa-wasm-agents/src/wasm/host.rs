@@ -21,6 +21,10 @@ pub struct HostState {
     /// Outgoing messages to send
     pub outbox: VecDeque<proto::AclMessage>,
 
+    /// Raw UNL send intents emitted by the agent via `send-unl`. The node
+    /// validates each against the receiver's vocabulary and packages it.
+    pub unl_sends: Vec<OutboundIntent>,
+
     /// Persistent storage
     pub storage: HashMap<String, Vec<u8>>,
 
@@ -70,6 +74,7 @@ impl HostState {
             node_id: String::new(),
             mailbox: VecDeque::new(),
             outbox: VecDeque::new(),
+            unl_sends: Vec::new(),
             storage: HashMap::new(),
             storage_usage: 0,
             services: vec![],
@@ -186,6 +191,16 @@ impl HostState {
         self.services.retain(|s| s.name != name);
         self.services.len() < len_before
     }
+}
+
+/// A raw UNL send the agent emitted via the `send-unl` host import: the
+/// receiver, the semantic (UNL) bytes, and the data payload. The node validates
+/// it against the receiver's vocabulary, then packages and transmits it.
+#[derive(Clone, Debug)]
+pub struct OutboundIntent {
+    pub receiver: String,
+    pub unl: Vec<u8>,
+    pub body: Vec<u8>,
 }
 
 /// Storage error types

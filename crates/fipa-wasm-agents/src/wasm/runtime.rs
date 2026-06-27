@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use wasmtime::*;
 
 use crate::proto;
-use super::host::HostState;
+use super::host::{HostState, OutboundIntent};
 
 /// WASM Runtime for executing agent modules
 pub struct WasmRuntime {
@@ -91,6 +91,34 @@ impl WasmRuntime {
             let state = caller.data();
             if state.mailbox.is_empty() { 0 } else { 1 }
         })?;
+
+        // The agent emits a message: send-unl(receiver, unl, body) as (ptr,len)
+        // triples into WASM memory. The node validates + packages + transmits it.
+        linker.func_wrap(
+            "fipa:agent/messaging",
+            "send-unl",
+            |mut caller: Caller<'_, HostState>,
+             rp: i32, rl: i32, up: i32, ul: i32, bp: i32, bl: i32| {
+                let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                else {
+                    return;
+                };
+                let read = |caller: &Caller<'_, HostState>, ptr: i32, len: i32| -> Vec<u8> {
+                    let data = memory.data(caller);
+                    let start = ptr as usize;
+                    data.get(start..start + len as usize)
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default()
+                };
+                let receiver = String::from_utf8_lossy(&read(&caller, rp, rl)).into_owned();
+                let unl = read(&caller, up, ul);
+                let body = read(&caller, bp, bl);
+                caller
+                    .data_mut()
+                    .unl_sends
+                    .push(OutboundIntent { receiver, unl, body });
+            },
+        )?;
 
         // Lifecycle functions
         linker.func_wrap("fipa:agent/lifecycle", "get-agent-id", |_caller: Caller<'_, HostState>| -> i64 {
@@ -220,6 +248,13 @@ impl WasmRuntime {
             (unl_ptr, unl.len() as i32, body_ptr, body.len() as i32),
         )?;
         Ok(())
+    }
+
+    /// Drain the UNL send intents the agent emitted via `send-unl`. The node
+    /// validates each against the receiver's vocabulary, packages it, and
+    /// transmits it.
+    pub fn take_unl_sends(&mut self) -> Vec<OutboundIntent> {
+        std::mem::take(&mut self.store.data_mut().unl_sends)
     }
 
     /// Allocate `n` bytes in WASM memory via the guest's `alloc` export.
@@ -357,5 +392,38 @@ mod config_abi_tests {
         let mut rt = WasmRuntime::new(BARE.as_bytes(), &caps()).unwrap();
         rt.call_init().unwrap();
         rt.call_config(b"x", b"y").unwrap(); // graceful no-op
+    }
+
+    // A guest that emits one message via the host's `send-unl` import: receiver
+    // "bob" at offset 0, UNL "agt(go,bob)" at 16, body byte 0x07 at 64.
+    const EMIT_GUEST: &str = r#"
+    (module
+      (import "fipa:agent/messaging" "send-unl"
+        (func $send (param i32 i32 i32 i32 i32 i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0) "bob")
+      (data (i32.const 16) "agt(go,bob)")
+      (data (i32.const 64) "\07")
+      (func (export "init"))
+      (func (export "run") (result i32)
+        (call $send
+          (i32.const 0) (i32.const 3)    ;; receiver
+          (i32.const 16) (i32.const 11)  ;; unl
+          (i32.const 64) (i32.const 1))  ;; body
+        (i32.const 0)))
+    "#;
+
+    #[test]
+    fn send_unl_captures_agent_emit() {
+        let mut rt = WasmRuntime::new(EMIT_GUEST.as_bytes(), &caps()).unwrap();
+        rt.call_init().unwrap();
+        rt.call_run().unwrap();
+        let sends = rt.take_unl_sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].receiver, "bob");
+        assert_eq!(sends[0].unl, b"agt(go,bob)");
+        assert_eq!(sends[0].body, &[0x07]);
+        // Drained.
+        assert!(rt.take_unl_sends().is_empty());
     }
 }
