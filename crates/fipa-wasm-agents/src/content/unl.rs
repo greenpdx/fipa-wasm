@@ -28,6 +28,7 @@ use crate::proto::{AclMessage, AgentId, Performative};
 use std::collections::HashMap;
 use unl_core::UnlGraph;
 use unl_kb::Vocabulary;
+use unl_validator::Diagnostic;
 
 /// The content-language tag agents set on UNL messages (`AclMessage.language`).
 pub const CONTENT_LANGUAGE: &str = "UNL";
@@ -198,6 +199,69 @@ pub fn sanitize_inbound(
         graph,
         data: message_data(msg),
     }))
+}
+
+/// Node-side registry of agents' vocabularies, so the node can check an outgoing
+/// message against the **receiver's** words before transmitting — "will the
+/// receiver understand this?".
+#[derive(Default)]
+pub struct VocabRegistry {
+    by_agent: HashMap<String, Vocabulary>,
+}
+
+impl VocabRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register (or replace) an agent's vocabulary.
+    pub fn register(&mut self, agent: impl Into<String>, vocab: Vocabulary) {
+        self.by_agent.insert(agent.into(), vocab);
+    }
+
+    pub fn get(&self, agent: &str) -> Option<&Vocabulary> {
+        self.by_agent.get(agent)
+    }
+
+    pub fn knows(&self, agent: &str) -> bool {
+        self.by_agent.contains_key(agent)
+    }
+}
+
+/// The sender flow (validate + package): check the outgoing UNL against the
+/// **receiver's** vocabulary, then package it into a message ready to transmit.
+/// `Err` = the receiver would not understand it (diagnostics; do not transmit).
+/// An unknown receiver (no vocabulary on file) is packaged optimistically — the
+/// node cannot pre-check it.
+pub fn package_outbound(
+    sender: &str,
+    receiver: &str,
+    graph: &UnlGraph,
+    body: &[u8],
+    registry: &VocabRegistry,
+) -> Result<AclMessage, Vec<Diagnostic>> {
+    if let Some(vocab) = registry.get(receiver) {
+        unl_validator::verify_vocabulary(graph, vocab)?;
+    }
+    let mut msg = AclMessage {
+        message_id: new_id(),
+        performative: Performative::Inform as i32,
+        sender: Some(agent_id(sender)),
+        receivers: vec![agent_id(receiver)],
+        reply_to: None,
+        protocol: None,
+        conversation_id: None,
+        in_reply_to: None,
+        reply_with: None,
+        reply_by: None,
+        language: None,
+        encoding: None,
+        ontology: None,
+        content: Vec::new(),
+        user_properties: HashMap::new(),
+    };
+    set_message_content(&mut msg, graph, body);
+    Ok(msg)
 }
 
 /// Render a UNL message in the standard FIPA-ACL string form via `unl-fipa`,
@@ -529,6 +593,29 @@ mod tests {
 
         let plain = base_msg(Performative::Request, "a", "b");
         assert!(v.sanitize(&plain).unwrap().is_none()); // non-UNL
+    }
+
+    #[test]
+    fn package_outbound_validates_against_receiver() {
+        // Receiver understands => packaged message with UNL + DATA blocks.
+        let mut reg = VocabRegistry::new();
+        reg.register("bob", vocab());
+        let msg = package_outbound("alice", "bob", &cat_icl_animal(), b"hi", &reg).unwrap();
+        assert_eq!(msg.sender.as_ref().unwrap().name, "alice");
+        assert_eq!(msg.receivers[0].name, "bob");
+        assert_eq!(first_tag(&msg), RelationTag::Icl);
+        assert_eq!(message_data(&msg), b"hi");
+
+        // Receiver missing the words => rejected, no message.
+        let mut narrow = VocabRegistry::new();
+        let mut empty_vocab = Vocabulary::new();
+        empty_vocab.allow_relations([RelationTag::Icl]); // knows the relation, no concepts
+        narrow.register("bob", empty_vocab);
+        assert!(package_outbound("alice", "bob", &cat_icl_animal(), b"", &narrow).is_err());
+
+        // Unknown receiver => optimistic packaged message (can't pre-check).
+        let empty = VocabRegistry::new();
+        assert!(package_outbound("alice", "carol", &cat_icl_animal(), b"", &empty).is_ok());
     }
 
     #[test]
