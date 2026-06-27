@@ -44,6 +44,8 @@
 pub mod codec;
 pub mod ontology;
 pub mod sl_codec;
+/// Content-agnostic verification seam (the FIPA layer's content boundary).
+pub mod verify;
 /// UNL semantic content language bridge (the unl-* stack + unl-fipa).
 pub mod unl;
 

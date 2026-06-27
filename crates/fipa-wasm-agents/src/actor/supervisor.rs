@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::messages::*;
 use crate::actor::AgentActor;
+use crate::content::verify::ContentVerifier;
 use crate::proto;
 use crate::wasm::WasmRuntime;
 
@@ -22,9 +23,13 @@ pub struct Supervisor {
     /// Actor registry
     registry: Option<Addr<super::ActorRegistry>>,
 
-    /// Knowledge base passed to every spawned agent for UNL content
-    /// verification. `None` => agents run without content verification.
-    unl_kb: Option<Arc<dyn unl_kb::KnowledgeBase + Send + Sync>>,
+    /// Default content verifier applied to spawned agents with no override.
+    /// `None` => those agents run without content verification.
+    default_verifier: Option<Arc<dyn ContentVerifier>>,
+
+    /// Per-agent verifier overrides, keyed by agent name (each agent ships its
+    /// own vocabulary). Takes precedence over the default.
+    agent_verifiers: HashMap<String, Arc<dyn ContentVerifier>>,
 
     /// Node ID for this supervisor
     node_id: String,
@@ -58,7 +63,8 @@ impl Supervisor {
             agents: HashMap::new(),
             network: None,
             registry: None,
-            unl_kb: None,
+            default_verifier: None,
+            agent_verifiers: HashMap::new(),
             node_id,
         }
     }
@@ -75,12 +81,20 @@ impl Supervisor {
         self
     }
 
-    /// Set the knowledge base every spawned agent uses to verify UNL content.
-    pub fn with_knowledge_base(
+    /// Set the default content verifier applied to spawned agents.
+    pub fn with_content_verifier(mut self, verifier: Arc<dyn ContentVerifier>) -> Self {
+        self.default_verifier = Some(verifier);
+        self
+    }
+
+    /// Override the content verifier for a specific agent (by name) — this is how
+    /// each agent ships its own vocabulary. Takes precedence over the default.
+    pub fn with_agent_verifier(
         mut self,
-        kb: Arc<dyn unl_kb::KnowledgeBase + Send + Sync>,
+        agent_name: impl Into<String>,
+        verifier: Arc<dyn ContentVerifier>,
     ) -> Self {
-        self.unl_kb = Some(kb);
+        self.agent_verifiers.insert(agent_name.into(), verifier);
         self
     }
 
@@ -118,8 +132,14 @@ impl Supervisor {
             actor = actor.with_registry(registry.clone());
         }
 
-        if let Some(kb) = &self.unl_kb {
-            actor = actor.with_knowledge_base(kb.clone());
+        // Per-agent verifier override, else the supervisor default.
+        if let Some(verifier) = self
+            .agent_verifiers
+            .get(&agent_name)
+            .cloned()
+            .or_else(|| self.default_verifier.clone())
+        {
+            actor = actor.with_content_verifier(verifier);
         }
 
         let addr = actor.start();

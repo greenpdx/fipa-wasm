@@ -1,34 +1,32 @@
 //! UNL content-language bridge.
 //!
 //! Wires the `unl-*` stack (and `unl-fipa`) into the runtime's wire message
-//! [`proto::AclMessage`]. UNL becomes a `content-language` agents can carry:
-//! the graph is serialized into the message `content` bytes with
-//! `language = "UNL"`, and a received message can be **verified against the
-//! local knowledge base before the agent acts on it** — failing into a
-//! `not-understood` reply by construction.
+//! [`proto::AclMessage`]. UNL becomes a `content-language` agents can carry: the
+//! graph is serialized into the message `content` bytes with `language = "UNL"`.
+//!
+//! [`UnlVerifier`] is the UNL implementation of the FIPA layer's
+//! [`crate::content::verify::ContentVerifier`] seam: it accepts UNL content only
+//! when it lies entirely within the **agent's [`Vocabulary`]** (and is
+//! structurally sound). Non-UNL content passes through. An out-of-vocabulary
+//! message is `not-understood` — the agent literally has no word for it.
 //!
 //! ```ignore
-//! use fipa_wasm_agents::content::unl;
+//! use fipa_wasm_agents::content::unl::UnlVerifier;
 //!
-//! // Attach semantic content:
+//! // The agent ships its own compact vocabulary:
+//! let verifier = UnlVerifier::new(my_vocabulary);
+//! supervisor.with_content_verifier(Arc::new(verifier));
+//!
+//! // Attach / read semantic content, or interop over FIPA-ACL strings:
 //! unl::set_unl_content(&mut msg, &graph);
-//!
-//! // On receipt — the security boundary:
-//! match unl::verify(&msg, &kb) {
-//!     Ok(()) => act_on(unl::unl_graph(&msg)?),
-//!     Err(_) => send(unl::not_understood(&msg, my_name)),
-//! }
-//!
-//! // Interop with external (non-wasm) UNL agents over FIPA-ACL strings:
 //! let wire = unl::to_fipa_string(&msg)?;
-//! let incoming = unl::from_fipa_string(&wire)?;
 //! ```
 
+use crate::content::verify::ContentVerifier;
 use crate::proto::{AclMessage, AgentId, Performative};
 use std::collections::HashMap;
 use unl_core::UnlGraph;
-use unl_kb::KnowledgeBase;
-use unl_validator::Diagnostic;
+use unl_kb::Vocabulary;
 
 /// The content-language tag agents set on UNL messages (`AclMessage.language`).
 pub const CONTENT_LANGUAGE: &str = "UNL";
@@ -45,8 +43,36 @@ pub enum UnlError {
     Fipa(String),
     #[error("performative has no UNL/FIPA equivalent")]
     Performative,
-    #[error("content failed verification: {} error diagnostic(s)", .0.len())]
-    Invalid(Vec<Diagnostic>),
+}
+
+/// A [`ContentVerifier`] that accepts UNL content only when it lies entirely
+/// within the agent's [`Vocabulary`] and is structurally sound. Non-UNL content
+/// is not this verifier's concern and passes through.
+pub struct UnlVerifier {
+    vocab: Vocabulary,
+}
+
+impl UnlVerifier {
+    pub fn new(vocab: Vocabulary) -> Self {
+        UnlVerifier { vocab }
+    }
+}
+
+impl ContentVerifier for UnlVerifier {
+    fn verify(&self, msg: &AclMessage) -> Result<(), String> {
+        if !is_unl(msg) {
+            return Ok(());
+        }
+        let graph = unl_graph(msg).map_err(|e| e.to_string())?;
+        unl_validator::verify_vocabulary(&graph, &self.vocab).map_err(|diags| {
+            let terms = diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("not understood ({} issue(s)): {terms}", diags.len())
+        })
+    }
 }
 
 /// True if the message declares UNL as its content language.
@@ -68,50 +94,6 @@ pub fn unl_graph(msg: &AclMessage) -> Result<UnlGraph, UnlError> {
     }
     let text = std::str::from_utf8(&msg.content).map_err(|_| UnlError::Utf8)?;
     Ok(unl_parser::parse_sentence(text)?)
-}
-
-/// Verify a UNL-content message against the local KB — the security boundary.
-/// Routes through the `unl-fipa` envelope so the runtime shares one path.
-pub fn verify(msg: &AclMessage, kb: &dyn KnowledgeBase) -> Result<(), UnlError> {
-    to_unl_fipa(msg)?
-        .verify_content(kb)
-        .map_err(UnlError::Invalid)
-}
-
-/// The `not-understood` reply an agent sends when it cannot validate a message —
-/// threaded back to the original sender, echoing the conversation.
-pub fn not_understood(msg: &AclMessage, from: &str) -> AclMessage {
-    AclMessage {
-        message_id: new_id(),
-        performative: Performative::NotUnderstood as i32,
-        sender: Some(agent_id(from)),
-        receivers: msg.sender.clone().into_iter().collect(),
-        reply_to: None,
-        protocol: msg.protocol,
-        conversation_id: msg.conversation_id.clone(),
-        in_reply_to: msg.reply_with.clone(),
-        reply_with: None,
-        reply_by: None,
-        language: Some(CONTENT_LANGUAGE.to_string()),
-        encoding: Some("utf-8".to_string()),
-        ontology: None,
-        content: Vec::new(),
-        user_properties: HashMap::new(),
-    }
-}
-
-/// Screen an incoming message at the receive boundary. Returns the
-/// `not-understood` reply if the message carries UNL content that fails
-/// verification against `kb` (and so must **not** be delivered to the agent);
-/// `None` if it should be delivered (valid UNL, or not UNL content at all).
-pub fn screen(msg: &AclMessage, my_name: &str, kb: &dyn KnowledgeBase) -> Option<AclMessage> {
-    if !is_unl(msg) {
-        return None;
-    }
-    match verify(msg, kb) {
-        Ok(()) => None,
-        Err(_) => Some(not_understood(msg, my_name)),
-    }
 }
 
 /// Render a UNL message in the standard FIPA-ACL string form via `unl-fipa`,
@@ -248,11 +230,21 @@ fn unl_to_proto_perf(p: unl_fipa::Performative) -> Performative {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unl_core::{Relation, RelationTag, Uci, Uw};
-    use unl_kb::MemKb;
+    use unl_core::{LexCategory, Relation, RelationTag, Uci, Uw};
+    use unl_kb::ConceptFeatures;
 
-    fn kb() -> MemKb {
-        MemKb::from_toml(include_str!("../../../../data/kb-seed/memkb-fixture.toml")).unwrap()
+    /// A small vocabulary that knows cat/animal and the `icl` relation.
+    fn vocab() -> Vocabulary {
+        let feat = || ConceptFeatures {
+            category: LexCategory::Nominal,
+            abstract_: false,
+            gloss: None,
+        };
+        let mut v = Vocabulary::new();
+        v.allow_concept(2, feat(), vec![], vec![], &["animal"]);
+        v.allow_concept(1, feat(), vec![2], vec![], &["cat"]);
+        v.allow_relations([RelationTag::Icl]);
+        v
     }
 
     fn base_msg(perf: Performative, sender: &str, receiver: &str) -> AclMessage {
@@ -305,24 +297,34 @@ mod tests {
     }
 
     #[test]
-    fn verify_accepts_valid_content() {
+    fn unl_verifier_accepts_in_vocab_content() {
         let mut m = base_msg(Performative::Inform, "a", "b");
         set_unl_content(&mut m, &cat_icl_animal());
-        assert!(verify(&m, &kb()).is_ok());
+        assert!(UnlVerifier::new(vocab()).verify(&m).is_ok());
     }
 
     #[test]
-    fn unverifiable_request_yields_not_understood() {
-        let mut m = base_msg(Performative::Request, "alice", "bob");
-        set_unl_content(&mut m, &dangling());
-        assert!(matches!(verify(&m, &kb()), Err(UnlError::Invalid(_))));
+    fn unl_verifier_passes_through_non_unl() {
+        // No UNL content => not this verifier's concern => deliver.
+        let m = base_msg(Performative::Request, "a", "b");
+        assert!(UnlVerifier::new(vocab()).verify(&m).is_ok());
+    }
 
-        let nu = not_understood(&m, "bob");
+    #[test]
+    fn unl_verifier_rejects_out_of_vocab_then_not_understood() {
+        // "do"/agt are outside the vocabulary (and node 99 dangles).
+        let mut bad = base_msg(Performative::Request, "alice", "bob");
+        set_unl_content(&mut bad, &dangling());
+        assert!(UnlVerifier::new(vocab()).verify(&bad).is_err());
+
+        // The FIPA layer builds the not-understood reply (content-agnostic).
+        let nu = crate::content::verify::not_understood(&bad, "bob");
         assert_eq!(nu.performative, Performative::NotUnderstood as i32);
         assert_eq!(nu.sender.unwrap().name, "bob");
         assert_eq!(nu.receivers[0].name, "alice");
         assert_eq!(nu.in_reply_to.as_deref(), Some("r1"));
         assert_eq!(nu.conversation_id.as_deref(), Some("c-1"));
+        assert!(nu.language.is_none()); // not-understood carries no content language
     }
 
     #[test]
@@ -337,27 +339,6 @@ mod tests {
         assert_eq!(back.performative, Performative::Request as i32);
         assert_eq!(back.sender.as_ref().unwrap().name, "alice");
         assert_eq!(first_tag(&back), RelationTag::Icl);
-    }
-
-    #[test]
-    fn screen_delivers_valid_and_blocks_invalid() {
-        let kb = kb();
-
-        // Valid UNL content => deliver (None).
-        let mut good = base_msg(Performative::Request, "alice", "bob");
-        set_unl_content(&mut good, &cat_icl_animal());
-        assert!(screen(&good, "bob", &kb).is_none());
-
-        // Invalid UNL content => blocked, with a not-understood reply.
-        let mut bad = base_msg(Performative::Request, "alice", "bob");
-        set_unl_content(&mut bad, &dangling());
-        let reply = screen(&bad, "bob", &kb).expect("blocked");
-        assert_eq!(reply.performative, Performative::NotUnderstood as i32);
-        assert_eq!(reply.receivers[0].name, "alice");
-
-        // Non-UNL content => not our concern, deliver (None).
-        let plain = base_msg(Performative::Request, "alice", "bob");
-        assert!(screen(&plain, "bob", &kb).is_none());
     }
 
     #[test]
