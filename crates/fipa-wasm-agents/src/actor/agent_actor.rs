@@ -2,6 +2,7 @@
 
 use actix::prelude::*;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn, instrument};
 
@@ -36,6 +37,10 @@ pub struct AgentActor {
 
     /// Registry for looking up other agents
     registry: Option<Addr<super::ActorRegistry>>,
+
+    /// Knowledge base for verifying UNL content before delivery.
+    /// `None` => no content-language verification (deliver as-is).
+    unl_kb: Option<Arc<dyn unl_kb::KnowledgeBase + Send + Sync>>,
 
     /// Runtime state
     state: AgentRuntimeState,
@@ -72,6 +77,7 @@ impl AgentActor {
             supervisor: None,
             network: None,
             registry: None,
+            unl_kb: None,
             state: AgentRuntimeState::Starting,
             stats: AgentStats::default(),
             start_time: Instant::now(),
@@ -93,6 +99,17 @@ impl AgentActor {
     /// Set the registry address
     pub fn with_registry(mut self, registry: Addr<super::ActorRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Attach a knowledge base. When set, incoming messages whose content
+    /// language is UNL are verified against it before delivery; content that
+    /// fails verification is answered with `not-understood` and not delivered.
+    pub fn with_knowledge_base(
+        mut self,
+        kb: Arc<dyn unl_kb::KnowledgeBase + Send + Sync>,
+    ) -> Self {
+        self.unl_kb = Some(kb);
         self
     }
 
@@ -123,6 +140,23 @@ impl AgentActor {
             .map(|p| format!("{:?}", p))
             .unwrap_or_else(|| "unknown".to_string());
         record_message_received(&performative, &protocol);
+
+        // UNL content-language security boundary: never act on semantic content
+        // we cannot validate against the local knowledge base. Unverifiable
+        // content is answered with `not-understood` and dropped here, before it
+        // reaches any conversation protocol or the WASM module.
+        if let Some(kb) = &self.unl_kb {
+            if let Some(reply) = crate::content::unl::screen(&msg, &self.agent_id.name, kb.as_ref())
+            {
+                warn!(
+                    agent = %self.agent_id.name,
+                    message = ?msg.message_id,
+                    "rejecting unverifiable UNL content; replying not-understood",
+                );
+                self.send_message(reply, ctx)?;
+                return Ok(());
+            }
+        }
 
         // Check if this is part of an existing conversation
         if let Some(conv_id) = &msg.conversation_id {

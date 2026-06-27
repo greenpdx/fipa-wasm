@@ -100,6 +100,20 @@ pub fn not_understood(msg: &AclMessage, from: &str) -> AclMessage {
     }
 }
 
+/// Screen an incoming message at the receive boundary. Returns the
+/// `not-understood` reply if the message carries UNL content that fails
+/// verification against `kb` (and so must **not** be delivered to the agent);
+/// `None` if it should be delivered (valid UNL, or not UNL content at all).
+pub fn screen(msg: &AclMessage, my_name: &str, kb: &dyn KnowledgeBase) -> Option<AclMessage> {
+    if !is_unl(msg) {
+        return None;
+    }
+    match verify(msg, kb) {
+        Ok(()) => None,
+        Err(_) => Some(not_understood(msg, my_name)),
+    }
+}
+
 /// Render a UNL message in the standard FIPA-ACL string form via `unl-fipa`,
 /// for interop with external UNL agents.
 pub fn to_fipa_string(msg: &AclMessage) -> Result<String, UnlError> {
@@ -323,6 +337,27 @@ mod tests {
         assert_eq!(back.performative, Performative::Request as i32);
         assert_eq!(back.sender.as_ref().unwrap().name, "alice");
         assert_eq!(first_tag(&back), RelationTag::Icl);
+    }
+
+    #[test]
+    fn screen_delivers_valid_and_blocks_invalid() {
+        let kb = kb();
+
+        // Valid UNL content => deliver (None).
+        let mut good = base_msg(Performative::Request, "alice", "bob");
+        set_unl_content(&mut good, &cat_icl_animal());
+        assert!(screen(&good, "bob", &kb).is_none());
+
+        // Invalid UNL content => blocked, with a not-understood reply.
+        let mut bad = base_msg(Performative::Request, "alice", "bob");
+        set_unl_content(&mut bad, &dangling());
+        let reply = screen(&bad, "bob", &kb).expect("blocked");
+        assert_eq!(reply.performative, Performative::NotUnderstood as i32);
+        assert_eq!(reply.receivers[0].name, "alice");
+
+        // Non-UNL content => not our concern, deliver (None).
+        let plain = base_msg(Performative::Request, "alice", "bob");
+        assert!(screen(&plain, "bob", &kb).is_none());
     }
 
     #[test]
