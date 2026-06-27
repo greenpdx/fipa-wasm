@@ -8,6 +8,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::messages::*;
 use crate::actor::AgentActor;
+use crate::content::block::{BlockFile, TAG_WASM};
+use crate::content::unl::UnlVerifier;
 use crate::content::verify::ContentVerifier;
 use crate::proto;
 use crate::wasm::WasmRuntime;
@@ -98,6 +100,33 @@ impl Supervisor {
         self
     }
 
+    /// Choose the content verifier for an agent: an operator override, else the
+    /// agent's own UNL block (the rules it ships), else the supervisor default.
+    fn select_verifier(
+        &self,
+        agent_name: &str,
+        bundle: Option<&BlockFile>,
+    ) -> Option<Arc<dyn ContentVerifier>> {
+        self.agent_verifiers
+            .get(agent_name)
+            .cloned()
+            .or_else(|| bundle.and_then(Self::verifier_from_bundle))
+            .or_else(|| self.default_verifier.clone())
+    }
+
+    /// Build a content verifier from an agent bundle's UNL block, if present and
+    /// well-formed. A malformed UNL block is logged and skipped (no verifier).
+    fn verifier_from_bundle(bundle: &BlockFile) -> Option<Arc<dyn ContentVerifier>> {
+        match UnlVerifier::from_bundle(bundle) {
+            Some(Ok(v)) => Some(Arc::new(v)),
+            Some(Err(e)) => {
+                warn!(error = %e, "ignoring malformed UNL block in agent bundle");
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Spawn an agent under supervision
     fn spawn_agent(&mut self, config: AgentConfig, ctx: &mut Context<Self>) -> Result<Addr<AgentActor>, AgentError> {
         let agent_name = config.id.name.clone();
@@ -110,8 +139,25 @@ impl Supervisor {
             )));
         }
 
+        // The agent's deployable artifact may be a typed-block bundle (WASM +
+        // UNL + ...) or raw WASM (back-compat). The node reads the blocks.
+        let bundle = if BlockFile::is_block_container(&config.wasm_module) {
+            Some(
+                BlockFile::decode(&config.wasm_module)
+                    .map_err(|e| AgentError::InvalidState(format!("invalid agent bundle: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let wasm_bytes: &[u8] = match &bundle {
+            Some(b) => b
+                .get(TAG_WASM)
+                .ok_or_else(|| AgentError::InvalidState("agent bundle has no WASM block".into()))?,
+            None => &config.wasm_module,
+        };
+
         // Create WASM runtime
-        let mut runtime = WasmRuntime::new(&config.wasm_module, &config.capabilities)
+        let mut runtime = WasmRuntime::new(wasm_bytes, &config.capabilities)
             .map_err(|e| AgentError::RuntimeError(e.to_string()))?;
 
         // Restore state if provided
@@ -132,13 +178,9 @@ impl Supervisor {
             actor = actor.with_registry(registry.clone());
         }
 
-        // Per-agent verifier override, else the supervisor default.
-        if let Some(verifier) = self
-            .agent_verifiers
-            .get(&agent_name)
-            .cloned()
-            .or_else(|| self.default_verifier.clone())
-        {
+        // Verifier precedence: operator override > the agent's own UNL block
+        // (its declared rules) > the supervisor default.
+        if let Some(verifier) = self.select_verifier(&agent_name, bundle.as_ref()) {
             actor = actor.with_content_verifier(verifier);
         }
 
@@ -345,5 +387,97 @@ impl Handler<DeliverMessage> for Supervisor {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::block::TAG_UNL;
+    use crate::content::unl::{set_unl_content, vocabulary_block};
+    use unl_core::{LexCategory, Relation, RelationTag, Uci, Uw, UnlGraph};
+    use unl_kb::{ConceptFeatures, Vocabulary};
+
+    // A vocabulary that knows exactly one concept lemma and the `mod` relation.
+    fn vocab_knowing(lemma: &str) -> Vocabulary {
+        let mut v = Vocabulary::new();
+        v.allow_concept(
+            1,
+            ConceptFeatures { category: LexCategory::Nominal, abstract_: false, gloss: None },
+            vec![],
+            vec![],
+            &[lemma],
+        );
+        v.allow_relations([RelationTag::Mod]);
+        v
+    }
+
+    fn verifier_knowing(lemma: &str) -> Arc<dyn ContentVerifier> {
+        Arc::new(UnlVerifier::new(vocab_knowing(lemma)))
+    }
+
+    fn bundle_knowing(lemma: &str) -> BlockFile {
+        BlockFile::new().with(TAG_UNL, vocabulary_block(&vocab_knowing(lemma)))
+    }
+
+    fn empty_msg() -> proto::AclMessage {
+        proto::AclMessage {
+            message_id: "m".into(),
+            performative: proto::Performative::Inform as i32,
+            sender: Some(proto::AgentId { name: "s".into(), addresses: vec![], resolvers: vec![] }),
+            receivers: vec![],
+            reply_to: None,
+            protocol: None,
+            conversation_id: None,
+            in_reply_to: None,
+            reply_with: None,
+            reply_by: None,
+            language: None,
+            encoding: None,
+            ontology: None,
+            content: vec![],
+            user_properties: HashMap::new(),
+        }
+    }
+
+    // A message whose UNL content is `mod(lemma, lemma)`.
+    fn msg_about(lemma: &str) -> proto::AclMessage {
+        let mut g = UnlGraph::new();
+        g.insert_node("01", Uw::new(Uci::ucn(lemma)));
+        g.insert_node("02", Uw::new(Uci::ucn(lemma)));
+        g.entry = Some("01".into());
+        g.add_relation(Relation::between(RelationTag::Mod, "01".into(), "02".into()));
+        let mut m = empty_msg();
+        set_unl_content(&mut m, &g);
+        m
+    }
+
+    #[test]
+    fn verifier_precedence_override_then_bundle_then_default() {
+        // override→cat, bundle→dog, default→fish — three distinguishable vocabs.
+        let sup = Supervisor::new("n".into())
+            .with_content_verifier(verifier_knowing("fish"))
+            .with_agent_verifier("a1", verifier_knowing("cat"));
+        let bundle = bundle_knowing("dog");
+
+        // a1: operator override (cat) wins over bundle(dog) and default(fish).
+        let v = sup.select_verifier("a1", Some(&bundle)).unwrap();
+        assert!(v.verify(&msg_about("cat")).is_ok());
+        assert!(v.verify(&msg_about("dog")).is_err());
+
+        // a2: no override → the agent's own UNL block (dog) beats default(fish).
+        let v = sup.select_verifier("a2", Some(&bundle)).unwrap();
+        assert!(v.verify(&msg_about("dog")).is_ok());
+        assert!(v.verify(&msg_about("fish")).is_err());
+
+        // a3: no override, no bundle → supervisor default (fish).
+        let v = sup.select_verifier("a3", None).unwrap();
+        assert!(v.verify(&msg_about("fish")).is_ok());
+    }
+
+    #[test]
+    fn no_sources_means_no_verifier() {
+        let sup = Supervisor::new("n".into());
+        assert!(sup.select_verifier("a", None).is_none());
     }
 }
