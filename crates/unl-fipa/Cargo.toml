@@ -1,0 +1,17 @@
+[package]
+name = "unl-fipa"
+version = "0.1.0"
+description = "FIPA ACL performative envelope with UNL as the :content-language"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+unl-parser = { path = "../unl-parser" }
+unl-validator = { path = "../unl-validator" }
+unl-kb = { path = "../unl-kb" }
+unl-a2a = { path = "../unl-a2a" }
+serde = { workspace = true }
+smol_str.workspace = true
+thiserror.workspace = true
