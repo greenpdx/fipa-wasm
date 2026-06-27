@@ -27,6 +27,12 @@ pub const TAG_LLM: Tag = *b"LLM ";
 pub const TAG_UNL: Tag = *b"UNL ";
 /// The data/payload block (agent data, or a message body the UNL describes).
 pub const TAG_DATA: Tag = *b"DATA";
+/// A UTF-8 string block.
+pub const TAG_STRING: Tag = *b"STR ";
+
+// The tag set is OPEN: any 4-byte tag is valid. The constants above name the
+// common types; add more (here or at the call site, e.g. `*b"XML "`) as needed —
+// the container never enumerates or rejects unknown tags.
 
 const MAGIC: &[u8; 4] = b"FBLK";
 const VERSION: u8 = 1;
@@ -153,6 +159,17 @@ mod tests {
         let back = BlockFile::decode(&msg.encode()).unwrap();
         assert_eq!(back.get(TAG_UNL), Some(b"agt(detect, gate)".as_slice()));
         assert_eq!(back.get(TAG_DATA), Some([0x17].as_slice()));
+    }
+
+    #[test]
+    fn tag_set_is_open() {
+        // Named and ad-hoc tags coexist; unknown tags are stored and read back.
+        let f = BlockFile::new()
+            .with(TAG_STRING, b"hello".to_vec())
+            .with(*b"XML ", b"<x/>".to_vec()); // a tag with no named constant
+        let back = BlockFile::decode(&f.encode()).unwrap();
+        assert_eq!(back.get(TAG_STRING), Some(b"hello".as_slice()));
+        assert_eq!(back.get(*b"XML "), Some(b"<x/>".as_slice()));
     }
 
     #[test]

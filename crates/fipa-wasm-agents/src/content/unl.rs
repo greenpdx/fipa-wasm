@@ -22,6 +22,7 @@
 //! let wire = unl::to_fipa_string(&msg)?;
 //! ```
 
+use crate::content::block::{BlockFile, TAG_UNL};
 use crate::content::verify::ContentVerifier;
 use crate::proto::{AclMessage, AgentId, Performative};
 use std::collections::HashMap;
@@ -56,6 +57,21 @@ impl UnlVerifier {
     pub fn new(vocab: Vocabulary) -> Self {
         UnlVerifier { vocab }
     }
+
+    /// Build a verifier from an agent bundle's `UNL ` block — the agent's
+    /// vocabulary rules (data) that the node reads and turns into a verifier
+    /// (process). Returns `None` if the bundle has no UNL block (the agent
+    /// declares no UNL rules), `Some(Err)` if the block is malformed.
+    pub fn from_bundle(bundle: &BlockFile) -> Option<Result<UnlVerifier, serde_json::Error>> {
+        let bytes = bundle.get(TAG_UNL)?;
+        Some(serde_json::from_slice::<Vocabulary>(bytes).map(UnlVerifier::new))
+    }
+}
+
+/// Serialize a vocabulary into the bytes of an agent's `UNL ` block (the
+/// authoring side — produces the rules an agent ships).
+pub fn vocabulary_block(vocab: &Vocabulary) -> Vec<u8> {
+    serde_json::to_vec(vocab).expect("Vocabulary serializes")
 }
 
 impl ContentVerifier for UnlVerifier {
@@ -339,6 +355,32 @@ mod tests {
         assert_eq!(back.performative, Performative::Request as i32);
         assert_eq!(back.sender.as_ref().unwrap().name, "alice");
         assert_eq!(first_tag(&back), RelationTag::Icl);
+    }
+
+    #[test]
+    fn unl_verifier_from_agent_bundle() {
+        use crate::content::block::{BlockFile, TAG_WASM};
+        // The agent ships its rules as a UNL block in its bundle (data); the node
+        // reads the block and builds the verifier (process).
+        let bundle = BlockFile::new()
+            .with(TAG_WASM, vec![0, 1, 2])
+            .with(TAG_UNL, vocabulary_block(&vocab()));
+        let verifier = UnlVerifier::from_bundle(&bundle).expect("has UNL block").unwrap();
+
+        let mut good = base_msg(Performative::Inform, "a", "b");
+        set_unl_content(&mut good, &cat_icl_animal());
+        assert!(verifier.verify(&good).is_ok());
+
+        let mut bad = base_msg(Performative::Request, "a", "b");
+        set_unl_content(&mut bad, &dangling());
+        assert!(verifier.verify(&bad).is_err());
+    }
+
+    #[test]
+    fn no_unl_block_means_no_verifier() {
+        use crate::content::block::{BlockFile, TAG_WASM};
+        let bundle = BlockFile::new().with(TAG_WASM, vec![0]);
+        assert!(UnlVerifier::from_bundle(&bundle).is_none());
     }
 
     #[test]
