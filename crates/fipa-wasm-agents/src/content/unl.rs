@@ -22,7 +22,7 @@
 //! let wire = unl::to_fipa_string(&msg)?;
 //! ```
 
-use crate::content::block::{BlockFile, TAG_UNL};
+use crate::content::block::{BlockFile, TAG_DATA, TAG_UNL};
 use crate::content::verify::ContentVerifier;
 use crate::proto::{AclMessage, AgentId, Performative};
 use std::collections::HashMap;
@@ -44,6 +44,8 @@ pub enum UnlError {
     Fipa(String),
     #[error("performative has no UNL/FIPA equivalent")]
     Performative,
+    #[error("malformed message blocks: {0}")]
+    Block(String),
 }
 
 /// A [`ContentVerifier`] that accepts UNL content only when it lies entirely
@@ -96,20 +98,91 @@ pub fn is_unl(msg: &AclMessage) -> bool {
     msg.language.as_deref() == Some(CONTENT_LANGUAGE)
 }
 
-/// Attach a UNL graph as the content (list format, UTF-8, `language = "UNL"`).
+/// Attach a UNL graph as the content (bare list format, UTF-8, `language = "UNL"`).
+/// For a message that also carries a data payload, use [`set_message_content`].
 pub fn set_unl_content(msg: &mut AclMessage, graph: &UnlGraph) {
     msg.content = unl_parser::serialize_list(graph).into_bytes();
     msg.language = Some(CONTENT_LANGUAGE.to_string());
     msg.encoding = Some("utf-8".to_string());
 }
 
-/// Parse the UNL graph from a message's content.
+/// Attach a message as a typed-block container: a `UNL ` block (the semantic
+/// content) plus a `DATA` block (the payload the UNL describes).
+pub fn set_message_content(msg: &mut AclMessage, graph: &UnlGraph, data: &[u8]) {
+    let blocks = BlockFile::new()
+        .with(TAG_UNL, unl_parser::serialize_list(graph).into_bytes())
+        .with(TAG_DATA, data.to_vec());
+    msg.content = blocks.encode();
+    msg.language = Some(CONTENT_LANGUAGE.to_string());
+    msg.encoding = Some("application/x-fipa-blocks".to_string());
+}
+
+/// The `DATA` block of a message's content (empty if none / not a block message).
+pub fn message_data(msg: &AclMessage) -> Vec<u8> {
+    if BlockFile::is_block_container(&msg.content) {
+        BlockFile::decode(&msg.content)
+            .ok()
+            .and_then(|b| b.get(TAG_DATA).map(<[u8]>::to_vec))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Parse the UNL graph from a message's content — the `UNL ` block of a block
+/// container, or the whole content as a bare UNL list (back-compat).
 pub fn unl_graph(msg: &AclMessage) -> Result<UnlGraph, UnlError> {
     if !is_unl(msg) {
         return Err(UnlError::NotUnl);
     }
-    let text = std::str::from_utf8(&msg.content).map_err(|_| UnlError::Utf8)?;
+    let unl_owned;
+    let unl_bytes: &[u8] = if BlockFile::is_block_container(&msg.content) {
+        let blocks = BlockFile::decode(&msg.content).map_err(|e| UnlError::Block(e.to_string()))?;
+        unl_owned = blocks.get(TAG_UNL).ok_or(UnlError::NotUnl)?.to_vec();
+        &unl_owned
+    } else {
+        &msg.content
+    };
+    let text = std::str::from_utf8(unl_bytes).map_err(|_| UnlError::Utf8)?;
     Ok(unl_parser::parse_sentence(text)?)
+}
+
+/// A sanitized inbound message — decoded and verified in the node, ready to hand
+/// to the agent. Nothing reaches the WASM until it is this.
+#[derive(Debug, Clone)]
+pub struct Inbound {
+    pub performative: i32,
+    pub sender: Option<AgentId>,
+    pub conversation_id: Option<String>,
+    /// The decoded, in-vocabulary semantic content.
+    pub graph: UnlGraph,
+    /// The data payload the UNL describes.
+    pub data: Vec<u8>,
+}
+
+/// Sanitize an inbound message in the node: verify against the agent's rules,
+/// then decode. `Err` is the `not-understood` reply (reject, never delivered);
+/// `Ok(Some)` is the decoded `(UNL, data)` for the agent; `Ok(None)` is a
+/// non-UNL message (not this pipeline's concern — deliver by the raw path).
+pub fn sanitize_inbound(
+    msg: &AclMessage,
+    my_name: &str,
+    verifier: &dyn ContentVerifier,
+) -> Result<Option<Inbound>, AclMessage> {
+    if verifier.verify(msg).is_err() {
+        return Err(crate::content::verify::not_understood(msg, my_name));
+    }
+    if !is_unl(msg) {
+        return Ok(None);
+    }
+    let graph = unl_graph(msg).map_err(|_| crate::content::verify::not_understood(msg, my_name))?;
+    Ok(Some(Inbound {
+        performative: msg.performative,
+        sender: msg.sender.clone(),
+        conversation_id: msg.conversation_id.clone(),
+        graph,
+        data: message_data(msg),
+    }))
 }
 
 /// Render a UNL message in the standard FIPA-ACL string form via `unl-fipa`,
@@ -381,6 +454,48 @@ mod tests {
         use crate::content::block::{BlockFile, TAG_WASM};
         let bundle = BlockFile::new().with(TAG_WASM, vec![0]);
         assert!(UnlVerifier::from_bundle(&bundle).is_none());
+    }
+
+    #[test]
+    fn message_blocks_unl_plus_data_roundtrip() {
+        let mut m = base_msg(Performative::Inform, "a", "b");
+        set_message_content(&mut m, &cat_icl_animal(), b"payload");
+        assert!(is_unl(&m));
+        assert_eq!(first_tag(&m), RelationTag::Icl); // unl_graph reads the UNL block
+        assert_eq!(message_data(&m), b"payload");
+    }
+
+    #[test]
+    fn sanitize_inbound_decodes_valid_rejects_invalid_passes_non_unl() {
+        let verifier = UnlVerifier::new(vocab());
+
+        // Valid block message => Some(Inbound) with decoded graph + data.
+        let mut good = base_msg(Performative::Inform, "alice", "bob");
+        set_message_content(&mut good, &cat_icl_animal(), b"23.4");
+        let inbound = sanitize_inbound(&good, "bob", &verifier).unwrap().expect("decoded");
+        assert_eq!(inbound.graph.relations[0].tag, RelationTag::Icl);
+        assert_eq!(inbound.data, b"23.4");
+        assert_eq!(inbound.sender.unwrap().name, "alice");
+
+        // Out-of-vocab => Err(not_understood), never delivered.
+        let mut bad = base_msg(Performative::Request, "alice", "bob");
+        set_message_content(&mut bad, &dangling(), b"");
+        let nu = sanitize_inbound(&bad, "bob", &verifier).unwrap_err();
+        assert_eq!(nu.performative, Performative::NotUnderstood as i32);
+
+        // Non-UNL => Ok(None), delivered by the raw path.
+        let plain = base_msg(Performative::Request, "alice", "bob");
+        assert!(sanitize_inbound(&plain, "bob", &verifier).unwrap().is_none());
+    }
+
+    #[test]
+    fn sanitize_inbound_back_compat_bare_unl_list() {
+        let verifier = UnlVerifier::new(vocab());
+        let mut m = base_msg(Performative::Inform, "a", "b");
+        set_unl_content(&mut m, &cat_icl_animal()); // bare list, no blocks
+        let inbound = sanitize_inbound(&m, "me", &verifier).unwrap().expect("decoded");
+        assert_eq!(inbound.graph.relations[0].tag, RelationTag::Icl);
+        assert!(inbound.data.is_empty());
     }
 
     #[test]
