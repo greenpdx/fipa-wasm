@@ -23,7 +23,7 @@ pub use normalize::{
 };
 
 use unl_core::{UnlEquivalent, UnlGraph};
-use unl_kb::KnowledgeBase;
+use unl_kb::{KnowledgeBase, Vocabulary};
 
 /// Structural + semantic validation of a UNL graph against a knowledge base.
 pub trait Validate {
@@ -46,6 +46,23 @@ impl Validate for UnlGraph {
 /// True if any diagnostic is an error.
 pub fn has_errors(diags: &[Diagnostic]) -> bool {
     diags.iter().any(|d| d.severity == Severity::Error)
+}
+
+/// Verify a graph against an agent's [`Vocabulary`]: structurally sound AND every
+/// concept, relation, and attribute within the agent's vocabulary. Returns the
+/// blocking error diagnostics on failure — an out-of-vocabulary term (or a
+/// structural error) makes the message *not-understood*. This is the edge/agent
+/// verification path: it needs only the agent's compact vocabulary, not the
+/// central KB.
+pub fn verify_vocabulary(graph: &UnlGraph, vocab: &Vocabulary) -> Result<(), Vec<Diagnostic>> {
+    let mut diags = checks::structural_integrity(graph, vocab);
+    diags.extend(checks::vocabulary(graph, vocab));
+    diags.retain(|d| d.severity == Severity::Error);
+    if diags.is_empty() {
+        Ok(())
+    } else {
+        Err(diags)
+    }
 }
 
 /// Semantic (meaning) equivalence: normalize both graphs with `normalizer`, then

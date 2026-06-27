@@ -1,6 +1,6 @@
 use crate::*;
 use unl_core::*;
-use unl_kb::MemKb;
+use unl_kb::{ConceptFeatures, MemKb, Vocabulary};
 
 fn kb() -> MemKb {
     MemKb::from_toml(include_str!("../../../data/kb-seed/memkb-fixture.toml")).unwrap()
@@ -144,6 +144,72 @@ fn ambiguous_entry() {
 
     g.entry = Some(NodeId::from("01"));
     assert!(!has_code(&g.validate(&kb()), DiagCode::AmbiguousEntry));
+}
+
+// --- vocabulary (edge/agent verification) -------------------------------
+
+fn sensor_vocab() -> Vocabulary {
+    let feat = || ConceptFeatures {
+        category: LexCategory::Nominal,
+        abstract_: false,
+        gloss: None,
+    };
+    let mut v = Vocabulary::new();
+    v.allow_concept(2, feat(), vec![], vec![], &["animal"]);
+    v.allow_concept(1, feat(), vec![2], vec![], &["cat"]); // cat icl animal
+    v.allow_relations([RelationTag::Icl]);
+    v.allow_attributes([Attr::Def]);
+    v
+}
+
+#[test]
+fn vocabulary_accepts_in_vocab_message() {
+    let mut g = UnlGraph::new();
+    g.add_relation(rel(
+        RelationTag::Icl,
+        inline(Uci::ucn("cat"), vec![Attr::Def]),
+        inline(Uci::ucn("animal"), vec![]),
+    ));
+    assert!(verify_vocabulary(&g, &sensor_vocab()).is_ok());
+}
+
+#[test]
+fn vocabulary_rejects_unknown_concept() {
+    let mut g = UnlGraph::new();
+    g.add_relation(rel(
+        RelationTag::Icl,
+        inline(Uci::ucn("dog"), vec![]), // no word for "dog"
+        inline(Uci::ucn("animal"), vec![]),
+    ));
+    let err = verify_vocabulary(&g, &sensor_vocab()).unwrap_err();
+    assert!(err.iter().any(|d| d.code == DiagCode::OutOfVocabulary));
+}
+
+#[test]
+fn vocabulary_rejects_unknown_relation_and_attribute() {
+    // agt relation not in vocab.
+    let mut g = UnlGraph::new();
+    g.add_relation(rel(
+        RelationTag::Agt,
+        inline(Uci::ucn("cat"), vec![]),
+        inline(Uci::ucn("animal"), vec![]),
+    ));
+    assert!(verify_vocabulary(&g, &sensor_vocab())
+        .unwrap_err()
+        .iter()
+        .any(|d| d.code == DiagCode::OutOfVocabulary));
+
+    // @plural attribute not in vocab.
+    let mut g2 = UnlGraph::new();
+    g2.add_relation(rel(
+        RelationTag::Icl,
+        inline(Uci::ucn("cat"), vec![Attr::Plural]),
+        inline(Uci::ucn("animal"), vec![]),
+    ));
+    assert!(verify_vocabulary(&g2, &sensor_vocab())
+        .unwrap_err()
+        .iter()
+        .any(|d| d.code == DiagCode::OutOfVocabulary));
 }
 
 // --- normalization ------------------------------------------------------

@@ -4,7 +4,7 @@
 
 use crate::diagnostic::{DiagCode, Diagnostic, Severity};
 use unl_core::{Attr, NodeId, NodeRef, RelationTag, Uci, UnlGraph, Uw};
-use unl_kb::KnowledgeBase;
+use unl_kb::{KnowledgeBase, Vocabulary};
 
 /// Every UW in the graph, with its node id where one exists (declared nodes, and
 /// inline UWs carrying a `node_id`).
@@ -160,6 +160,49 @@ pub fn non_redundancy(g: &UnlGraph, _kb: &dyn KnowledgeBase) -> Vec<Diagnostic> 
                 DiagCode::Redundancy,
                 format!("duplicate relation arc: '{}'", r.tag),
             ));
+        }
+    }
+    out
+}
+
+/// Vocabulary membership: every concept, relation, and attribute used must be in
+/// the agent's vocabulary. Out-of-vocabulary terms are errors — the agent has no
+/// word for them, so the message is not-understood.
+pub fn vocabulary(graph: &UnlGraph, vocab: &Vocabulary) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+
+    for r in &graph.relations {
+        if !vocab.allows_relation(r.tag) {
+            out.push(Diagnostic::new(
+                Severity::Error,
+                DiagCode::OutOfVocabulary,
+                format!("relation '{}' is not in the agent's vocabulary", r.tag),
+            ));
+        }
+    }
+
+    for (uw, loc) in uws(graph) {
+        if matches!(uw.uci, Uci::Ucl { .. } | Uci::Ucn { .. }) && !vocab.knows(&uw.uci) {
+            out.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagCode::OutOfVocabulary,
+                    format!("concept not in the agent's vocabulary: {:?}", uw.uci),
+                )
+                .at(loc.clone()),
+            );
+        }
+        for attr in uw.attributes.iter() {
+            if !vocab.allows_attribute(attr) {
+                out.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        DiagCode::OutOfVocabulary,
+                        format!("attribute '@{}' is not in the agent's vocabulary", attr.as_label()),
+                    )
+                    .at(loc.clone()),
+                );
+            }
         }
     }
     out

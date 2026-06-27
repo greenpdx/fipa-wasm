@@ -52,4 +52,7 @@ pub enum DiagCode {
     AmbiguousEntry,
     /// A UW whose concept does not resolve in the KB.
     UnknownConcept,
+    /// A concept, relation, or attribute outside the agent's vocabulary — the
+    /// agent has no word for it, so the message is not-understood.
+    OutOfVocabulary,
 }

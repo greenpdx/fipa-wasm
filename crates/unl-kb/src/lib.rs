@@ -16,11 +16,13 @@
 mod graph_kb;
 mod mem;
 mod sled_kb;
+mod vocabulary;
 mod wordnet;
 
 pub use graph_kb::GraphKb;
 pub use mem::{ConceptSeed, MemKb};
 pub use sled_kb::{BuildStats, SledKb};
+pub use vocabulary::Vocabulary;
 pub use wordnet::WordNetKb;
 
 use unl_core::{Lang, LexCategory, Relation, RelationTag, Uci};
