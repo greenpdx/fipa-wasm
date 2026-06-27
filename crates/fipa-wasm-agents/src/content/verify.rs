@@ -10,11 +10,27 @@
 use crate::proto::{AclMessage, AgentId, Performative};
 use std::collections::HashMap;
 
+/// Decoded, sanitized content ready to hand to the WASM agent: the semantic
+/// (UNL) bytes and the data payload the agent acts on.
+#[derive(Debug, Clone, Default)]
+pub struct Decoded {
+    pub unl: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
 /// Vets a message's content before delivery. Content-language agnostic.
 pub trait ContentVerifier: Send + Sync {
     /// `Ok(())` to deliver the message to the agent; `Err(reason)` to reject it
     /// with a `not-understood` reply (the agent has no way to act on it).
     fn verify(&self, msg: &AclMessage) -> Result<(), String>;
+
+    /// Verify *and* decode for the receive path: `Err` = reject (the
+    /// `not-understood` reason); `Ok(Some)` = the decoded `(unl, body)` to hand
+    /// to the agent; `Ok(None)` = content this verifier does not decode (deliver
+    /// by the raw path). Default: verify only.
+    fn sanitize(&self, msg: &AclMessage) -> Result<Option<Decoded>, String> {
+        self.verify(msg).map(|()| None)
+    }
 }
 
 /// Build the `not-understood` reply for a message that could not be vetted —

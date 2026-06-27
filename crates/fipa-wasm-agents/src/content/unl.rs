@@ -91,6 +91,21 @@ impl ContentVerifier for UnlVerifier {
             format!("not understood ({} issue(s)): {terms}", diags.len())
         })
     }
+
+    fn sanitize(
+        &self,
+        msg: &AclMessage,
+    ) -> Result<Option<crate::content::verify::Decoded>, String> {
+        self.verify(msg)?;
+        if !is_unl(msg) {
+            return Ok(None);
+        }
+        let graph = unl_graph(msg).map_err(|e| e.to_string())?;
+        Ok(Some(crate::content::verify::Decoded {
+            unl: unl_parser::serialize_list(&graph).into_bytes(),
+            body: message_data(msg),
+        }))
+    }
 }
 
 /// True if the message declares UNL as its content language.
@@ -496,6 +511,24 @@ mod tests {
         let inbound = sanitize_inbound(&m, "me", &verifier).unwrap().expect("decoded");
         assert_eq!(inbound.graph.relations[0].tag, RelationTag::Icl);
         assert!(inbound.data.is_empty());
+    }
+
+    #[test]
+    fn unl_verifier_sanitize_decodes_to_unl_and_body() {
+        let v = UnlVerifier::new(vocab());
+
+        let mut m = base_msg(Performative::Inform, "a", "b");
+        set_message_content(&mut m, &cat_icl_animal(), b"payload");
+        let decoded = v.sanitize(&m).unwrap().expect("decoded");
+        assert!(!decoded.unl.is_empty());
+        assert_eq!(decoded.body, b"payload");
+
+        let mut bad = base_msg(Performative::Request, "a", "b");
+        set_message_content(&mut bad, &dangling(), b"");
+        assert!(v.sanitize(&bad).is_err()); // out-of-vocab
+
+        let plain = base_msg(Performative::Request, "a", "b");
+        assert!(v.sanitize(&plain).unwrap().is_none()); // non-UNL
     }
 
     #[test]

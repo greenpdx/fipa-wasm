@@ -197,6 +197,58 @@ impl WasmRuntime {
         }
     }
 
+    /// Deliver decoded content to the agent: write the UNL bytes and the body
+    /// into WASM memory (via the guest's `alloc`) and call its
+    /// `config(unl_ptr, unl_len, body_ptr, body_len)` export. The agent keeps
+    /// its state across calls (its memory persists), so `config` runs once at
+    /// startup to seed state and again per inbound message. A guest without a
+    /// `config` export is a graceful no-op.
+    pub fn call_config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
+        let config = match self
+            .instance
+            .get_typed_func::<(i32, i32, i32, i32), ()>(&mut self.store, "config")
+        {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        };
+        let unl_ptr = self.guest_alloc(unl.len())?;
+        self.write_bytes(unl_ptr, unl)?;
+        let body_ptr = self.guest_alloc(body.len())?;
+        self.write_bytes(body_ptr, body)?;
+        config.call(
+            &mut self.store,
+            (unl_ptr, unl.len() as i32, body_ptr, body.len() as i32),
+        )?;
+        Ok(())
+    }
+
+    /// Allocate `n` bytes in WASM memory via the guest's `alloc` export.
+    fn guest_alloc(&mut self, n: usize) -> Result<i32> {
+        let alloc = self
+            .instance
+            .get_typed_func::<i32, i32>(&mut self.store, "alloc")
+            .map_err(|_| anyhow!("agent exports `config` but not `alloc`"))?;
+        Ok(alloc.call(&mut self.store, n as i32)?)
+    }
+
+    /// Copy `bytes` into WASM memory at `ptr`.
+    fn write_bytes(&mut self, ptr: i32, bytes: &[u8]) -> Result<()> {
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow!("memory export not found"))?;
+        let start = ptr as usize;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow!("config write overflow"))?;
+        let data = memory.data_mut(&mut self.store);
+        let dst = data
+            .get_mut(start..end)
+            .ok_or_else(|| anyhow!("config write out of bounds"))?;
+        dst.copy_from_slice(bytes);
+        Ok(())
+    }
+
     /// Capture agent state for migration
     pub fn capture_state(&mut self) -> Result<proto::AgentState> {
         // Get memory
@@ -257,5 +309,53 @@ impl std::fmt::Debug for WasmRuntime {
         f.debug_struct("WasmRuntime")
             .field("module_size", &self.module_bytes.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod config_abi_tests {
+    use super::*;
+
+    // A guest that exports memory + a bump `alloc` + `init` + `config`. Its
+    // `config` copies the received UNL bytes to offset 0 and the body to offset
+    // 512, so the host can observe exactly what crossed the boundary.
+    const ECHO_GUEST: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $bump (mut i32) (i32.const 1024))
+      (func (export "init"))
+      (func (export "alloc") (param $n i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $bump))
+        (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+        (local.get $p))
+      (func (export "config")
+        (param $up i32) (param $ul i32) (param $bp i32) (param $bl i32)
+        (memory.copy (i32.const 0) (local.get $up) (local.get $ul))
+        (memory.copy (i32.const 512) (local.get $bp) (local.get $bl))))
+    "#;
+
+    fn caps() -> proto::AgentCapabilities {
+        proto::AgentCapabilities { max_execution_time_ms: 1000, ..Default::default() }
+    }
+
+    #[test]
+    fn call_config_delivers_unl_and_body_into_wasm_memory() {
+        let mut rt = WasmRuntime::new(ECHO_GUEST.as_bytes(), &caps()).unwrap();
+        rt.call_init().unwrap();
+        rt.call_config(b"agt(detect,gate)", &[0x17, 0x2a]).unwrap();
+
+        let mem = rt.instance.get_memory(&mut rt.store, "memory").unwrap();
+        let data = mem.data(&rt.store);
+        assert_eq!(&data[0..16], b"agt(detect,gate)"); // the UNL the guest received
+        assert_eq!(&data[512..514], &[0x17, 0x2a]); // the body the guest received
+    }
+
+    #[test]
+    fn call_config_is_a_noop_without_a_config_export() {
+        const BARE: &str = r#"(module (memory (export "memory") 1) (func (export "init")))"#;
+        let mut rt = WasmRuntime::new(BARE.as_bytes(), &caps()).unwrap();
+        rt.call_init().unwrap();
+        rt.call_config(b"x", b"y").unwrap(); // graceful no-op
     }
 }

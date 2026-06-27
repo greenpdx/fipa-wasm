@@ -141,20 +141,32 @@ impl AgentActor {
             .unwrap_or_else(|| "unknown".to_string());
         record_message_received(&performative, &protocol);
 
-        // Content-language security boundary: never act on content the agent
-        // cannot vet. Unverifiable content is answered with `not-understood` and
-        // dropped here, before it reaches any conversation protocol or the WASM
-        // module. The verifier is content-agnostic; UNL is one implementation.
+        // Content-language security boundary: the node sanitizes (verify +
+        // decode) before anything reaches the WASM. Unverifiable content is
+        // answered with `not-understood` and dropped here. Decoded content is
+        // delivered as (UNL, body) via the agent's `config` entry point — the
+        // agent keeps its state across calls. The verifier is content-agnostic;
+        // UNL is one implementation.
         if let Some(verifier) = &self.verifier {
-            if let Err(reason) = verifier.verify(&msg) {
-                warn!(
-                    agent = %self.agent_id.name,
-                    message = ?msg.message_id,
-                    "rejecting message content; replying not-understood: {reason}",
-                );
-                let reply = crate::content::verify::not_understood(&msg, &self.agent_id.name);
-                self.send_message(reply, ctx)?;
-                return Ok(());
+            match verifier.sanitize(&msg) {
+                Err(reason) => {
+                    warn!(
+                        agent = %self.agent_id.name,
+                        message = ?msg.message_id,
+                        "rejecting message content; replying not-understood: {}", reason,
+                    );
+                    let reply = crate::content::verify::not_understood(&msg, &self.agent_id.name);
+                    self.send_message(reply, ctx)?;
+                    return Ok(());
+                }
+                Ok(Some(decoded)) => {
+                    if let Err(e) = self.runtime.call_config(&decoded.unl, &decoded.body) {
+                        error!(agent = %self.agent_id.name, "agent config(UNL, body) failed: {}", e);
+                        self.stats.errors += 1;
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {} // not decoded content — fall through to the raw path
             }
         }
 
