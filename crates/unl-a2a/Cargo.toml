@@ -1,0 +1,19 @@
+[package]
+name = "unl-a2a"
+version = "0.1.0"
+description = "Agent-to-agent messaging with UNL as the content language — verifiable, language-independent semantic messages"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unl-core = { path = "../unl-core" }
+unl-parser = { path = "../unl-parser" }
+unl-validator = { path = "../unl-validator" }
+unl-kb = { path = "../unl-kb" }
+serde = { workspace = true }
+serde_json = "1.0"
+smol_str.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
