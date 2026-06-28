@@ -1,10 +1,10 @@
 // Integration test: a native agent runs in its own agent-host process, driven
 // over UDS, and is SIGKILLed on drop.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fipa_wasm_agents::process::{AgentSpec, Limits, ProcessRuntime};
+use fipa_wasm_agents::process::{AgentSpec, Limits, ManagedAgent, Profile, ProcessRuntime, Recipe};
 use fipa_wasm_agents::wasm::AgentRuntime;
 
 #[test]
@@ -37,4 +37,31 @@ fn native_agent_runs_isolated_in_a_process() {
 
     // Dropping the runtime SIGKILLs the child (verified by no hang/leak here).
     drop(rt);
+}
+
+#[test]
+fn hosted_agent_restarts_after_a_crash() {
+    let host = env!("CARGO_BIN_EXE_agent-host");
+    let recipe = Recipe {
+        spec: AgentSpec::Native("boomer".into()),
+        profile: Profile::Hosted(Limits { mem_bytes: 0, cpu_secs: 30 }),
+        host_bin: PathBuf::from(host),
+        timeout: Duration::from_secs(10),
+        seed_unl: vec![],
+        seed_data: vec![],
+        max_restarts: 3,
+    };
+    let mut agent = ManagedAgent::spawn(recipe).expect("spawn managed agent");
+
+    // A normal message echoes.
+    let out = agent.deliver(b"agt(hi, x)", b"a").unwrap();
+    assert_eq!(out[0].body, b"a");
+
+    // "boom" crashes the child process — deliver fails, but the agent restarts.
+    assert!(agent.deliver(b"boom", b"").is_err());
+    assert_eq!(agent.restarts(), 1);
+
+    // The restarted agent (a fresh process) works again.
+    let out = agent.deliver(b"agt(again, y)", b"b").unwrap();
+    assert_eq!(out[0].body, b"b");
 }

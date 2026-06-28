@@ -21,6 +21,11 @@ use anyhow::{anyhow, Result};
 
 use crate::wasm::{AgentRuntime, OutboundIntent};
 
+mod agents;
+mod manage;
+pub use agents::native_agent;
+pub use manage::{build_runtime, build_wasm, ManagedAgent, Profile, Recipe};
+
 /// Resource caps applied by the child before it loads the agent. `0` = leave
 /// the limit unchanged.
 #[derive(Clone, Copy, Debug)]

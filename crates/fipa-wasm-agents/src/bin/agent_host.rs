@@ -1,57 +1,19 @@
 // agent_host.rs - One agent in its own process (the "host" isolation profile).
 //
 // Applies OS resource caps (setrlimit) BEFORE loading the agent, then connects
-// to the node over a Unix domain socket and serves the agent. A wasm agent is
-// loaded from a bundle; a native agent is one compiled in here (where DF/AMS/PA
-// will register). The node SIGKILLs this process to kill the agent.
+// to the node over a Unix domain socket and serves it. The agent itself is
+// built in-process (this *is* the isolated process); the node SIGKILLs this
+// process to kill the agent.
 //
 //   agent-host --socket <path> (--wasm <bundle> | --native <name>)
 //              [--mem-bytes N] [--cpu-secs N]
 
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use fipa_wasm_agents::content::block::{BlockFile, TAG_WASM};
-use fipa_wasm_agents::process::{apply_limits, serve, Limits};
-use fipa_wasm_agents::proto;
-use fipa_wasm_agents::wasm::{AgentRuntime, NativeRuntime, WasmRuntime};
-
-/// A sample native agent — echoes each message back to "peer". Stands in for the
-/// infrastructure agents (DF/AMS/PA) that will register here.
-struct Echo;
-impl unl_agent::Agent for Echo {
-    fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut unl_agent::Ctx) {
-        ctx.send("peer", unl, body.to_vec());
-    }
-}
-
-/// Registry of native agents compiled into the host.
-fn native(name: &str) -> Option<Box<dyn AgentRuntime>> {
-    match name {
-        "echo" => Some(Box::new(NativeRuntime::new(Echo))),
-        _ => None,
-    }
-}
-
-fn build_wasm(path: &PathBuf) -> Result<Box<dyn AgentRuntime>> {
-    let bytes = std::fs::read(path)?;
-    let wasm = if BlockFile::is_block_container(&bytes) {
-        BlockFile::decode(&bytes)?
-            .get(TAG_WASM)
-            .ok_or_else(|| anyhow!("bundle has no WASM block"))?
-            .to_vec()
-    } else {
-        bytes
-    };
-    let caps = proto::AgentCapabilities {
-        max_execution_time_ms: 1000,
-        max_memory_bytes: 64 * 1024 * 1024,
-        storage_quota_bytes: 1024 * 1024,
-        ..Default::default()
-    };
-    Ok(Box::new(WasmRuntime::new(&wasm, &caps)?))
-}
+use fipa_wasm_agents::process::{apply_limits, build_runtime, serve, AgentSpec, Limits, Profile};
 
 fn main() -> Result<()> {
     let mut socket: Option<String> = None;
@@ -73,14 +35,17 @@ fn main() -> Result<()> {
     }
     let socket = socket.ok_or_else(|| anyhow!("--socket required"))?;
 
+    let spec = match (native_name, wasm) {
+        (Some(name), _) => AgentSpec::Native(name),
+        (None, Some(path)) => AgentSpec::Wasm(PathBuf::from(path)),
+        (None, None) => return Err(anyhow!("one of --native / --wasm required")),
+    };
+
     // Cap resources BEFORE loading the agent, so it can never run unbounded.
     apply_limits(&Limits { mem_bytes, cpu_secs });
 
-    let runtime = match (native_name, wasm) {
-        (Some(name), _) => native(&name).ok_or_else(|| anyhow!("unknown native agent: {name}"))?,
-        (None, Some(path)) => build_wasm(&PathBuf::from(path))?,
-        (None, None) => return Err(anyhow!("one of --native / --wasm required")),
-    };
+    // The agent-host runs the agent in its own process — always in-process here.
+    let runtime = build_runtime(&spec, &Profile::InProcess, Path::new(""), Duration::ZERO)?;
 
     let stream = UnixStream::connect(&socket)?;
     serve(runtime, stream)
