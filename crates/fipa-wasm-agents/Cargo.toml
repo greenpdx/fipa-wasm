@@ -109,6 +109,7 @@ unl-validator = { path = "../unl-validator" }
 unl-agent = { path = "../unl-agent" }
 df-agent = { path = "../../agents/df" }
 ams-agent = { path = "../../agents/ams" }
+pa-agent = { path = "../../agents/pa" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

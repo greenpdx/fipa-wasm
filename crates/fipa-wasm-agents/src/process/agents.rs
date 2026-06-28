@@ -30,6 +30,7 @@ pub fn native_agent(name: &str) -> Option<Box<dyn AgentRuntime>> {
         "boomer" => Some(Box::new(NativeRuntime::new(Boomer))),
         "df" => Some(Box::new(NativeRuntime::new(df_agent::Df::new()))),
         "ams" => Some(Box::new(NativeRuntime::new(ams_agent::Ams::new()))),
+        "pa" => Some(Box::new(NativeRuntime::new(pa_agent::Pa::new()))),
         _ => None,
     }
 }
