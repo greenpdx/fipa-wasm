@@ -23,9 +23,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY fipa.wit ./
 
-# Build both demos with the flow-trace feature so every engine step is printed.
-RUN cargo build --release -p fipa-wasm-agents --bin actor-demo --bin flow-demo --features flow-trace
-RUN strip /build/target/release/actor-demo /build/target/release/flow-demo
+# Build the demos with the flow-trace feature so every engine step is printed.
+RUN cargo build --release -p fipa-wasm-agents \
+      --bin actor-demo --bin flow-demo --bin ping-pong --features flow-trace
+RUN strip /build/target/release/actor-demo /build/target/release/flow-demo /build/target/release/ping-pong
 
 # =============================================================================
 # Stage 2: Runtime
@@ -36,6 +37,7 @@ RUN apk add --no-cache libgcc
 RUN addgroup -S fipa && adduser -S fipa -G fipa
 COPY --from=builder /build/target/release/actor-demo /usr/local/bin/actor-demo
 COPY --from=builder /build/target/release/flow-demo /usr/local/bin/flow-demo
+COPY --from=builder /build/target/release/ping-pong /usr/local/bin/ping-pong
 USER fipa
 
 # One-shot: print the flows and exit. Default to the full actor runtime;

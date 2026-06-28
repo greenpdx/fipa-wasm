@@ -132,6 +132,14 @@ path = "src/bin/flow_demo.rs"
 name = "actor-demo"
 path = "src/bin/actor_demo.rs"
 
+[[bin]]
+name = "ping-pong"
+path = "src/bin/ping_pong.rs"
+
+[[bin]]
+name = "inspect"
+path = "src/bin/inspect.rs"
+
 [lib]
 name = "fipa_wasm_agents"
 path = "src/lib.rs"
