@@ -46,6 +46,11 @@ pub struct AgentActor {
     /// `None` => the agent's `send-unl` emits are dropped.
     outbound: Option<Arc<dyn crate::content::verify::OutboundPackager>>,
 
+    /// Startup seed: the agent's own UNL + DATA blocks, used to `config()` the
+    /// agent once after init to seed its state. Empty => no seed (skipped).
+    seed_unl: Vec<u8>,
+    seed_data: Vec<u8>,
+
     /// Runtime state
     state: AgentRuntimeState,
 
@@ -83,6 +88,8 @@ impl AgentActor {
             registry: None,
             verifier: None,
             outbound: None,
+            seed_unl: Vec::new(),
+            seed_data: Vec::new(),
             state: AgentRuntimeState::Starting,
             stats: AgentStats::default(),
             start_time: Instant::now(),
@@ -125,6 +132,14 @@ impl AgentActor {
         packager: Arc<dyn crate::content::verify::OutboundPackager>,
     ) -> Self {
         self.outbound = Some(packager);
+        self
+    }
+
+    /// Provide the startup seed (the agent's own UNL + DATA blocks). When
+    /// non-empty, the agent is `config()`'d once with it after init.
+    pub fn with_seed(mut self, unl: Vec<u8>, data: Vec<u8>) -> Self {
+        self.seed_unl = unl;
+        self.seed_data = data;
         self
     }
 
@@ -327,6 +342,13 @@ impl Actor for AgentActor {
         match self.runtime.call_init() {
             Ok(_) => {
                 self.state = AgentRuntimeState::Running;
+                // Seed the agent's state from its own UNL/DATA blocks. Skipped
+                // when there is no seed; the agent's `config` may be a no-op.
+                if !self.seed_unl.is_empty() || !self.seed_data.is_empty() {
+                    if let Err(e) = self.runtime.call_config(&self.seed_unl, &self.seed_data) {
+                        warn!(agent = %self.agent_id.name, "startup seed config failed: {}", e);
+                    }
+                }
                 self.notify_supervisor(SupervisionEventType::Started);
             }
             Err(e) => {

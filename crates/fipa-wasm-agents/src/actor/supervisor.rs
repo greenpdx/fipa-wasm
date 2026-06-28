@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::messages::*;
 use crate::actor::AgentActor;
-use crate::content::block::{BlockFile, TAG_WASM};
+use crate::content::block::{BlockFile, TAG_DATA, TAG_UNL, TAG_WASM};
 use crate::content::unl::{vocabulary_from_bundle, UnlPackager, UnlVerifier, VocabRegistry};
 use crate::content::verify::{ContentVerifier, OutboundPackager};
 use crate::proto;
@@ -207,6 +207,15 @@ impl Supervisor {
 
         // The shared outbound packager (validate + package the agent's sends).
         actor = actor.with_outbound_packager(self.outbound.clone());
+
+        // Startup seed: the agent's own UNL + DATA blocks (skipped if absent).
+        if let Some(b) = &bundle {
+            let seed_unl = b.get(TAG_UNL).map(<[u8]>::to_vec).unwrap_or_default();
+            let seed_data = b.get(TAG_DATA).map(<[u8]>::to_vec).unwrap_or_default();
+            if !seed_unl.is_empty() || !seed_data.is_empty() {
+                actor = actor.with_seed(seed_unl, seed_data);
+            }
+        }
 
         let addr = actor.start();
 
