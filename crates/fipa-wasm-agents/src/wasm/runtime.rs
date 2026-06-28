@@ -436,4 +436,26 @@ mod config_abi_tests {
         // Drained.
         assert!(rt.take_unl_sends().is_empty());
     }
+
+    // End-to-end: a Rust agent compiled to wasm32 via unl_agent::export_agent!.
+    // Skips if the sample agent hasn't been built for wasm32.
+    #[test]
+    fn rust_wasm_agent_runs_through_the_runtime() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/wasm32-unknown-unknown/debug/greeter_agent.wasm"
+        );
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: greeter_agent.wasm not built for wasm32");
+            return;
+        };
+        let mut rt = WasmRuntime::new(&bytes, &caps()).unwrap();
+        rt.call_init().unwrap();
+        rt.call_config(b"agt(hello, me)", b"ping").unwrap(); // a message
+        let sends = rt.take_unl_sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].receiver, "peer");
+        assert_eq!(sends[0].unl, b"agt(greet, you)");
+        assert_eq!(sends[0].body, b"hi from rust-wasm");
+    }
 }
