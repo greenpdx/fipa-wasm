@@ -29,6 +29,7 @@ pub mod actor;
 pub mod behavior;
 pub mod consensus;
 pub mod content;
+pub mod identity;
 pub mod interplatform;
 #[cfg(feature = "mcp")]
 pub mod mcp;
