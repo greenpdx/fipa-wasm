@@ -1,30 +1,23 @@
-// book_demo.rs — the full book-buy conversation over the Router, with
-// authenticated `from`, then deliberately broken to locate problems.
+// book_demo.rs — the full book-buy conversation over the Router, with the buyer
+// (BA) running as a real wasm32 agent (ba-agent), then deliberately broken to
+// locate problems.
 //
-//   cargo run --bin book-demo --features flow-trace
+//   cargo build -p ba-agent --target wasm32-unknown-unknown   # build BA wasm
+//   cargo run --bin book-demo --features flow-trace           # run it
 //
-// Flow (all messages stamped with the authenticated sender by the Router):
-//   BA → DF  seek bookselling     DF → BA  provide [bookSeller]
-//   BA → AMS locate bookSeller    AMS → BA at {address}
-//   BA → BS  catalog              BS → BA  catalog [{LtG, 999}, …]
-//   BA → PA  reserve LtG {seller, 999}
-//        PA → BA receipt held     PA → BS receipt held {buyer:BA}
-//   BS → PA  accept LtG           PA → BA,BS receipt paid   (funds released)
-//   BS → BA  deliver LtG          BA → result bought
-//
-// BA emits its final verdict to "result" (a non-agent) so it lands in the
-// router outbox where we can read it.
+// If the BA wasm isn't built, the demo falls back to running the same Buyer
+// natively (ba-agent is cdylib+rlib — one source, both targets).
 
 use fipa_wasm_agents::process::Router;
-use fipa_wasm_agents::wasm::NativeRuntime;
-use serde::Deserialize;
+use fipa_wasm_agents::proto;
+use fipa_wasm_agents::wasm::{AgentRuntime, NativeRuntime, WasmRuntime};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use unl_agent::{Agent, Ctx};
 use unl_core::{NodeRef, Uci};
 use unl_parser::parse_sentence;
 
-// ── message helpers ─────────────────────────────────────────────────────
+// ── message helpers (for BS + reading BA's verdict) ─────────────────────
 
 fn verb_subject(unl: &str) -> Option<(String, String)> {
     let g = parse_sentence(unl).ok()?;
@@ -47,100 +40,7 @@ fn jfield(body: &[u8], key: &str) -> Option<String> {
     v.get(key)?.as_str().map(str::to_string)
 }
 
-// ── BA: the buyer (a small conversation state machine) ──────────────────
-
-#[derive(Clone, Copy, PartialEq)]
-enum St {
-    Init,
-    Provider,
-    Address,
-    Catalog,
-    Held,
-    Delivery,
-    Done,
-    Failed,
-}
-
-#[derive(Deserialize)]
-struct Book {
-    title: String,
-    price: u64,
-}
-
-struct Buyer {
-    st: St,
-    seller: String,
-}
-impl Buyer {
-    fn new() -> Self {
-        Buyer { st: St::Init, seller: String::new() }
-    }
-}
-impl Agent for Buyer {
-    fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx) {
-        let Some((verb, _subj)) = verb_subject(unl) else { return };
-        // any deny aborts the purchase.
-        if verb == "deny" {
-            let reason = jfield(body, "reason").unwrap_or_else(|| "denied".into());
-            ctx.send("result", "obj(failed, x)", reason.into_bytes());
-            self.st = St::Failed;
-            return;
-        }
-        match (self.st, verb.as_str()) {
-            (St::Init, "start") => {
-                ctx.send("df", "obj(seek, bookselling)", vec![]);
-                self.st = St::Provider;
-            }
-            (St::Provider, "provide") => {
-                let providers: Vec<String> = serde_json::from_slice(body).unwrap_or_default();
-                match providers.first() {
-                    Some(p) => {
-                        self.seller = p.clone();
-                        ctx.send("ams", format!("obj(locate, {p})"), vec![]);
-                        self.st = St::Address;
-                    }
-                    None => self.fail(ctx, "no-provider"),
-                }
-            }
-            (St::Address, "at") => match jfield(body, "address") {
-                Some(_addr) => {
-                    ctx.send(&self.seller, "obj(catalog, systemdynamics)", vec![]);
-                    self.st = St::Catalog;
-                }
-                None => self.fail(ctx, "no-address"),
-            },
-            (St::Catalog, "catalog") => {
-                let books: Vec<Book> = serde_json::from_slice(body).unwrap_or_default();
-                match books.iter().find(|b| b.title == "LtG") {
-                    Some(b) => {
-                        let terms = serde_json::json!({ "seller": self.seller, "amount": b.price });
-                        ctx.send("pa", "obj(reserve, LtG)", serde_json::to_vec(&terms).unwrap());
-                        self.st = St::Held;
-                    }
-                    None => self.fail(ctx, "book-not-found"),
-                }
-            }
-            (St::Held, "receipt") => {
-                if jstatus(body) == "held" {
-                    self.st = St::Delivery; // funds secured; await the book
-                }
-            }
-            (St::Delivery, "deliver") => {
-                ctx.send("result", "obj(bought, LtG)", vec![]);
-                self.st = St::Done;
-            }
-            _ => {}
-        }
-    }
-}
-impl Buyer {
-    fn fail(&mut self, ctx: &mut Ctx, why: &str) {
-        ctx.send("result", "obj(failed, x)", why.as_bytes().to_vec());
-        self.st = St::Failed;
-    }
-}
-
-// ── BS: the seller ──────────────────────────────────────────────────────
+// ── BS: the seller (native) ─────────────────────────────────────────────
 
 struct Seller {
     has_ltg: bool,
@@ -167,23 +67,43 @@ impl Agent for Seller {
             "receipt" => match jstatus(body).as_str() {
                 "held" => {
                     if let Some(buyer) = jfield(body, "buyer") {
-                        self.buyers.insert(subject.clone(), buyer); // reserve the book for the buyer
+                        self.buyers.insert(subject.clone(), buyer);
                         ctx.send("pa", format!("obj(accept, {subject})"), vec![]);
                     }
                 }
                 "paid" => {
                     if let Some(buyer) = self.buyers.get(&subject) {
-                        ctx.send(buyer.clone(), format!("obj(deliver, {subject})"), vec![]); // ship
+                        ctx.send(buyer.clone(), format!("obj(deliver, {subject})"), vec![]);
                     }
                 }
                 "cancelled" => {
-                    self.buyers.remove(&subject); // release the book
+                    self.buyers.remove(&subject);
                 }
                 _ => {}
             },
             _ => {}
         }
     }
+}
+
+// ── BA: load the wasm agent (fallback to native) ────────────────────────
+
+fn ba_wasm_path() -> &'static str {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/wasm32-unknown-unknown/debug/ba_agent.wasm")
+}
+
+fn ba_is_wasm() -> bool {
+    std::fs::metadata(ba_wasm_path()).is_ok()
+}
+
+fn ba_runtime() -> Box<dyn AgentRuntime> {
+    if let Ok(bytes) = std::fs::read(ba_wasm_path()) {
+        let caps = proto::AgentCapabilities { max_execution_time_ms: 1000, ..Default::default() };
+        if let Ok(rt) = WasmRuntime::new(&bytes, &caps) {
+            return Box::new(rt);
+        }
+    }
+    Box::new(NativeRuntime::new(ba_agent::Buyer::new()))
 }
 
 // ── wiring + scenarios ──────────────────────────────────────────────────
@@ -217,15 +137,14 @@ fn run(s: &Scenario) -> String {
     r.add("ams", Box::new(NativeRuntime::new(ams)));
     r.add("pa", Box::new(NativeRuntime::new(pa)));
     r.add("bookSeller", Box::new(NativeRuntime::new(Seller::new(s.bs_has_book))));
-    r.add("BA", Box::new(NativeRuntime::new(Buyer::new())));
+    r.add("BA", ba_runtime()); // ← the buyer, as wasm (or native fallback)
 
-    r.send("boot", "BA", b"obj(start, buy)", b""); // kick off the buyer
+    r.send("boot", "BA", b"obj(start, buy)", b"");
     r.run(200);
 
-    // BA's verdict landed in the outbox (addressed to the non-agent "result").
     match r.outbox.iter().find(|e| e.to == "result") {
         Some(e) => {
-            let (verb, _) = verb_subject(&String::from_utf8_lossy(&e.unl)).unwrap_or_default_pair();
+            let verb = verb_subject(&String::from_utf8_lossy(&e.unl)).map(|(v, _)| v).unwrap_or_default();
             if verb == "bought" {
                 "✓ bought LtG".to_string()
             } else {
@@ -236,17 +155,16 @@ fn run(s: &Scenario) -> String {
     }
 }
 
-trait UnwrapPair {
-    fn unwrap_or_default_pair(self) -> (String, String);
-}
-impl UnwrapPair for Option<(String, String)> {
-    fn unwrap_or_default_pair(self) -> (String, String) {
-        self.unwrap_or_default()
-    }
-}
-
 fn main() {
     println!("=== book-buy conversation (run with --features flow-trace to see each hop) ===");
+    println!(
+        "BA running as: {}",
+        if ba_is_wasm() {
+            "wasm32 (real mobile agent)"
+        } else {
+            "native fallback — build it: cargo build -p ba-agent --target wasm32-unknown-unknown"
+        }
+    );
 
     let scenarios = [
         ("happy path", Scenario { ba_funds: 10000, df_has_provider: true, ams_has_address: true, bs_has_book: true }),

@@ -110,6 +110,7 @@ unl-agent = { path = "../unl-agent" }
 df-agent = { path = "../../agents/df" }
 ams-agent = { path = "../../agents/ams" }
 pa-agent = { path = "../../agents/pa" }
+ba-agent = { path = "../../agents/ba" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
