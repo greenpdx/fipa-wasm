@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1
 
-# UNL flow-demo node — runs the two scenarios (chat; search & buy a book) plus
-# the WASM agent boundary, with step-by-step [flow] instrumentation on.
+# UNL demo node — runs the message flow with step-by-step [flow] instrumentation.
 #
 #   docker build -f Dockerfile.flow-demo -t unl-flow-demo .
-#   docker run --rm unl-flow-demo
+#   docker run --rm unl-flow-demo                  # full actor runtime (default)
+#   docker run --rm unl-flow-demo flow-demo        # node-engine pipeline demo
+#
+# actor-demo: a Supervisor spawns real WASM agents (bundles) that chat and trade
+#   a book over the actor system (receive → config → send-unl → package → route).
+# flow-demo:  the same engine driven directly (chat; search & buy; WASM boundary).
 
 # =============================================================================
 # Stage 1: Build
@@ -19,9 +23,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY fipa.wit ./
 
-# Build the demo with the flow-trace feature so every engine step is printed.
-RUN cargo build --release -p fipa-wasm-agents --bin flow-demo --features flow-trace
-RUN strip /build/target/release/flow-demo
+# Build both demos with the flow-trace feature so every engine step is printed.
+RUN cargo build --release -p fipa-wasm-agents --bin actor-demo --bin flow-demo --features flow-trace
+RUN strip /build/target/release/actor-demo /build/target/release/flow-demo
 
 # =============================================================================
 # Stage 2: Runtime
@@ -30,8 +34,10 @@ FROM alpine:3.21
 
 RUN apk add --no-cache libgcc
 RUN addgroup -S fipa && adduser -S fipa -G fipa
+COPY --from=builder /build/target/release/actor-demo /usr/local/bin/actor-demo
 COPY --from=builder /build/target/release/flow-demo /usr/local/bin/flow-demo
 USER fipa
 
-# One-shot: print the flows and exit.
-ENTRYPOINT ["flow-demo"]
+# One-shot: print the flows and exit. Default to the full actor runtime;
+# `docker run <image> flow-demo` selects the node-engine pipeline demo instead.
+CMD ["actor-demo"]

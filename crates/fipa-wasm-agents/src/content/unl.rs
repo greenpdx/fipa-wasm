@@ -108,10 +108,39 @@ impl OutboundPackager for UnlPackager {
     ) -> Result<AclMessage, String> {
         let text = std::str::from_utf8(unl).map_err(|_| "outgoing UNL is not UTF-8".to_string())?;
         let graph = unl_parser::parse_sentence(text).map_err(|e| e.to_string())?;
-        let registry = self.registry.read().map_err(|_| "vocab registry poisoned".to_string())?;
-        package_outbound(sender, receiver, &graph, body, &registry).map_err(|diags| {
-            format!("receiver '{receiver}' would not understand ({} issue(s))", diags.len())
-        })
+        crate::flow!("send: '{sender}' → '{receiver}' : validating UNL against receiver's vocabulary");
+        {
+            let registry = self.registry.read().map_err(|_| "vocab registry poisoned".to_string())?;
+            if let Some(vocab) = registry.get(receiver) {
+                if let Err(diags) = unl_validator::verify_vocabulary(&graph, vocab) {
+                    crate::flow!("send:   receiver '{receiver}' would NOT understand ({} issue(s)) → not transmitted", diags.len());
+                    return Err(format!("receiver '{receiver}' would not understand ({} issue(s))", diags.len()));
+                }
+            } else {
+                crate::flow!("send:   receiver '{receiver}' vocabulary unknown → optimistic send");
+            }
+        }
+        // Transmit the agent's UNL bytes as-is (no re-serialization).
+        let mut msg = AclMessage {
+            message_id: new_id(),
+            performative: Performative::Inform as i32,
+            sender: Some(agent_id(sender)),
+            receivers: vec![agent_id(receiver)],
+            reply_to: None,
+            protocol: None,
+            conversation_id: None,
+            in_reply_to: None,
+            reply_with: None,
+            reply_by: None,
+            language: None,
+            encoding: None,
+            ontology: None,
+            content: Vec::new(),
+            user_properties: HashMap::new(),
+        };
+        set_message_content_bytes(&mut msg, unl, body);
+        crate::flow!("send:   packaged UNL+DATA message '{}' → transmit", msg.message_id);
+        Ok(msg)
     }
 }
 
@@ -166,6 +195,16 @@ pub fn set_message_content(msg: &mut AclMessage, graph: &UnlGraph, data: &[u8]) 
     let blocks = BlockFile::new()
         .with(TAG_UNL, unl_parser::serialize_list(graph).into_bytes())
         .with(TAG_DATA, data.to_vec());
+    msg.content = blocks.encode();
+    msg.language = Some(CONTENT_LANGUAGE.to_string());
+    msg.encoding = Some("application/x-fipa-blocks".to_string());
+}
+
+/// Attach a message from already-serialized UNL bytes (+ data) without
+/// re-serializing — preserves the exact UNL the sender produced, so it parses
+/// back identically on the receiver.
+pub fn set_message_content_bytes(msg: &mut AclMessage, unl: &[u8], data: &[u8]) {
+    let blocks = BlockFile::new().with(TAG_UNL, unl.to_vec()).with(TAG_DATA, data.to_vec());
     msg.content = blocks.encode();
     msg.language = Some(CONTENT_LANGUAGE.to_string());
     msg.encoding = Some("application/x-fipa-blocks".to_string());

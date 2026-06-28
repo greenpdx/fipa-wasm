@@ -182,6 +182,7 @@ impl AgentActor {
         ctx: &mut Context<Self>,
     ) -> Result<(), AgentError> {
         self.stats.messages_received += 1;
+        crate::flow!("recv: agent '{}' received '{}'", self.agent_id.name, msg.message_id);
 
         // Record metrics
         let performative = proto::Performative::try_from(msg.performative)
@@ -202,6 +203,7 @@ impl AgentActor {
         if let Some(verifier) = &self.verifier {
             match verifier.sanitize(&msg) {
                 Err(reason) => {
+                    crate::flow!("recv:   '{}' REJECTED message: {}", self.agent_id.name, reason);
                     warn!(
                         agent = %self.agent_id.name,
                         message = ?msg.message_id,
@@ -270,18 +272,21 @@ impl AgentActor {
         Ok(())
     }
 
-    /// Send an ACL message
+    /// Send an ACL message. Routes through the supervisor, which delivers to
+    /// local agents and forwards non-local receivers to the network. Falls back
+    /// to the network directly when no supervisor is attached.
     fn send_message(
         &mut self,
         msg: proto::AclMessage,
         _ctx: &mut Context<Self>,
     ) -> Result<(), AgentError> {
-        if let Some(network) = &self.network {
-            // Determine target node
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.do_send(DeliverMessage { message: msg });
+            self.stats.messages_sent += 1;
+        } else if let Some(network) = &self.network {
             for _receiver in &msg.receivers {
-                // Try local first, then remote
                 network.do_send(SendRemoteMessage {
-                    target_node: String::new(), // Will be resolved
+                    target_node: String::new(),
                     message: msg.clone(),
                 });
             }

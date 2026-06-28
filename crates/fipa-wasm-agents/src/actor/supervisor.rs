@@ -411,10 +411,16 @@ impl Handler<DeliverMessage> for Supervisor {
     type Result = Result<(), AgentError>;
 
     fn handle(&mut self, msg: DeliverMessage, _ctx: &mut Self::Context) -> Self::Result {
-        // Route message to appropriate agent
+        // Route message: local agents directly, otherwise forward to the network.
         for receiver in &msg.message.receivers {
+            crate::flow!("route: node delivers '{}' → '{}'", msg.message.message_id, receiver.name);
             if let Some(supervised) = self.agents.get(&receiver.name) {
                 supervised.addr.do_send(msg.clone());
+            } else if let Some(network) = &self.network {
+                network.do_send(SendRemoteMessage {
+                    target_node: String::new(),
+                    message: msg.message.clone(),
+                });
             } else {
                 warn!("Agent not found for message delivery: {}", receiver.name);
             }
