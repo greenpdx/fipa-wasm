@@ -107,6 +107,7 @@ unl-kb = { path = "../unl-kb" }
 unl-parser = { path = "../unl-parser" }
 unl-validator = { path = "../unl-validator" }
 unl-agent = { path = "../unl-agent" }
+df-agent = { path = "../../agents/df" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

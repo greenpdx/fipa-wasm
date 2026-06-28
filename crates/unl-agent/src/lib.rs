@@ -83,11 +83,15 @@ impl Ctx {
 
 /// An agent. The same trait whether the agent is compiled native or to wasm32.
 pub trait Agent {
-    /// Called once after the agent is seeded, before any message.
+    /// Called once before any message, with no data. Use for pure setup.
     fn on_init(&mut self, _ctx: &mut Ctx) {}
 
+    /// Called once at startup with the agent's own `DATA` seed block (e.g. an
+    /// infrastructure agent's initial registry). Default: ignore.
+    fn on_seed(&mut self, _data: &[u8], _ctx: &mut Ctx) {}
+
     /// Called per inbound message with the decoded UNL text and the data
-    /// payload. Reply via `ctx.send(...)`.
+    /// payload; the sender is `ctx.from()`. Reply via `ctx.send(...)`.
     fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx);
 }
 
@@ -185,7 +189,8 @@ macro_rules! export_agent {
                 let unl = unsafe { ::core::slice::from_raw_parts(up, ul) };
                 let body = unsafe { ::core::slice::from_raw_parts(bp, bl) };
                 if $crate::is_seed(unl) {
-                    return; // vocabulary seed — not a message
+                    drive(|a, ctx| a.on_seed(body, ctx)); // DATA seed → on_seed
+                    return;
                 }
                 let unl = ::core::str::from_utf8(unl).unwrap_or("");
                 drive(|a, ctx| a.on_message(unl, body, ctx));

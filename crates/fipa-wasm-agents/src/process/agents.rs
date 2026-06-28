@@ -28,6 +28,7 @@ pub fn native_agent(name: &str) -> Option<Box<dyn AgentRuntime>> {
     match name {
         "echo" => Some(Box::new(NativeRuntime::new(Echo))),
         "boomer" => Some(Box::new(NativeRuntime::new(Boomer))),
+        "df" => Some(Box::new(NativeRuntime::new(df_agent::Df::new()))),
         _ => None,
     }
 }

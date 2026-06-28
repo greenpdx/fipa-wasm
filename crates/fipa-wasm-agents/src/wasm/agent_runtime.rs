@@ -102,9 +102,9 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
     }
 
     fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
-        // The vocabulary seed (UNL begins with '{') is not a message.
+        // The seed (UNL begins with '{') carries the agent's DATA block.
         if unl_agent::is_seed(unl) {
-            return Ok(());
+            return self.guarded(move |a, ctx| a.on_seed(body, ctx));
         }
         let text = std::str::from_utf8(unl).unwrap_or("").to_string();
         let from = from.to_string();
