@@ -4,7 +4,11 @@
 //!
 //! On a host build the `export_agent!` glue is `cfg(wasm32)`-compiled out, so
 //! the type is unused — hence the allow below.
+//!
+//! `forbid(unsafe_code)` is the agent-crate policy: a safe-Rust agent cannot
+//! corrupt node memory, the native counterpart of the wasm memory sandbox.
 #![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 use unl_agent::{Agent, Ctx};
 

@@ -69,23 +69,35 @@ impl<A: Agent> NativeRuntime<A> {
         NativeRuntime { agent, outbox: Vec::new() }
     }
 
-    fn drain(&mut self, ctx: &mut Ctx) {
-        for out in ctx.take() {
-            self.outbox.push(OutboundIntent {
-                receiver: out.to,
-                unl: out.unl.into_bytes(),
-                body: out.body,
-            });
+    /// Run one agent call with **fault isolation**: a panic is caught so it can
+    /// never unwind into the node. On panic the agent's emitted output is
+    /// discarded (its state is suspect) and the call fails, so the supervisor
+    /// can quarantine or restart it. (Requires `panic = "unwind"`; with
+    /// `panic = "abort"` only a process boundary contains a faulting agent.)
+    fn guarded(&mut self, call: impl FnOnce(&mut A, &mut Ctx)) -> Result<()> {
+        let agent = &mut self.agent;
+        let mut ctx = Ctx::new();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(agent, &mut ctx)));
+        match outcome {
+            Ok(()) => {
+                for out in ctx.take() {
+                    self.outbox.push(OutboundIntent {
+                        receiver: out.to,
+                        unl: out.unl.into_bytes(),
+                        body: out.body,
+                    });
+                }
+                Ok(())
+            }
+            Err(_) => Err(anyhow::anyhow!("native agent panicked; output discarded")),
         }
     }
 }
 
 impl<A: Agent> AgentRuntime for NativeRuntime<A> {
     fn init(&mut self) -> Result<()> {
-        let mut ctx = Ctx::new();
-        self.agent.on_init(&mut ctx);
-        self.drain(&mut ctx);
-        Ok(())
+        self.guarded(|a, ctx| a.on_init(ctx))
     }
 
     fn config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
@@ -93,11 +105,8 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
         if unl_agent::is_seed(unl) {
             return Ok(());
         }
-        let text = std::str::from_utf8(unl).unwrap_or("");
-        let mut ctx = Ctx::new();
-        self.agent.on_message(text, body, &mut ctx);
-        self.drain(&mut ctx);
-        Ok(())
+        let text = std::str::from_utf8(unl).unwrap_or("").to_string();
+        self.guarded(move |a, ctx| a.on_message(&text, body, ctx))
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
@@ -115,6 +124,25 @@ mod tests {
             // bounce the message back to "peer"
             ctx.send("peer", unl, body.to_vec());
         }
+    }
+
+    struct Panicker;
+    impl Agent for Panicker {
+        fn on_message(&mut self, _unl: &str, _body: &[u8], _ctx: &mut Ctx) {
+            panic!("agent went rogue");
+        }
+    }
+
+    #[test]
+    fn panicking_agent_is_contained() {
+        let mut rt = NativeRuntime::new(Panicker);
+        // The panic is caught; the node survives and no output leaks.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the panic print
+        let r = rt.config(b"agt(x, y)", b"");
+        std::panic::set_hook(prev);
+        assert!(r.is_err());
+        assert!(rt.take_sends().is_empty());
     }
 
     #[test]

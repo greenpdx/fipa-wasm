@@ -11,6 +11,19 @@
 //! through [`Ctx`]. The host driver (native `NativeRuntime` or the wasm glue)
 //! collects those replies — so both substrates behave identically.
 //!
+//! ## Isolation
+//!
+//! A native agent must be sandboxed *like* a wasm one so a corrupt agent cannot
+//! poison the node. The four wasm guarantees map to native as:
+//! - **capability** — the agent only gets `&mut self` + [`Ctx`]; no node handles
+//!   (it cannot reach the supervisor, network, or other agents);
+//! - **memory** — agent crates set `#![forbid(unsafe_code)]`, so safe Rust
+//!   cannot corrupt host memory;
+//! - **fault** — `NativeRuntime` runs every call under `catch_unwind`, so a
+//!   panic is contained and the agent is quarantined, not the node;
+//! - **resource** (hard CPU/RAM caps) — *not* achievable in-process; needs a
+//!   thread or process boundary. That is the remaining isolation upgrade.
+//!
 //! ```ignore
 //! struct Greeter { peer: String }
 //! impl unl_agent::Agent for Greeter {
