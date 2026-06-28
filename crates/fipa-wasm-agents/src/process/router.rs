@@ -78,6 +78,12 @@ impl Router {
             steps += 1;
             match self.agents.get_mut(&env.to) {
                 Some(agent) => {
+                    crate::flow!(
+                        "  {} → {} : {}",
+                        env.from,
+                        env.to,
+                        String::from_utf8_lossy(&env.unl)
+                    );
                     if agent.config(&env.from, &env.unl, &env.body).is_err() {
                         continue;
                     }
@@ -93,7 +99,15 @@ impl Router {
                         });
                     }
                 }
-                None => self.outbox.push(env), // non-local recipient
+                None => {
+                    crate::flow!(
+                        "  {} → {} : {} (external/undelivered)",
+                        env.from,
+                        env.to,
+                        String::from_utf8_lossy(&env.unl)
+                    );
+                    self.outbox.push(env); // non-local recipient
+                }
             }
         }
     }

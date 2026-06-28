@@ -149,6 +149,10 @@ path = "src/bin/inspect.rs"
 name = "agent-host"
 path = "src/bin/agent_host.rs"
 
+[[bin]]
+name = "book-demo"
+path = "src/bin/book_demo.rs"
+
 [lib]
 name = "fipa_wasm_agents"
 path = "src/lib.rs"
