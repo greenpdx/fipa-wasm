@@ -39,9 +39,14 @@ impl AgentRuntime for super::WasmRuntime {
         self.call_init()
     }
 
-    fn config(&mut self, _from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
-        // Wasm sender threading is not wired yet; the guest gets ctx.from() == "".
-        self.call_config(unl, body)
+    fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
+        // Prefer the from-aware `deliver` export; fall back to `config` for
+        // guests that don't export it (hand-written WAT agents).
+        if self.call_deliver(from.as_bytes(), unl, body)? {
+            Ok(())
+        } else {
+            self.call_config(unl, body)
+        }
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {

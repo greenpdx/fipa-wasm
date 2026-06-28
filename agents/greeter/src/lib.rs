@@ -12,12 +12,13 @@
 
 use unl_agent::{Agent, Ctx};
 
-/// Replies to any message by greeting its peer.
+/// Replies to whoever sent the message (uses the authenticated `ctx.from()`).
 struct Greeter;
 
 impl Agent for Greeter {
     fn on_message(&mut self, _unl: &str, _body: &[u8], ctx: &mut Ctx) {
-        ctx.send("peer", "agt(greet, you)", b"hi from rust-wasm".to_vec());
+        let from = ctx.from().to_string();
+        ctx.send(from, "agt(greet, you)", b"hi from rust-wasm".to_vec());
     }
 }
 

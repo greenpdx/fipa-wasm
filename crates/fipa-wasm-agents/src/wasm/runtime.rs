@@ -260,6 +260,31 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// Deliver `(unl, body)` from sender `from` via the agent's `deliver` export
+    /// (from-aware). Returns `Ok(false)` if the guest has no `deliver` export, so
+    /// the caller can fall back to `call_config`.
+    pub fn call_deliver(&mut self, from: &[u8], unl: &[u8], body: &[u8]) -> Result<bool> {
+        let deliver = match self
+            .instance
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), ()>(&mut self.store, "deliver")
+        {
+            Ok(f) => f,
+            Err(_) => return Ok(false),
+        };
+        crate::flow!("wasm: → deliver(from={} bytes, unl={} bytes) into agent", from.len(), unl.len());
+        let fp = self.guest_alloc(from.len())?;
+        self.write_bytes(fp, from)?;
+        let up = self.guest_alloc(unl.len())?;
+        self.write_bytes(up, unl)?;
+        let bp = self.guest_alloc(body.len())?;
+        self.write_bytes(bp, body)?;
+        deliver.call(
+            &mut self.store,
+            (fp, from.len() as i32, up, unl.len() as i32, bp, body.len() as i32),
+        )?;
+        Ok(true)
+    }
+
     /// Drain the UNL send intents the agent emitted via `send-unl`. The node
     /// validates each against the receiver's vocabulary, packages it, and
     /// transmits it.
@@ -449,12 +474,15 @@ mod config_abi_tests {
             eprintln!("skip: greeter_agent.wasm not built for wasm32");
             return;
         };
+        use crate::wasm::AgentRuntime;
         let mut rt = WasmRuntime::new(&bytes, &caps()).unwrap();
         rt.call_init().unwrap();
-        rt.call_config(b"agt(hello, me)", b"ping").unwrap(); // a message
+        // Via the seam → `deliver`, threading the sender. The greeter replies to
+        // ctx.from(), so the receiver must be the authenticated sender.
+        rt.config("alice", b"agt(hello, me)", b"ping").unwrap();
         let sends = rt.take_unl_sends();
         assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].receiver, "peer");
+        assert_eq!(sends[0].receiver, "alice"); // ctx.from() threaded into wasm
         assert_eq!(sends[0].unl, b"agt(greet, you)");
         assert_eq!(sends[0].body, b"hi from rust-wasm");
     }

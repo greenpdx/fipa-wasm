@@ -184,16 +184,44 @@ macro_rules! export_agent {
                 1 // keep running
             }
 
+            fn handle(from: &[u8], unl: &[u8], body: &[u8]) {
+                let from = ::core::str::from_utf8(from).unwrap_or("");
+                if $crate::is_seed(unl) {
+                    drive(|a, ctx| {
+                        ctx.set_from(from);
+                        a.on_seed(body, ctx); // DATA seed → on_seed
+                    });
+                } else {
+                    let unl = ::core::str::from_utf8(unl).unwrap_or("");
+                    drive(|a, ctx| {
+                        ctx.set_from(from);
+                        a.on_message(unl, body, ctx);
+                    });
+                }
+            }
+
+            // No-sender delivery (back-compat: the host's `call_config`).
             #[unsafe(no_mangle)]
             pub extern "C" fn config(up: *const u8, ul: usize, bp: *const u8, bl: usize) {
                 let unl = unsafe { ::core::slice::from_raw_parts(up, ul) };
                 let body = unsafe { ::core::slice::from_raw_parts(bp, bl) };
-                if $crate::is_seed(unl) {
-                    drive(|a, ctx| a.on_seed(body, ctx)); // DATA seed → on_seed
-                    return;
-                }
-                let unl = ::core::str::from_utf8(unl).unwrap_or("");
-                drive(|a, ctx| a.on_message(unl, body, ctx));
+                handle(&[], unl, body);
+            }
+
+            // From-aware delivery: the sender id is the first (ptr,len) pair.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn deliver(
+                fp: *const u8,
+                fl: usize,
+                up: *const u8,
+                ul: usize,
+                bp: *const u8,
+                bl: usize,
+            ) {
+                let from = unsafe { ::core::slice::from_raw_parts(fp, fl) };
+                let unl = unsafe { ::core::slice::from_raw_parts(up, ul) };
+                let body = unsafe { ::core::slice::from_raw_parts(bp, bl) };
+                handle(from, unl, body);
             }
 
             // re-export the host allocator so the linker keeps it
