@@ -17,6 +17,7 @@ members = [
     "crates/unl-llm",
     "crates/unl-a2a",
     "crates/unl-fipa",
+    "crates/unl-agent",
     "xtask",
 ]
 
