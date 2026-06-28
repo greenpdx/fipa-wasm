@@ -30,7 +30,17 @@ pub fn native_agent(name: &str) -> Option<Box<dyn AgentRuntime>> {
         "boomer" => Some(Box::new(NativeRuntime::new(Boomer))),
         "df" => Some(Box::new(NativeRuntime::new(df_agent::Df::new()))),
         "ams" => Some(Box::new(NativeRuntime::new(ams_agent::Ams::new()))),
-        "pa" => Some(Box::new(NativeRuntime::new(pa_agent::Pa::new()))),
+        // PA is durable: open its sled store under the node's data dir.
+        "pa" => {
+            let dir = std::env::var("FIPA_DATA_DIR").unwrap_or_else(|_| "./fipa-data".into());
+            match pa_agent::Pa::open(std::path::Path::new(&dir).join("pa")) {
+                Ok(pa) => Some(Box::new(NativeRuntime::new(pa))),
+                Err(e) => {
+                    eprintln!("pa: failed to open store: {e}");
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }

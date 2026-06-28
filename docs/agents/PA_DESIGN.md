@@ -106,19 +106,24 @@ PA handles money, so identity and durability are first-class.
   malformed messages ignored.
 - **Scoped receipts** — only to the hold's actual buyer/seller.
 
+**Done:**
+- *PA agent:* **durable ledger + holds** (sled) — the whole state is rewritten
+  atomically (single key) + flushed after each mutation, and reloaded by
+  `Pa::open`, so a crash/restart recovers in-flight escrow. Test:
+  `state_survives_restart`.
+
 **Deferred (with hooks), by layer:**
 - *FIPA/node:* **authenticate `from`** (signed messages / authenticated channels)
   — authorization is only meaningful once this exists; transport integrity (TLS)
   for cross-node; rate-limiting. *(Process isolation + `rlimit` already done.)*
-- *PA agent:* **durable ledger + holds** (a DB) — **without it a restart loses
-  escrow**, since `ManagedAgent` rebuilds from the seed; audit log; timeout
-  auto-`deny` of stale holds; `status` query.
+- *PA agent:* audit log; timeout auto-`deny` of stale holds; `status` query;
+  per-key WAL/transactions (the blob is correct for small state).
 - *end-to-end:* **sign** `(order, action, terms)` and PA's **receipts** for
   integrity + non-repudiation, independent of router trust.
 
-**Sharpest risks today:** (1) `from` is unauthenticated → spoofed `accept`/`deny`;
-(2) in-memory state → a restart loses held funds. Both are noted as the security
-roadmap; v1 is a trusted-`from`, in-memory build.
+**Sharpest risk remaining:** `from` is unauthenticated → spoofed `accept`/`deny`
+(the FIPA-layer foundation the agent's authorization waits on). State durability
+is now handled.
 
 ## 7b. Other deferred
 

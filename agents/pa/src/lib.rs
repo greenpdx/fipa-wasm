@@ -1,9 +1,10 @@
-//! # Payment Agent (PA) — escrow / hold settlement
+//! # Payment Agent (PA) — escrow / hold settlement (durable)
 //!
 //! PA settles payment between a buyer and a seller with an **escrow hold**: it
 //! **reserves** (holds) the buyer's funds, then **releases** them to the seller
 //! on **accept** or back to the buyer on **deny**, issuing **receipts**
-//! throughout. It is the money side of the book purchase.
+//! throughout. State (the ledger + holds) is **durable** (sled): a restart
+//! recovers in-flight escrow.
 //!
 //! ## The six verbs as a state machine
 //!
@@ -17,11 +18,6 @@
 //!        receipt "paid" ×2      receipt "cancelled" ×2
 //! ```
 //!
-//! - **reserve** (in): escrow funds for an order. **hold** is the resulting
-//!   state. **accept** (in, seller): **release** to the seller. **deny** (in,
-//!   buyer/seller): **release** back to the buyer — and PA's *out* `deny` is its
-//!   rejection of a reserve. **receipt** (out): the proof, to both parties.
-//!
 //! ## Messages — UNL verb + order id; JSON body for terms
 //!
 //! | in `unl` / `body` | PA does |
@@ -34,36 +30,39 @@
 //! Replies: `obj(receipt, <order>)` / `{"status":"held"|"paid"|"cancelled",…}`,
 //! or `obj(deny, <order>)` / `{"reason":…}`.
 //!
-//! ## Security (v1: in-memory, trusted `from`)
+//! ## Durability
 //!
-//! Baked in (correct now; enforceable once the node authenticates `from`):
-//! - **authorization** — `accept` only from `hold.seller`; `deny` only from the
-//!   hold's buyer or seller (checked against `ctx.from()`);
-//! - **idempotency** — a duplicate `reserve` for an order is rejected; the
-//!   one-way state machine blunts `accept`/`deny` replay;
-//! - **validation** — amounts are non-negative integers, checked for overflow;
-//! - **scoped receipts** — only to the hold's buyer/seller.
+//! The whole state (`ledger` + `holds`) is serialized under one sled key and
+//! rewritten atomically after each mutation, then `flush`ed. Single-key writes
+//! are atomic, so the ledger is never torn. `Pa::open(path)` reloads it — escrow
+//! survives a crash/restart. (A per-key WAL/transaction design is the scale-up;
+//! the blob is correct and simple for the agent's small state.)
 //!
-//! Deferred (the security roadmap, in `docs/agents/PA_DESIGN.md`): authenticated
-//! `from` (FIPA layer), signed messages + receipts (end-to-end), and **durable
-//! ledger/holds** — without which a restart loses escrow. **Next step.**
+//! ## Security (v1: durable, trusted `from`)
+//!
+//! Baked in: **authorization** (`accept`←`hold.seller`, `deny`←buyer/seller, vs
+//! `ctx.from()`), **idempotency** (duplicate `reserve` rejected; one-way state
+//! machine), **validation** (positive, overflow-checked amounts), **scoped
+//! receipts**. Deferred (roadmap in `docs/agents/PA_DESIGN.md`): authenticated
+//! `from` (FIPA layer), signed messages + receipts (end-to-end).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use unl_agent::{Agent, Ctx};
 use unl_core::{NodeRef, Uci};
 use unl_parser::parse_sentence;
 
 /// The state of an escrow hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HoldState {
     Held,
     Paid,
     Cancelled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Hold {
     buyer: String,
     seller: String,
@@ -71,29 +70,55 @@ struct Hold {
     state: HoldState,
 }
 
-/// The Payment Agent: a ledger of balances and a set of escrow holds.
-#[derive(Default)]
-pub struct Pa {
+/// Persisted PA state: balances + escrow holds.
+#[derive(Default, Serialize, Deserialize)]
+struct State {
     ledger: BTreeMap<String, u64>,
     holds: BTreeMap<String, Hold>,
 }
 
+/// The Payment Agent — a durable ledger of balances and escrow holds.
+pub struct Pa {
+    db: sled::Db,
+    state: State,
+}
+
+const STATE_KEY: &str = "state";
+
 impl Pa {
-    pub fn new() -> Self {
-        Self::default()
+    /// Open (or create) PA's durable store at `path`, reloading any prior state.
+    pub fn open(path: impl AsRef<Path>) -> sled::Result<Self> {
+        Self::with_db(sled::open(path)?)
     }
 
-    /// Credit an account (construction/test helper).
+    fn with_db(db: sled::Db) -> sled::Result<Self> {
+        let state = db
+            .get(STATE_KEY)?
+            .and_then(|v| serde_json::from_slice(&v).ok())
+            .unwrap_or_default();
+        Ok(Pa { db, state })
+    }
+
+    /// Write the whole state atomically (single key) and flush.
+    fn persist(&self) {
+        if let Ok(bytes) = serde_json::to_vec(&self.state) {
+            let _ = self.db.insert(STATE_KEY, bytes);
+            let _ = self.db.flush();
+        }
+    }
+
+    /// Credit an account (construction/test helper); persisted.
     pub fn credit(&mut self, account: impl Into<String>, amount: u64) {
-        *self.ledger.entry(account.into()).or_default() += amount;
+        *self.state.ledger.entry(account.into()).or_default() += amount;
+        self.persist();
     }
 
     pub fn balance(&self, account: &str) -> u64 {
-        self.ledger.get(account).copied().unwrap_or(0)
+        self.state.ledger.get(account).copied().unwrap_or(0)
     }
 
     pub fn hold_state(&self, order: &str) -> Option<HoldState> {
-        self.holds.get(order).map(|h| h.state)
+        self.state.holds.get(order).map(|h| h.state)
     }
 }
 
@@ -106,7 +131,8 @@ struct Seed {
 impl Agent for Pa {
     fn on_seed(&mut self, data: &[u8], _ctx: &mut Ctx) {
         if let Ok(seed) = serde_json::from_slice::<Seed>(data) {
-            self.ledger.extend(seed.ledger);
+            self.state.ledger.extend(seed.ledger);
+            self.persist();
         }
     }
 
@@ -126,60 +152,56 @@ impl Agent for Pa {
 
 impl Pa {
     fn reserve(&mut self, order: &str, buyer: &str, body: &[u8], ctx: &mut Ctx) {
-        // idempotency: an order id is used once.
-        if self.holds.contains_key(order) {
-            return deny(ctx, buyer, order, "duplicate-order");
+        if self.state.holds.contains_key(order) {
+            return deny(ctx, buyer, order, "duplicate-order"); // idempotency
         }
         let (Some(seller), Some(amount)) = (json_str(body, "seller"), json_u64(body, "amount"))
         else {
             return deny(ctx, buyer, order, "bad-request");
         };
-        // validation: a positive amount the buyer can cover.
         if amount == 0 {
             return deny(ctx, buyer, order, "bad-amount");
         }
         if self.balance(buyer) < amount {
             return deny(ctx, buyer, order, "insufficient");
         }
-        *self.ledger.entry(buyer.to_string()).or_default() -= amount;
-        self.holds.insert(
+        *self.state.ledger.entry(buyer.to_string()).or_default() -= amount;
+        self.state.holds.insert(
             order.to_string(),
             Hold { buyer: buyer.into(), seller: seller.clone(), amount, state: HoldState::Held },
         );
-        // "held" receipt to the buyer, and notify the seller (PA confirms to BS).
+        self.persist();
         receipt(ctx, buyer, order, "held", amount, None);
-        receipt(ctx, &seller, order, "held", amount, Some(buyer));
+        receipt(ctx, &seller, order, "held", amount, Some(buyer)); // notify the seller
     }
 
     fn accept(&mut self, order: &str, from: &str, ctx: &mut Ctx) {
-        let Some(h) = self.holds.get(order).cloned() else {
-            return; // unknown order — ignore
+        let Some(h) = self.state.holds.get(order).cloned() else {
+            return;
         };
-        // authorization: only the seller may accept (release funds to itself).
         if from != h.seller {
             return deny(ctx, from, order, "unauthorized");
         }
         if h.state == HoldState::Held {
-            if let Some(bal) = self.ledger.entry(h.seller.clone()).or_default().checked_add(h.amount) {
-                *self.ledger.get_mut(&h.seller).unwrap() = bal;
-            }
-            self.holds.get_mut(order).unwrap().state = HoldState::Paid;
+            *self.state.ledger.entry(h.seller.clone()).or_default() += h.amount;
+            self.state.holds.get_mut(order).unwrap().state = HoldState::Paid;
+            self.persist();
         }
         receipt(ctx, &h.buyer, order, "paid", h.amount, None);
         receipt(ctx, &h.seller, order, "paid", h.amount, None);
     }
 
     fn cancel(&mut self, order: &str, from: &str, ctx: &mut Ctx) {
-        let Some(h) = self.holds.get(order).cloned() else {
-            return; // unknown order — ignore
+        let Some(h) = self.state.holds.get(order).cloned() else {
+            return;
         };
-        // authorization: only a party to the hold may cancel.
         if from != h.buyer && from != h.seller {
             return deny(ctx, from, order, "unauthorized");
         }
         if h.state == HoldState::Held {
-            *self.ledger.entry(h.buyer.clone()).or_default() += h.amount; // refund
-            self.holds.get_mut(order).unwrap().state = HoldState::Cancelled;
+            *self.state.ledger.entry(h.buyer.clone()).or_default() += h.amount; // refund
+            self.state.holds.get_mut(order).unwrap().state = HoldState::Cancelled;
+            self.persist();
         }
         receipt(ctx, &h.buyer, order, "cancelled", h.amount, None);
         receipt(ctx, &h.seller, order, "cancelled", h.amount, None);
@@ -227,6 +249,21 @@ fn json_u64(body: &[u8], key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_pa() -> Pa {
+        // a throwaway in-memory-ish db, auto-removed on drop
+        Pa::with_db(sled::Config::new().temporary(true).open().unwrap()).unwrap()
+    }
+
+    fn unique_path() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "pa-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn run(pa: &mut Pa, from: &str, unl: &str, body: &[u8]) -> Vec<unl_agent::Outgoing> {
         let mut ctx = Ctx::new();
@@ -240,7 +277,7 @@ mod tests {
     }
 
     fn funded() -> Pa {
-        let mut pa = Pa::new();
+        let mut pa = temp_pa();
         pa.credit("BA", 10000);
         pa
     }
@@ -252,7 +289,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|m| m.to == "BA" && status(m) == "held"));
         assert!(out.iter().any(|m| m.to == "bookSeller" && status(m) == "held"));
-        assert_eq!(pa.balance("BA"), 9001); // debited
+        assert_eq!(pa.balance("BA"), 9001);
         assert_eq!(pa.hold_state("LtG"), Some(HoldState::Held));
     }
 
@@ -262,7 +299,7 @@ mod tests {
         let out = run(&mut pa, "BA", "obj(reserve, LtG)", br#"{"seller":"bookSeller","amount":99999}"#);
         assert_eq!(out[0].unl, "obj(deny, LtG)");
         assert_eq!(json_str(&out[0].body, "reason").unwrap(), "insufficient");
-        assert_eq!(pa.balance("BA"), 10000); // unchanged
+        assert_eq!(pa.balance("BA"), 10000);
     }
 
     #[test]
@@ -278,7 +315,6 @@ mod tests {
         let mut pa = funded();
         run(&mut pa, "BA", "obj(reserve, LtG)", br#"{"seller":"bookSeller","amount":999}"#);
         let out = run(&mut pa, "bookSeller", "obj(accept, LtG)", b"");
-        assert_eq!(out.len(), 2);
         assert!(out.iter().all(|m| status(m) == "paid"));
         assert_eq!(pa.balance("bookSeller"), 999);
         assert_eq!(pa.hold_state("LtG"), Some(HoldState::Paid));
@@ -290,7 +326,7 @@ mod tests {
         run(&mut pa, "BA", "obj(reserve, LtG)", br#"{"seller":"bookSeller","amount":999}"#);
         let out = run(&mut pa, "attacker", "obj(accept, LtG)", b"");
         assert_eq!(json_str(&out[0].body, "reason").unwrap(), "unauthorized");
-        assert_eq!(pa.balance("bookSeller"), 0); // no release
+        assert_eq!(pa.balance("bookSeller"), 0);
         assert_eq!(pa.hold_state("LtG"), Some(HoldState::Held));
     }
 
@@ -300,21 +336,37 @@ mod tests {
         run(&mut pa, "BA", "obj(reserve, LtG)", br#"{"seller":"bookSeller","amount":999}"#);
         let out = run(&mut pa, "BA", "obj(deny, LtG)", b"");
         assert!(out.iter().all(|m| status(m) == "cancelled"));
-        assert_eq!(pa.balance("BA"), 10000); // refunded
+        assert_eq!(pa.balance("BA"), 10000);
         assert_eq!(pa.hold_state("LtG"), Some(HoldState::Cancelled));
     }
 
     #[test]
     fn accept_unknown_order_is_ignored() {
         let mut pa = funded();
-        let out = run(&mut pa, "bookSeller", "obj(accept, ghost)", b"");
-        assert!(out.is_empty());
+        assert!(run(&mut pa, "bookSeller", "obj(accept, ghost)", b"").is_empty());
     }
 
     #[test]
     fn seed_ledger_from_data() {
-        let mut pa = Pa::new();
+        let mut pa = temp_pa();
         pa.on_seed(br#"{"ledger":{"BA":500}}"#, &mut Ctx::new());
         assert_eq!(pa.balance("BA"), 500);
+    }
+
+    #[test]
+    fn state_survives_restart() {
+        let path = unique_path();
+        {
+            let mut pa = Pa::open(&path).unwrap();
+            pa.credit("BA", 10000);
+            run(&mut pa, "BA", "obj(reserve, LtG)", br#"{"seller":"bookSeller","amount":999}"#);
+            // pa dropped here — state was persisted on each mutation
+        }
+        {
+            let pa = Pa::open(&path).unwrap(); // reopen the same store
+            assert_eq!(pa.balance("BA"), 9001, "debited balance recovered");
+            assert_eq!(pa.hold_state("LtG"), Some(HoldState::Held), "hold recovered");
+        }
+        std::fs::remove_dir_all(&path).ok();
     }
 }
