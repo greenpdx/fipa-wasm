@@ -113,6 +113,12 @@ impl WasmRuntime {
                 let receiver = String::from_utf8_lossy(&read(&caller, rp, rl)).into_owned();
                 let unl = read(&caller, up, ul);
                 let body = read(&caller, bp, bl);
+                crate::flow!(
+                    "wasm: ← agent emitted send-unl → '{}' (unl={} bytes, body={} bytes)",
+                    receiver,
+                    unl.len(),
+                    body.len()
+                );
                 caller
                     .data_mut()
                     .unl_sends
@@ -237,8 +243,12 @@ impl WasmRuntime {
             .get_typed_func::<(i32, i32, i32, i32), ()>(&mut self.store, "config")
         {
             Ok(f) => f,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                crate::flow!("wasm: no `config` export → skip (agent ignores content)");
+                return Ok(());
+            }
         };
+        crate::flow!("wasm: → config(unl={} bytes, body={} bytes) into agent", unl.len(), body.len());
         let unl_ptr = self.guest_alloc(unl.len())?;
         self.write_bytes(unl_ptr, unl)?;
         let body_ptr = self.guest_alloc(body.len())?;

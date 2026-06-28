@@ -223,19 +223,28 @@ pub fn sanitize_inbound(
     my_name: &str,
     verifier: &dyn ContentVerifier,
 ) -> Result<Option<Inbound>, AclMessage> {
+    crate::flow!("recv: sanitizing message '{}' for agent '{}'", msg.message_id, my_name);
     if verifier.verify(msg).is_err() {
+        crate::flow!("recv:   REJECTED — out of vocabulary → not-understood");
         return Err(crate::content::verify::not_understood(msg, my_name));
     }
     if !is_unl(msg) {
+        crate::flow!("recv:   non-UNL content → raw path");
         return Ok(None);
     }
     let graph = unl_graph(msg).map_err(|_| crate::content::verify::not_understood(msg, my_name))?;
+    let data = message_data(msg);
+    crate::flow!(
+        "recv:   verified ✓, decoded UNL ({} relation(s)) + {} data byte(s) → deliver to agent",
+        graph.relations.len(),
+        data.len()
+    );
     Ok(Some(Inbound {
         performative: msg.performative,
         sender: msg.sender.clone(),
         conversation_id: msg.conversation_id.clone(),
         graph,
-        data: message_data(msg),
+        data,
     }))
 }
 
@@ -278,8 +287,18 @@ pub fn package_outbound(
     body: &[u8],
     registry: &VocabRegistry,
 ) -> Result<AclMessage, Vec<Diagnostic>> {
+    crate::flow!("send: '{}' → '{}' : validating UNL against receiver's vocabulary", sender, receiver);
     if let Some(vocab) = registry.get(receiver) {
-        unl_validator::verify_vocabulary(graph, vocab)?;
+        if let Err(diags) = unl_validator::verify_vocabulary(graph, vocab) {
+            crate::flow!(
+                "send:   receiver '{}' would NOT understand ({} issue(s)) → not transmitted",
+                receiver,
+                diags.len()
+            );
+            return Err(diags);
+        }
+    } else {
+        crate::flow!("send:   receiver '{}' vocabulary unknown → optimistic send", receiver);
     }
     let mut msg = AclMessage {
         message_id: new_id(),
@@ -299,6 +318,7 @@ pub fn package_outbound(
         user_properties: HashMap::new(),
     };
     set_message_content(&mut msg, graph, body);
+    crate::flow!("send:   packaged UNL+DATA message '{}' → transmit", msg.message_id);
     Ok(msg)
 }
 

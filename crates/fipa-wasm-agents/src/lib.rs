@@ -5,6 +5,26 @@
 
 #![doc = include_str!("../README.md")]
 
+// --- flow instrumentation ------------------------------------------------
+// `flow!(...)` prints a step of the UNL message flow, but only when the
+// `flow-trace` feature is on. The args go through `format_args!` either way, so
+// variables used only in `flow!` never warn as unused when the feature is off.
+#[doc(hidden)]
+#[cfg(feature = "flow-trace")]
+pub fn __flow_print(args: std::fmt::Arguments<'_>) {
+    eprintln!("[flow] {args}");
+}
+#[doc(hidden)]
+#[cfg(not(feature = "flow-trace"))]
+#[inline(always)]
+pub fn __flow_print(_args: std::fmt::Arguments<'_>) {}
+
+/// Emit a flow-trace step (no-op unless the `flow-trace` feature is enabled).
+#[macro_export]
+macro_rules! flow {
+    ($($arg:tt)*) => { $crate::__flow_print(format_args!($($arg)*)) };
+}
+
 pub mod actor;
 pub mod behavior;
 pub mod consensus;
