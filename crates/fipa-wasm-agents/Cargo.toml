@@ -87,6 +87,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
+libc = "0.2"
 hex = "0.4"
 colored = "2.1"
 ratatui = "0.29"
@@ -140,6 +141,10 @@ path = "src/bin/ping_pong.rs"
 [[bin]]
 name = "inspect"
 path = "src/bin/inspect.rs"
+
+[[bin]]
+name = "agent-host"
+path = "src/bin/agent_host.rs"
 
 [lib]
 name = "fipa_wasm_agents"

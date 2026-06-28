@@ -36,6 +36,8 @@ pub mod network;
 pub mod observability;
 pub mod persistence;
 pub mod platform;
+#[cfg(unix)]
+pub mod process;
 pub mod proto;
 pub mod protocol;
 pub mod security;
