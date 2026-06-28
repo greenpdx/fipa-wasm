@@ -16,9 +16,9 @@ pub trait AgentRuntime {
     /// Run the agent's `init` entry point.
     fn init(&mut self) -> Result<()>;
 
-    /// Deliver `(unl, body)` to the agent — once at startup to seed it, then per
-    /// inbound message.
-    fn config(&mut self, unl: &[u8], body: &[u8]) -> Result<()>;
+    /// Deliver `(unl, body)` to the agent from sender `from` — once at startup
+    /// to seed it (`from == ""`), then per inbound message.
+    fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()>;
 
     /// Drain the messages the agent emitted (validated + packaged by the node).
     fn take_sends(&mut self) -> Vec<OutboundIntent>;
@@ -39,7 +39,8 @@ impl AgentRuntime for super::WasmRuntime {
         self.call_init()
     }
 
-    fn config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
+    fn config(&mut self, _from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
+        // Wasm sender threading is not wired yet; the guest gets ctx.from() == "".
         self.call_config(unl, body)
     }
 
@@ -100,13 +101,17 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
         self.guarded(|a, ctx| a.on_init(ctx))
     }
 
-    fn config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
+    fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
         // The vocabulary seed (UNL begins with '{') is not a message.
         if unl_agent::is_seed(unl) {
             return Ok(());
         }
         let text = std::str::from_utf8(unl).unwrap_or("").to_string();
-        self.guarded(move |a, ctx| a.on_message(&text, body, ctx))
+        let from = from.to_string();
+        self.guarded(move |a, ctx| {
+            ctx.set_from(&from);
+            a.on_message(&text, body, ctx);
+        })
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
@@ -139,7 +144,7 @@ mod tests {
         // The panic is caught; the node survives and no output leaks.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // silence the panic print
-        let r = rt.config(b"agt(x, y)", b"");
+        let r = rt.config("alice", b"agt(x, y)", b"");
         std::panic::set_hook(prev);
         assert!(r.is_err());
         assert!(rt.take_sends().is_empty());
@@ -152,11 +157,11 @@ mod tests {
         assert!(rt.take_sends().is_empty());
 
         // a seed config is ignored
-        rt.config(b"{\"concepts\":{}}", b"peer").unwrap();
+        rt.config("", b"{\"concepts\":{}}", b"peer").unwrap();
         assert!(rt.take_sends().is_empty());
 
         // a real message is handled
-        rt.config(b"agt(greet, you)", b"hi").unwrap();
+        rt.config("alice", b"agt(greet, you)", b"hi").unwrap();
         let sends = rt.take_sends();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].receiver, "peer");

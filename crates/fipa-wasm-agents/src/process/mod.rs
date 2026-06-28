@@ -58,8 +58,8 @@ pub enum AgentSpec {
 pub enum Frame {
     /// node → host: run the agent's init.
     Init,
-    /// node → host: deliver `(unl, body)`.
-    Config { unl: Vec<u8>, body: Vec<u8> },
+    /// node → host: deliver `(unl, body)` from sender `from`.
+    Config { from: String, unl: Vec<u8>, body: Vec<u8> },
     /// host → node: the agent emitted a message.
     Emit { receiver: String, unl: Vec<u8>, body: Vec<u8> },
     /// host → node: end of the response to the last Init/Config.
@@ -92,8 +92,9 @@ pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let mut buf = Vec::new();
     match frame {
         Frame::Init => buf.push(0x01),
-        Frame::Config { unl, body } => {
+        Frame::Config { from, unl, body } => {
             buf.push(0x02);
+            put(&mut buf, from.as_bytes());
             put(&mut buf, unl);
             put(&mut buf, body);
         }
@@ -126,7 +127,11 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Frame>> {
     let mut p = 1;
     let frame = match tag {
         0x01 => Frame::Init,
-        0x02 => Frame::Config { unl: get(&buf, &mut p)?, body: get(&buf, &mut p)? },
+        0x02 => Frame::Config {
+            from: String::from_utf8_lossy(&get(&buf, &mut p)?).into_owned(),
+            unl: get(&buf, &mut p)?,
+            body: get(&buf, &mut p)?,
+        },
         0x10 => Frame::Emit {
             receiver: String::from_utf8_lossy(&get(&buf, &mut p)?).into_owned(),
             unl: get(&buf, &mut p)?,
@@ -218,8 +223,12 @@ impl AgentRuntime for ProcessRuntime {
         self.round_trip(Frame::Init)
     }
 
-    fn config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
-        self.round_trip(Frame::Config { unl: unl.to_vec(), body: body.to_vec() })
+    fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
+        self.round_trip(Frame::Config {
+            from: from.to_string(),
+            unl: unl.to_vec(),
+            body: body.to_vec(),
+        })
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
@@ -247,8 +256,8 @@ pub fn serve(mut runtime: Box<dyn AgentRuntime>, mut stream: UnixStream) -> Resu
                 runtime.init()?;
                 flush(runtime.as_mut(), &mut stream)?;
             }
-            Frame::Config { unl, body } => {
-                runtime.config(&unl, &body)?;
+            Frame::Config { from, unl, body } => {
+                runtime.config(&from, &unl, &body)?;
                 flush(runtime.as_mut(), &mut stream)?;
             }
             _ => break,
@@ -289,7 +298,7 @@ mod tests {
     fn frame_roundtrip() {
         let frames = [
             Frame::Init,
-            Frame::Config { unl: b"agt(x, y)".to_vec(), body: b"data".to_vec() },
+            Frame::Config { from: "alice".into(), unl: b"agt(x, y)".to_vec(), body: b"data".to_vec() },
             Frame::Emit { receiver: "bob".into(), unl: b"agt(p, q)".to_vec(), body: vec![1, 2, 3] },
             Frame::Done,
         ];

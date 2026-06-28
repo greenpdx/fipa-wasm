@@ -101,16 +101,16 @@ impl ManagedAgent {
         rt.init()?;
         let _ = rt.take_sends();
         if !recipe.seed_unl.is_empty() || !recipe.seed_data.is_empty() {
-            rt.config(&recipe.seed_unl, &recipe.seed_data)?;
+            rt.config("", &recipe.seed_unl, &recipe.seed_data)?; // seed: no sender
             let _ = rt.take_sends();
         }
         Ok(rt)
     }
 
-    /// Deliver a message; on failure, restart (within budget) and surface the
-    /// error so the caller can resend if it wishes.
-    pub fn deliver(&mut self, unl: &[u8], body: &[u8]) -> Result<Vec<OutboundIntent>> {
-        match self.runtime.config(unl, body) {
+    /// Deliver a message from `from`; on failure, restart (within budget) and
+    /// surface the error so the caller can resend if it wishes.
+    pub fn deliver(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<Vec<OutboundIntent>> {
+        match self.runtime.config(from, unl, body) {
             Ok(()) => Ok(self.runtime.take_sends()),
             Err(e) => {
                 self.restart()?;
@@ -148,7 +148,7 @@ mod tests {
         )
         .unwrap();
         rt.init().unwrap();
-        rt.config(b"agt(hi, x)", b"ping").unwrap();
+        rt.config("BA", b"agt(hi, x)", b"ping").unwrap();
         let sends = rt.take_sends();
         assert_eq!(sends[0].receiver, "peer");
         assert_eq!(sends[0].body, b"ping");

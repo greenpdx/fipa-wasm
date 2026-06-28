@@ -44,17 +44,30 @@ pub struct Outgoing {
     pub body: Vec<u8>,
 }
 
-/// The per-call context handed to an agent: it collects outgoing messages. The
-/// host driver drains them after the call, so the agent is oblivious to whether
-/// it runs native or in wasm.
+/// The per-call context handed to an agent: the sender of the current message,
+/// and a sink for outgoing replies. The host driver sets the sender and drains
+/// the replies, so the agent is oblivious to whether it runs native or in wasm.
 #[derive(Default)]
 pub struct Ctx {
+    from: String,
     sends: Vec<Outgoing>,
 }
 
 impl Ctx {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The id of the agent that sent the current message (`""` if unknown, e.g.
+    /// during the seed). Reply with `ctx.send(ctx.from().to_string(), ...)`.
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// Set the current sender — called by the runtime before delivering.
+    pub fn set_from(&mut self, from: &str) {
+        self.from.clear();
+        self.from.push_str(from);
     }
 
     /// Send a message to another agent (by id).

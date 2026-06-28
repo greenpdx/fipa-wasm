@@ -1,6 +1,6 @@
-//! Native agents compiled into the node / agent-host. The infrastructure agents
-//! (DF, AMS, PA) will register here; for now there are two samples used by the
-//! tests. Shared by the in-process factory and the agent-host child.
+//! Native agent registry. Sample agents (echo/boomer) used by the tests live
+//! here; the infrastructure agents (DF, AMS, PA) live in their own crates under
+//! `agents/` and register below once built.
 
 use crate::wasm::{AgentRuntime, NativeRuntime};
 use unl_agent::{Agent, Ctx};

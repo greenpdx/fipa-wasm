@@ -23,7 +23,7 @@ fn native_agent_runs_isolated_in_a_process() {
     .expect("spawn agent-host");
 
     rt.init().unwrap();
-    rt.config(b"agt(hello, x)", b"ping").unwrap();
+    rt.config("BA", b"agt(hello, x)", b"ping").unwrap();
     let sends = rt.take_sends();
     assert_eq!(sends.len(), 1, "echo agent should reply once");
     assert_eq!(sends[0].receiver, "peer");
@@ -31,7 +31,7 @@ fn native_agent_runs_isolated_in_a_process() {
     assert_eq!(sends[0].body, b"ping");
 
     // A second message also round-trips through the process.
-    rt.config(b"agt(again, y)", b"pong").unwrap();
+    rt.config("BA", b"agt(again, y)", b"pong").unwrap();
     let sends = rt.take_sends();
     assert_eq!(sends[0].body, b"pong");
 
@@ -54,14 +54,14 @@ fn hosted_agent_restarts_after_a_crash() {
     let mut agent = ManagedAgent::spawn(recipe).expect("spawn managed agent");
 
     // A normal message echoes.
-    let out = agent.deliver(b"agt(hi, x)", b"a").unwrap();
+    let out = agent.deliver("BA", b"agt(hi, x)", b"a").unwrap();
     assert_eq!(out[0].body, b"a");
 
     // "boom" crashes the child process — deliver fails, but the agent restarts.
-    assert!(agent.deliver(b"boom", b"").is_err());
+    assert!(agent.deliver("BA", b"boom", b"").is_err());
     assert_eq!(agent.restarts(), 1);
 
     // The restarted agent (a fresh process) works again.
-    let out = agent.deliver(b"agt(again, y)", b"b").unwrap();
+    let out = agent.deliver("BA", b"agt(again, y)", b"b").unwrap();
     assert_eq!(out[0].body, b"b");
 }
