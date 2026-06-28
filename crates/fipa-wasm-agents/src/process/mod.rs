@@ -24,9 +24,11 @@ use crate::wasm::{AgentRuntime, OutboundIntent};
 mod agents;
 mod manage;
 mod resolve;
+mod router;
 pub use agents::native_agent;
 pub use manage::{build_runtime, build_wasm, ManagedAgent, Profile, Recipe};
 pub use resolve::{resolve, Resolution};
+pub use router::{Envelope, Router};
 
 /// Resource caps applied by the child before it loads the agent. `0` = leave
 /// the limit unchanged.

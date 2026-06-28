@@ -111,19 +111,25 @@ PA handles money, so identity and durability are first-class.
   atomically (single key) + flushed after each mutation, and reloaded by
   `Pa::open`, so a crash/restart recovers in-flight escrow. Test:
   `state_survives_restart`.
+- *FIPA layer:* **authenticated `from` (intra-node)** — `process::Router` stamps
+  each message with the **emitting agent's own id**; agents can't forge identity,
+  so PA's authorization is real. Test: `spoofed_accept_rejected_genuine_accepted`
+  (a spoofed `accept` releases nothing; the genuine seller's does).
 
 **Deferred (with hooks), by layer:**
-- *FIPA/node:* **authenticate `from`** (signed messages / authenticated channels)
-  — authorization is only meaningful once this exists; transport integrity (TLS)
-  for cross-node; rate-limiting. *(Process isolation + `rlimit` already done.)*
+- *FIPA/node:* **cross-node** authenticated `from` — the intra-node router stamps
+  the sender, but *remote* agents need **signed messages / authenticated
+  channels** between nodes; transport integrity (TLS); rate-limiting; the
+  external-injection trust boundary (gateway authenticates external clients).
+  *(Process isolation + `rlimit` already done.)*
 - *PA agent:* audit log; timeout auto-`deny` of stale holds; `status` query;
   per-key WAL/transactions (the blob is correct for small state).
 - *end-to-end:* **sign** `(order, action, terms)` and PA's **receipts** for
   integrity + non-repudiation, independent of router trust.
 
-**Sharpest risk remaining:** `from` is unauthenticated → spoofed `accept`/`deny`
-(the FIPA-layer foundation the agent's authorization waits on). State durability
-is now handled.
+**Sharpest risk remaining:** **cross-node** identity — within a node the router
+authenticates `from`; messages from *other* nodes still need signing. State
+durability and intra-node authentication are now handled.
 
 ## 7b. Other deferred
 
