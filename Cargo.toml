@@ -20,6 +20,7 @@ members = [
     "crates/unl-agent",
     "agents/greeter",
     "agents/df",
+    "agents/ams",
     "xtask",
 ]
 
