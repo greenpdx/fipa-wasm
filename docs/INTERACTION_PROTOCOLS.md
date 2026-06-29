@@ -2,7 +2,7 @@
 
 **Version:** 0.2.0 (implementation-spec)
 **Last Updated:** 2026-06-29
-**Status:** spec complete; **not yet implemented**. Target crate: `unl-fipa`.
+**Status:** **DESIGN SPEC — NOT YET IMPLEMENTED.** These generic interaction-protocol state machines (request, query, contract-net, iterated-CN, subscribe/publish, English/Dutch/Vickrey auctions) are not built in code; the `unl-fipa` layer does not exist yet. What *is* built and tested is the messaging substrate they would run on: the `(from, unl, body)` envelope, `obj(verb, subject)` UNL, async reply-by-message (`request_id` correlation), over a node-authenticated + Noise-encrypted transport (R1/R2). A single concrete, hard-coded book-buy flow runs on that substrate today (discover via DF/AMS → reserve escrow at PA → buy) using direct request/inform-style messages, **not** the generic CNP/auction/subscribe FSMs below. Those remain future work. Target crate: `unl-fipa`.
 **Parents:** [`PROTOCOLS.md`](./PROTOCOLS.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) · [`MOBILITY.md`](./MOBILITY.md)
 
 Multi-message conversations (request, query, contract-net, iterated contract-net,
@@ -293,14 +293,24 @@ first provider" with competitive selection.
 
 ## 14. Status
 
+**This document is a design spec.** The generic interaction-protocol state machines
+are **not implemented**. Only the messaging substrate beneath them, and one concrete
+hard-coded interaction (book-buy), are built and tested.
+
 | Piece | Status |
 |---|---|
-| `_acl` header + content schemas | ✅ specified |
-| `unl-fipa` runtime (single-slot multiplex) | ✅ specified |
-| request / query / contract-net / iterated-CN | ✅ specified |
-| subscribe (leased) / auctions (eng/dutch/sealed) | ✅ specified |
-| composition, errors, interop mapping | ✅ specified |
-| **code** in `unl-fipa` | ⬜ post-M4 (needs ACL in `body` + scheduling M3 + async correlation M4) |
+| `(from, unl, body)` envelope + `obj(verb, subject)` UNL | ✅ built & tested |
+| async reply-by-message (`request_id` correlation) | ✅ built & tested |
+| node-authenticated + Noise-encrypted transport (R1/R2) | ✅ built & tested |
+| concrete book-buy flow (DF/AMS discover → PA escrow → buy) | ✅ built & tested (direct request/inform, hard-coded) |
+| `_acl` header + content schemas | ⬜ specified only |
+| `unl-fipa` runtime (single-slot multiplex) | ⬜ specified only — crate not built |
+| request / query / contract-net / iterated-CN | ⬜ specified only — generic FSMs not built |
+| subscribe (leased) / auctions (eng/dutch/sealed) | ⬜ specified only — generic FSMs not built |
+| composition, errors, interop mapping | ⬜ specified only |
+| **code** in `unl-fipa` | ⬜ future work (needs ACL in `body` + scheduling M3 + async correlation M4) |
 
-Prereqs: scheduling/`tick` (M3), async correlation (M4). No node changes beyond
-carrying `_acl` transparently in `body` (already supported — it's just JSON).
+The substrate exists; the generic protocol layer does not. Prereqs for building it:
+scheduling/`tick` (M3), async correlation (M4, already exercised by the book-buy flow).
+No node changes beyond carrying `_acl` transparently in `body` (already supported — it's
+just JSON).

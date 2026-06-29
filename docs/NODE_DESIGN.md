@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0 (draft)
 **Last Updated:** 2026-06-29
-**Status:** design-approved, **not yet implemented** — see [§14 Milestones](#14-implementation-milestones).
+**Status:** **largely implemented; see §15.**
 **Parents:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md)
 
 `ARCHITECTURE.md` states *what* the system is; `AGENT_HOST_ABI.md` specifies the
@@ -321,27 +321,35 @@ fipa-wasm-agents/src/
 Sequenced so each step is independently testable and the book-buy keeps passing
 throughout:
 
-| M | Deliverable | Proves |
-|---|---|---|
-| **M1** | Adapter traits + refactor current node onto `Engine=wasmtime`/`Transport=tcp`/`Store=sled`; N-agent mailbox/executor | seams exist; `book-cluster` still green |
-| **M2** | `Manifest` + `Loader` (parse/fit/grant/budget) + `Policy`; gates made explicit | load-time fit; uniform denials |
-| **M3** | `Scheduler` + `time` caps + `tick` | autonomy (timeouts, retries) |
-| **M4** | `async_rt` + `RequestTable`; `discovery` & `state` caps; out-gate scoping | async-reply model end-to-end |
-| **M5** | `LlmBackend` + `LlmRuntime` + `infer`; `crypto` (node-held key, domain-separated) | LLM brain + tool; signing oracle |
-| **M6** | `Supervisor` + `Audit` subsystem; hard fuel/mem metering | containment + forensics |
-| **M7** | IoT profile (wasmi, reduced ABI, local platform, low-power, MQTT) | second shape on one kernel |
-| **M8** | Browser profile (node-as-wasm, OPFS, WS/WebRTC) | third shape; mobility into a page |
+Status legend: **DONE** = on git `main`, tested, `book-cluster` green · **PARTIAL** =
+core built, remainder noted · **PENDING** = not yet built.
+
+| M | Deliverable | Proves | Status |
+|---|---|---|---|
+| **M1** | Adapter traits + refactor current node onto `Engine=wasmtime`/`Transport=tcp`/`Store=sled`; N-agent mailbox/executor | seams exist; `book-cluster` still green | **DONE** |
+| **M2** | `Manifest` + `Loader` (parse/fit/grant/budget) + `Policy`; gates made explicit | load-time fit; uniform denials | **DONE** |
+| **M3** | `Scheduler` + `time` caps + `tick` | autonomy (timeouts, retries) | **DONE** |
+| **M4** | `async_rt` + `RequestTable`; `discovery` & `state` caps; out-gate scoping (+ per-namespace quota) | async-reply model end-to-end | **DONE** — discovery works via direct DF/AMS messaging; typed discovery host-calls not separately built |
+| **M5** | `LlmBackend` + `LlmRuntime` + `infer`; `crypto` (node-held key, domain-separated) | LLM brain + tool; signing oracle | **DONE** — incl. migration (state-snapshot/restore, signed `AgentSnapshot`, single-hop handoff, epoch arbiter, ack-before-tombstone crash-safety, content-addressed `CODE_FETCH`); full two-phase STAGING + multi-hop attestation chain **PARTIAL** |
+| **M6** | `Supervisor` + `Audit` subsystem; hard fuel/mem metering; spawn caps ⊆ parent | containment + forensics | **DONE** |
+| **M7** | IoT profile (wasmi, reduced ABI, local platform, low-power, MQTT) | second shape on one kernel | **PARTIAL** — wasmi interpreter backend + profile-based engine selection in `mount_wasm` **DONE**; constrained transports (MQTT/BLE/LoRa) and low-power scheduling **PENDING** (TCP only) |
+| **M8** | Browser profile (node-as-wasm, OPFS, WS/WebRTC) | third shape; mobility into a page | **PENDING** (separate wasm-bindgen project) |
+| **E1** | `Engine`/`EngineModule` seam + wasmtime backend (`WasmRuntime` through the seam) | engine portability | **DONE** |
+| **E2** | wasmi backend, profile-selected; persistent Noise connections | constrained engine + durable links | **DONE** |
 
 ---
 
 ## 16. Open decisions
 
-1. **Async runtime** — tokio for normal + a cooperative-loop trait for IoT/browser,
-   or a single runtime-agnostic executor from day one? *(lean: tokio for normal,
-   poll-loop trait for constrained.)*
-2. **Wasm effects** — direct gated host imports (out-gate sees each `send`/`infer`
-   inline) vs. the `Ctx`/`take_sends` collect-then-drain model? *(lean: direct
-   imports for wasm, keep `take_sends` for native — both still hit the out-gate.)*
-3. **Manifest format** — JSON `HEAD` now, compact binary as an IoT optimization
-   later? *(lean: JSON now.)*
-4. **First code** — start at **M1** (a pure refactor, no behaviour change).
+1. ~~**Async runtime** — tokio for normal + a cooperative-loop trait for IoT/browser,
+   or a single runtime-agnostic executor from day one?~~ **RESOLVED:** tokio is **not**
+   used for the node loop — it is a single-threaded poll loop + thread-per-connection.
+2. ~~**Wasm effects** — direct gated host imports (out-gate sees each `send`/`infer`
+   inline) vs. the `Ctx`/`take_sends` collect-then-drain model?~~ **RESOLVED:** wasm uses
+   direct gated host imports (`send-unl`) over the five-op `Engine` seam; both still hit
+   the out-gate.
+3. ~~**Manifest format** — JSON `HEAD` now, compact binary as an IoT optimization
+   later?~~ **RESOLVED:** `Manifest` is JSON `HEAD`.
+4. ~~**First code** — start at **M1** (a pure refactor, no behaviour change).~~
+   **RESOLVED:** started at M1; M1–M6 now done.
+5. ~~**Agents per kernel** — one agent or N?~~ **RESOLVED:** the kernel hosts **N** agents.

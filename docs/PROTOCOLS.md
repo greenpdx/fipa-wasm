@@ -2,15 +2,18 @@
 
 **Version:** 0.1.0
 **Last Updated:** 2026-06-29
-**Status:** the verb tables below are **implemented and tested today**; the
-envelope/async/interaction layers marked *planned* are not.
+**Status:** the verb tables below are **implemented and tested today**, and so are
+their security mitigations — the wire transport is now **Noise-encrypted +
+node-authenticated** with authenticated cross-node `from` and directory
+authorization (R1–R7 built, see §12); the envelope ACL/async/interaction layers
+marked *planned* are not.
 **Parents:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) · [`NODE_DESIGN.md`](./NODE_DESIGN.md)
 
-> ⚠️ **Security.** The protocols below are **not safe across untrusted nodes as
-> specified** — `from` is forgeable cross-node and DF/AMS/PA authorize on it. See
-> [§12 Security requirements](#12-security-requirements) and
-> [`THREAT_MODEL.md`](./THREAT_MODEL.md) (kill chain in its §7). R1–R4 block any
-> networked build.
+> ✅ **Security.** The transport is now **Noise-encrypted + node-authenticated
+> (R1/R2/R4)**: every cross-node `from` is signed by the sending node's ed25519 key
+> and verified on receipt, and DF/AMS/PA authorize on that authenticated `from`.
+> R1–R7 are built (see [§12 Security requirements](#12-security-requirements) and
+> [`THREAT_MODEL.md`](./THREAT_MODEL.md)).
 
 Where `AGENT_HOST_ABI.md` specifies the *agent↔host* contract, this document
 specifies the *agent↔agent* and *node↔node* protocols: the message envelope, the UNL
@@ -250,30 +253,36 @@ Not implemented; specified here so the gap is explicit (also tracked in
 | PA escrow (reserve/accept/deny + receipts) | ✅ implemented + tested |
 | BS catalog & fulfilment | ✅ implemented + tested |
 | Book-buy end-to-end | ✅ verified (loopback + Docker over IP) |
+| Authenticated cross-node `from` (signed, R1) | ✅ implemented + tested |
+| Noise XX encrypted + node-authed transport (R2/R4) | ✅ implemented + tested |
+| Directory authorization + quotas (DF/AMS, R3/R5/R6) | ✅ implemented + tested |
+| Fuel/memory metering + supervised serve (R7) | ✅ implemented + tested |
 | ACL envelope (performative, conv-id, reply-by) | ⬜ planned |
 | Async `request_id` correlation | ⬜ planned |
 | `not-understood` / error acts | ⬜ planned |
-| Signed messages & receipts | ⬜ planned |
 | FIPA interaction protocols (contract-net, auction, subscribe) | ⬜ future |
 
 ---
 
 ## 12. Security requirements
 
-These protocols are described **as currently coded**, which is **only safe within a
-single trusted node**. Across untrusted nodes they are exploitable (full analysis +
-kill chain in [`THREAT_MODEL.md`](./THREAT_MODEL.md)). The following are **binding**
-before any networked deployment:
+The transport hardening below is now **built on `main` and tested** (full analysis +
+kill chain in [`THREAT_MODEL.md`](./THREAT_MODEL.md)). R1–R7 — the requirements that
+were binding before any networked deployment — have all **landed**:
 
-| Req | Applies to | Requirement |
-|---|---|---|
-| **R1** | the envelope (§1) | authenticated `from` cross-node (signed by the sending node); reject reserved sender-ids inbound from the wire |
-| **R2** | the wire (§3) | mutual node auth + encryption (Noise/TLS) |
-| **R3** | DF (§4), AMS (§5) | **authorize registration/binding**: DF `offer` requires `offerer == from`; AMS `bind` requires `from == agent` (or owner-signed); rate + quota limited |
-| **R4** | the wire (§3) | hard `MAX_FRAME` cap before allocation; read/accept/connect timeouts; non-blocking serve |
-| **R5** | DF, AMS, PA (§4–7) | quotas + TTL/GC; **PA hold expiry + auto-refund**; bound referral hops; `checked_add` in PA |
+| Req | Applies to | Requirement | Status |
+|---|---|---|---|
+| **R1** | the envelope (§1) | authenticated `from` cross-node — every `NodeMsg` signed by the sending node's ed25519 key over `to/from/from_addr/unl/body/nonce/sender_pub` and verified on receipt; reserved sender-ids rejected inbound from the wire | ✅ built |
+| **R2** | the wire (§3) | mutual node auth + encryption — Noise XX (per-node X25519 key) over persistent connections | ✅ built |
+| **R3** | DF (§4), AMS (§5) | **authorize registration/binding** — DF TOFU from-ownership; AMS `bind` requires `from == agent`; rate + quota limited | ✅ built |
+| **R4** | the wire (§3) | hard `MAX_FRAME` cap before allocation; read/accept/connect timeouts; non-blocking serve | ✅ built |
+| **R5** | DF, AMS, PA (§4–7) | quotas + TTL/GC (DF/AMS caps); **PA hold expiry + auto-refund**; bound referral hops; `checked_add` in PA | ✅ built |
+| **R6** | AMS (§5) | epoch-monotonic bindings | ✅ built |
+| **R7** | the node | fuel/memory metering + thread-per-connection serve + supervisor | ✅ built |
 
-Today's verb tables assume a **trusted `from`** (e.g. PA's authorization, DF
-self-registration). That assumption is valid intra-node and **invalid across nodes**
-until R1–R3 land. The threat model maps each finding (C1–C5, H1–H4, M1–M7) to these
-requirements and to milestones.
+The verb tables' **trusted-`from`** assumption (e.g. PA's authorization, DF
+self-registration) is now enforced **across nodes too**: `from` is
+cryptographically authenticated on the wire (R1) over a Noise-encrypted,
+mutually-authenticated channel (R2/R4), and DF/AMS authorize on it (R3/R6). The
+threat model maps each finding (C1–C5, H1–H4, M1–M7) to these requirements and to
+the milestones they shipped in.

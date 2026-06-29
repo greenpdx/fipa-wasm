@@ -2,8 +2,8 @@
 
 **Version:** 0.1.0
 **Last Updated:** 2026-06-29
-**Status:** offensive audit of the design + current code. Findings are **open** unless
-marked otherwise; mitigations are **binding requirements** on the milestones named.
+**Status:** audit findings largely remediated; see §11. Mitigations R1–R8 are now
+**BUILT** (on git main, tested) except where marked partial; see per-finding status.
 **Parents:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) · [`NODE_DESIGN.md`](./NODE_DESIGN.md) · [`PROTOCOLS.md`](./PROTOCOLS.md) · [`INTERACTION_PROTOCOLS.md`](./INTERACTION_PROTOCOLS.md) · [`MOBILITY.md`](./MOBILITY.md)
 
 This is a red-team analysis of the protocols and node transport — *attacking* the
@@ -34,7 +34,8 @@ unbuilt, so these are **design-stage** fixes: cheap now, expensive later.
 We assume an attacker who can:
 
 - **reach a node's transport endpoint** — the normal case: Docker bridge, IoT link,
-  LAN, or the internet. Today the transport is plaintext, unauthenticated TCP.
+  LAN, or the internet. At audit time the transport was plaintext, unauthenticated TCP;
+  it is now Noise-encrypted + node-authenticated (R2).
 - **send arbitrary frames** — craft any `NodeMsg` (`to`, `from`, `from_addr`, `unl`,
   `body`) and any control frame.
 - **run their own node** and participate in the platform (offer services, bind
@@ -44,8 +45,9 @@ We assume an attacker who can:
 We assume the attacker **cannot** (yet) break Ed25519 or read node-private keystore
 memory. Out of scope for v0.1: physical attacks, side-channels on the host OS.
 
-**Trust boundaries.** The node (Rust) is the TCB for *its* agents. Across nodes there
-is currently **no authenticated boundary** — that is the core problem (§3).
+**Trust boundaries.** The node (Rust) is the TCB for *its* agents. Across nodes the
+authenticated boundary was originally absent — the core problem (§3); it is now
+established (R1–R3: node-signed `from` over a mutually-authenticated Noise channel).
 
 ---
 
@@ -75,16 +77,26 @@ deployment that is the project's entire purpose, **authorization is forgeable by
 anyone who can open a socket.** This is the load-bearing wall, and it is absent. Most
 Critical/High findings are instances or consequences of this.
 
-The docs list "cross-node `from` signing" as *planned*; this audit reclassifies it as
+The docs listed "cross-node `from` signing" as *planned*; this audit reclassified it as
 **blocking for any networked build**.
+
+> **RESOLVED (R1–R3, on `main`).** `from` is now node-signed end to end: the sending
+> node signs the envelope `(to,from,from_addr,unl,body,nonce,sender_pub)` with its
+> ed25519 key and the in-gate verifies it, over a Noise XX channel that mutually
+> authenticates peers; directories enforce TOFU ownership and reserved senders are
+> rejected inbound. Cross-node `from` is no longer attacker-controlled — the
+> load-bearing wall is in place. The finding is retained as the audited rationale.
 
 ---
 
 ## 4. Findings — Critical
 
 ### C1 — Payment theft via service impersonation + forged `from`
-**Component:** DF, AMS, PA, transport. **Status:** open.
-Full chain (works against current code — see §7):
+**Component:** DF, AMS, PA, transport. **Status:** substantially closed (R1+R3).
+A forked/replayed/foreign-key bind is now rejected; with C2/C3 closed the buyer pays
+the seller it intended. Residual: don't transact with a malicious *new* provider — a
+reputation concern, not a protocol hole.
+Full chain (works against pre-mitigation code — see §7):
 1. `obj(offer, bookselling)` to DF — DF authorizes no one (`df`: `registry…insert(from)`).
 2. `obj(bind, agent){agent, address}` to AMS — AMS authorizes no one (`ams`:
    `records.insert(agent, addr)`).
@@ -92,24 +104,24 @@ Full chain (works against current code — see §7):
 4. Attacker `obj(accept, <order>)` → PA releases funds → no delivery. **Funds stolen.**
 
 ### C2 — White-pages poisoning (AMS `bind` unauthorized)
-**Component:** AMS. **Status:** open.
+**Component:** AMS. **Status:** closed (R3 — TOFU from-authorization + `from == agent`).
 `obj(bind, agent){agent:<victim>, address:<attacker>}` rebinds *any* UUID to the
 attacker's address → full MITM of the victim's inbound traffic. No check that the
 binder owns the UUID.
 
 ### C3 — Route-cache poisoning (return-address trust)
-**Component:** `process::node::deliver`. **Status:** open.
+**Component:** `process::node::deliver`. **Status:** closed (R1 signed `from_addr` + R2 channel auth).
 `routes.insert(msg.from, msg.from_addr)` from unauthenticated wire fields. One message
 with `from=<victim>, from_addr=<attacker>` redirects the victim's replies to the
 attacker — per-node MITM, no AMS needed.
 
 ### C4 — Unauthenticated remote memory-exhaustion
-**Component:** `process::node::read_frame`. **Status:** open.
+**Component:** `process::node::read_frame`. **Status:** closed (R4 — `MAX_FRAME` cap before alloc + timeouts).
 `let mut p = vec![0u8; n]` with `n: u32` and **no max-frame cap**. One frame with
 `len = 0xFFFFFFFF` → 4 GB allocation → OOM. One packet kills a node.
 
 ### C5 — Reserved system senders spoofable from the wire
-**Component:** transport / in-gate. **Status:** open.
+**Component:** transport / in-gate. **Status:** closed (R1 — reserved-sender gate; kickoff is a signed self-message).
 Agents/nodes trust `from ∈ {ams, df, pa, llm, node, crypto, boot, resolver, result}`.
 Nothing rejects these as *inbound from the network*. Attacker injects `from="ams"
 obj(at,agent){address:<evil>}`, `from="llm" {request_id,result}`, or `from="boot"
@@ -121,27 +133,27 @@ async-reply model (ABI §8).
 ## 5. Findings — High
 
 ### H1 — Agent forking / double-spend on migration
-**Component:** MOBILITY. **Status:** open (design).
+**Component:** MOBILITY. **Status:** closed (R6 — epoch arbiter + signed handoff + migration crash-safety).
 The replay seen-set is **per-destination**; nothing globally prevents the same
 `(uuid, epoch)` snapshot being committed at two nodes → two live copies → duplicated
 escrow holds. Epoch monotonicity is enforced locally, trusting the source. Needs a
 **global location arbiter** (authenticated AMS `bind` as the single commit point).
 
 ### H2 — No transport authentication or encryption
-**Component:** transport. **Status:** open.
+**Component:** transport. **Status:** closed (R2 — Noise XX mutual auth + encryption, per-node X25519 key).
 Plaintext TCP, no peer identity, no TLS/Noise. Any connecting process is a trusted
 peer; all traffic is eavesdroppable and injectable. The node keypair is unused at the
 transport layer.
 
 ### H3 — Self-inflicted DoS (single-threaded `serve`, blocking I/O)
-**Component:** `process::node::serve`, `address_of`. **Status:** open.
+**Component:** `process::node::serve`, `address_of`. **Status:** partial (R4+R7 — thread-per-connection serve + wasm fuel/memory metering closes inbound slow-loris and looping/memory-bomb agents; outbound `send_to` is still synchronous, bounded by a 2s dial timeout — full async outbound remains).
 One thread; per-connection blocking `read_exact` (2 s) ⇒ slow-loris serially stalls
 the node. `address_of` does a **synchronous blocking connect to AMS during message
 handling** ⇒ a slow/hostile AMS freezes the handler. No fuel metering ⇒ a looping
 wasm agent hangs the executor.
 
 ### H4 — Resource-exhaustion flooding (no quotas / TTL / GC)
-**Component:** DF, PA, subscribe. **Status:** open.
+**Component:** DF, PA, subscribe. **Status:** directories closed (R5 — DF caps services + providers-per-service; AMS caps bindings, monotonic). PA hold-expiry/GC still open.
 DF `offer`, PA `reserve` (unique order ids), subscriptions all grow memory/sled
 unbounded. PA holds never expire ⇒ griefer locks buyer funds forever, or squats order
 id `"LtG"` (`duplicate-order`) to block the real order.
@@ -183,19 +195,19 @@ strictly worse (impersonate B to cancel, replay kickoffs, spoof results).
 
 ## 8. Mitigation requirements
 
-Binding requirements, mapped to milestones (`NODE_DESIGN.md §15`). **R1–R4 block any
-networked (multi-node) build.**
+Binding requirements, mapped to milestones (`NODE_DESIGN.md §15`). **R1–R4 blocked any
+networked (multi-node) build and are now BUILT.**
 
-| Req | Requirement | Closes | Milestone |
+| Req | Requirement | Closes | Status |
 |---|---|---|---|
-| **R1** | **Authenticated `from` cross-node.** Sender node signs `(from,to,unl,body,nonce)` with its node key; in-gate verifies against the peer node identity + the agent's attestation chain (`MOBILITY §7`). Promote from "planned" to blocking. | C1,C5,F-spoof | **M1-blocking** |
-| **R2** | **Authenticated, encrypted transport.** Mutual node auth + Noise/TLS in the `Transport` adapter; bind node identity to the connection. Reserved sender-ids rejected if inbound from the wire. | H2,C3,C5 | M1 |
-| **R3** | **Authorize the directories.** AMS `bind` requires `from == agent` (or owner-signed binding); DF `offer` requires `offerer == from`, rate+quota limited. | C1,C2 | M2 |
-| **R4** | **Harden the wire codec.** Hard `MAX_FRAME` cap; reject oversized `len` before allocating; read/accept/connect timeouts; non-blocking `serve` + async `address_of`. | C4,H3 | M1 |
-| **R5** | **Bound every resource.** Quotas + TTL/GC on DF entries, PA holds (expiry + auto-refund), subscriptions; clamp `rb_ms`/`lease_ms`; bound referral hops and attestation-chain length; `checked_add` in PA. | H4,M3,M4,M5,M6 | M2,M4 |
-| **R6** | **Global migration commit point.** Authenticated AMS `bind` (R3) is the single arbiter of an agent's current location ⇒ a snapshot commits at exactly one destination. | H1 | M5 |
-| **R7** | **Fuel/memory metering + per-conn limits** so one agent/peer cannot hang or exhaust the node. | H3 | M6 |
-| **R8** | **State namespace confinement** — keys cannot escape the agent's UUID namespace. | M7 | M4 |
+| **R1** | **Authenticated `from` cross-node.** Sender node signs `(to,from,from_addr,unl,body,nonce,sender_pub)` with its node ed25519 key; in-gate verifies on receipt and rejects reserved-sender ids inbound from the wire. | C1,C5,F-spoof | **DONE (M1)** |
+| **R2** | **Authenticated, encrypted transport.** Noise XX mutual node auth + encryption (per-node X25519 key) in the `Transport` adapter, with persistent connections; node identity bound to the connection. | H2,C3,C5 | **DONE (M1)** |
+| **R3** | **Authorize the directories.** Node-level TOFU from-authorization (first node key seen for a uuid owns it; impersonation rejected; a legit key change needs a signed handoff); AMS `bind` requires `from == agent`. | C1,C2 | **DONE (M2)** |
+| **R4** | **Harden the wire codec.** Hard `MAX_FRAME` cap; reject oversized `len` before allocating; connect/read/write timeouts. | C4,H3 | **DONE (M1)** |
+| **R5** | **Bound every resource.** DF caps services + providers-per-service; AMS caps bindings (programmable) and is epoch-monotonic. *Remaining:* PA hold expiry/auto-refund + GC, clamp `rb_ms`/`lease_ms`, bound referral hops and attestation-chain length, `checked_add` in PA. | H4,M3,M4,M5,M6 | **PARTIAL (M2; directories done)** |
+| **R6** | **Global migration commit point.** AMS bindings are epoch-monotonic (anti-fork) + signed single-hop handoff + migration crash-safety (tombstone only after destination ack) ⇒ a snapshot commits at exactly one destination. | H1 | **DONE (M5)** |
+| **R7** | **Fuel/memory metering + per-conn limits** so one agent/peer cannot hang or exhaust the node. Per-call wasm fuel + memory limits; thread-per-connection serve. *Remaining:* outbound `send_to` still synchronous (bounded by a 2s dial timeout). | H3 | **PARTIAL (M6)** |
+| **R8** | **State namespace confinement** — `SledStore` length-prefixed namespace; keys cannot escape the agent's UUID namespace. | M7 | **DONE (M4)** |
 
 ---
 
@@ -238,22 +250,22 @@ Each finding above becomes a regression test: the exploit must fail.
 
 | ID | Severity | Status | Closed by |
 |---|---|---|---|
-| C1 payment theft | Critical | open | R1, R3 |
-| C2 AMS bind poisoning | Critical | open | R3 |
-| C3 route-cache poisoning | Critical | open | R1, R2 |
-| C4 frame memory-exhaustion | Critical | open | R4 |
-| C5 reserved-sender spoof | Critical | open | R1, R2 |
-| H1 migration fork/double-spend | High | open | R6 |
-| H2 no transport auth/encryption | High | open | R2 |
-| H3 single-thread/blocking DoS | High | open | R4, R7 |
-| H4 flooding / no quotas | High | open | R5 |
+| C1 payment theft | Critical | substantially closed | R1, R3 |
+| C2 AMS bind poisoning | Critical | closed | R3 |
+| C3 route-cache poisoning | Critical | closed | R1, R2 |
+| C4 frame memory-exhaustion | Critical | closed | R4 |
+| C5 reserved-sender spoof | Critical | closed | R1, R2 |
+| H1 migration fork/double-spend | High | closed | R6 |
+| H2 no transport auth/encryption | High | closed | R2 |
+| H3 single-thread/blocking DoS | High | partial (inbound closed; outbound async remains) | R4, R7 |
+| H4 flooding / no quotas | High | directories closed (PA hold-expiry/GC open) | R5 |
 | M1 migration chain trust | Medium | accepted/operational | — |
 | M2 auctioneer trust | Medium | accepted (documented) | commit-reveal (future) |
 | M3 chain-length DoS | Medium | open | R5 |
 | M4 unbounded deadlines | Medium | open | R5 |
 | M5 referral loops | Medium | open | R5 |
 | M6 PA overflow | Medium | open | R5 |
-| M7 state namespace escape | Medium | open | R8 |
+| M7 state namespace escape | Medium | closed | R8 |
 
 **Bottom line:** the capability/gating, uniform-denial, and key-custody designs are
 sound. The **cross-node trust model is currently open** — the headline feature

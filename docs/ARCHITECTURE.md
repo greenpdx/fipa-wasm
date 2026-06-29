@@ -5,12 +5,14 @@
 **Author:** Shaun Savage (SavageS)
 **Companion spec:** [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) — the detailed agent↔host contract.
 
-> **Reading note.** This document describes the system as it is **actually built**,
-> plus the **agreed design direction** for the agent↔host boundary. What is built
-> versus planned is stated explicitly in [§12 Status](#12-status-built-vs-planned).
+> **Reading note.** This document describes the system as it is **actually built**.
+> The agent↔host boundary, the security gates, the capabilities, scheduling,
+> migration, and the secured cross-node transport are all implemented and tested on
+> `main`; the small remainder that is still designed-only is stated explicitly in
+> [§12 Status](#12-status-built-vs-planned).
 > An earlier draft of this file described a libp2p/Raft/Actix/WASI-P2 platform that
-> was largely never implemented; that vision is preserved, clearly labelled, in
-> [Appendix A](#appendix-a-future-directions-not-built).
+> was never implemented; that vision is preserved, clearly labelled as aspirational,
+> in [Appendix A](#appendix-a-future-directions-not-built).
 
 ---
 
@@ -177,8 +179,9 @@ Every message is a triple:
 - **`from`** — the sender's instance UUID. It is **authenticated**: the node stamps
   it from its own knowledge of the emitter; the agent never sets it. Intra-node,
   the `Router` stamps `from` from the resolved sender (an `OutboundIntent` has no
-  sender field, so it is unforgeable). Cross-node authentication of `from` (signing)
-  is a planned upgrade — see [§12](#12-status-built-vs-planned).
+  sender field, so it is unforgeable). Cross-node, every `NodeMsg` is **signed by
+  the sending node's ed25519 key** and verified on receipt, so a remote `from` is
+  authenticated too (built — see [§12](#12-status-built-vs-planned)).
 - **`unl`** — a UNL graph: the **human/semantic** content (a service name, a
   request, an offer). This is what would "come from people."
 - **`body`** — JSON: **structured machine data** (UUIDs, amounts, addresses).
@@ -254,8 +257,9 @@ Four gates, all node-side:
 3. **Out-gate** — every emitted message and host-call (`OutboundIntent`) is
    validated, network-scoped, and rate-limited before it takes effect.
 4. **Runtime budget** — memory, fuel/CPU, storage quota, timer-slot count, message
-   rate. (Hard CPU/RAM caps for wasm are a planned upgrade; native agents run under
-   `catch_unwind` fault isolation today — see [§12](#12-status-built-vs-planned).)
+   rate. (wasm runs under hard per-call **fuel + memory limits**; native agents run
+   under `catch_unwind` fault isolation, and the supervisor quarantines a faulting
+   agent — all built. See [§12](#12-status-built-vs-planned).)
 
 ### 10.2 Uniform denials, no info leak
 
@@ -280,7 +284,7 @@ which is itself the strongest abuse signal.
 ### 10.4 Sandbox tiers
 
 - **wasm** — memory isolation by construction; resource caps via engine fuel/memory
-  limits (planned to be wired); host access only through granted imports.
+  limits (built); host access only through granted imports.
 - **native** — agent crates set `#![forbid(unsafe_code)]`; every call runs under
   `catch_unwind` so a panic is contained and the agent quarantined, not the node.
   Hard CPU/RAM caps need a thread/process boundary (the remaining native upgrade).
@@ -310,9 +314,9 @@ Three kinds of brain present the **same** lifecycle to the node, through the
 
 | Brain | Runtime | Use | Status |
 |---|---|---|---|
-| **wasm** | `WasmRuntime` | mobile / untrusted / portable agents | built |
+| **wasm** | `WasmRuntime` (wasmtime JIT + wasmi interpreter, per profile) | mobile / untrusted / portable agents | built |
 | **native** | `NativeRuntime<A>` | big, stationary agents (AMS/DF/PA) | built |
-| **llm** | `LlmRuntime` | the node runs the agent's LLM block as its brain | planned |
+| **llm** | `LlmRuntime` / the `llm` capability | the node runs the agent's LLM block as its brain | built (as the `llm` capability) |
 
 `LlmRuntime` maps `config(from,unl,body)` → a `Prompt` built from (UNL system frame
 + STATE + inbound) → `unl_llm::ReasoningBackend::complete` → parsed into
@@ -323,36 +327,76 @@ the node runs," reusing `unl-llm` wholesale.
 
 ## 12. Status: built vs planned
 
+All of the following is on `main`, tested, with the 5-node `book-cluster`
+verifying `obj(bought, LtG)` end-to-end.
+
 **Built and verified today:**
 
-- `unl-agent`: the `Agent` trait (`on_init`/`on_seed`/`on_message`) + `Ctx`, and the
-  wasm ABI (`init`/`run`/`config`/`deliver`/`alloc` exports, `send-unl` import).
-- `AgentRuntime` seam with `WasmRuntime` and `NativeRuntime` (fault-isolated).
-- Identity: `AgentId` (mint at spawn / persist for infra), `Aliases`.
-- Authenticated `from` **intra-node** via the `Router`.
-- Cross-node transport over TCP/IP (`process::node`): return-address caching,
-  bootstrap routes, synchronous `RESOLVE` to the AMS node, startup registration.
-- Platform agents: AMS, DF, PA (durable sled ledger), plus BS (seller) and a real
-  **wasm** Buyer (BA).
-- The full book-buy across 5 nodes, verified on loopback (`book-cluster`) and in
-  Docker over container IPs (`obj(bought, LtG)`).
-- UNL stack: `unl-core`, `unl-parser`, `unl-validator`, `unl-kb`, `unl-llm`,
+- **Core seam & agents.** `unl-agent`: the `Agent` trait
+  (`on_init`/`on_seed`/`on_message`/`on_tick`) + `Ctx`, and the wasm ABI
+  (`init`/`run`/`config`/`deliver`/`alloc` exports, `send-unl` import). The
+  `AgentRuntime`/Engine/Transport/StateStore/Clock/Crypto **adapter seams** (M1).
+  The **N-agent executor** — one node hosts many agents on an in-process work
+  queue — plus `SledStore`. Identity: `AgentId` (mint at spawn / persist for
+  infra), `Aliases`.
+- **The (from, unl, body) envelope**, `obj(verb, subject)` UNL, the DF/AMS/PA/BS
+  verbs, and the full book-buy flow — verified on loopback (`book-cluster`) and in
+  Docker over container IPs.
+- **Secured cross-node transport.** R1: authenticated `from` — every `NodeMsg` is
+  signed by the sending node's ed25519 key over `to`/`from`/`from_addr`/`unl`/
+  `body`/`nonce`/`sender_pub` and verified on receipt; reserved-sender ids
+  (`ams`/`df`/`pa`/`llm`/`boot`/…) are rejected inbound from the wire. R2: **Noise
+  XX** encrypted, mutually-authenticated transport (per-node X25519 static key)
+  over persistent per-peer connections. R4: wire hardening (`MAX_FRAME` cap before
+  alloc; connect/read/write timeouts). Plus the original TCP routing
+  (`process::node`): return-address caching, bootstrap routes, `RESOLVE` to the AMS
+  node, startup registration.
+- **Directory security.** R3: node-level **TOFU from-authorization** (first node
+  key seen for a uuid owns it; impersonation rejected; a legitimate key change
+  requires a signed handoff); AMS bind requires `from == agent`. R5: directory
+  **quotas** (DF services/providers caps, AMS bindings cap — programmable). R6:
+  **anti-fork** (AMS bindings epoch-monotonic; global location arbiter). R7:
+  **metering** (per-call wasm fuel + memory limits; thread-per-connection serve;
+  supervisor quarantines faulting agents).
+- **Manifest & profiles (M2).** Manifest (HEAD) + `Capability`/`Profile`/`Brain`/
+  `Budget`; `NodeProfile` (normal / iot) + **load-time fit**; the capability gate.
+- **Scheduling (M3).** `Ctx::set_timer`/`cancel` + `Agent::on_tick`; gated timer
+  slots.
+- **Capabilities.** M4: **state** (namespace-confined `SledStore` handle + byte
+  quota; R8 keys cannot escape the namespace); out-gate **net-scope**
+  (`net="none"` sandboxes to local); the **async request-table**. M5: **crypto**
+  (`sign`/`verify`/`random`, node-held key, domain-separated, confused-deputy
+  defence) and **llm** (`infer` → off-thread `LlmBackend` → reply-by-message from
+  `"llm"` by request_id). M6: **spawn** (child wasm, caps ⊆ parent),
+  **supervisor** (fault quarantine), **audit** (`AuditSink`; log-rich node-side,
+  uniform-deny agent-side).
+- **Three brains, one seam.** `NativeRuntime` + `WasmRuntime` built; the Engine
+  seam carries **two wasm backends** — wasmtime (JIT) and wasmi (IoT interpreter) —
+  selected by node profile in `mount_wasm`. `LlmRuntime` is realized as the **llm
+  capability** (the node runs the model).
+- **Migration** (wasm only; native agents are stationary, host-instantiated
+  templates): state-based snapshot/restore; signed `AgentSnapshot`; single-hop key
+  handoff updating the AMS-node TOFU; epoch arbiter; crash-safety (tombstone only
+  after destination ack); `CODE_FETCH` (content-addressed wasm by SHA-256,
+  fetch-on-miss).
+- **Platform agents:** AMS, DF, PA (durable sled ledger), plus BS (seller) and a
+  real **wasm** Buyer (BA).
+- **UNL stack:** `unl-core`, `unl-parser`, `unl-validator`, `unl-kb`, `unl-llm`,
   `unl-fipa`, `unl-a2a`.
 
-**Designed (this architecture) but not yet built:**
+**Designed but not yet built:**
 
-- The full **manifest** (HEAD beyond type/desc/name) and **load-time gating**.
-- **Profiles** (IoT vs normal) and the IoT node shape.
-- **Scheduling**: timer slots + `tick(timer_id, now_ms)`.
-- Host interfaces for wasm agents: **state, time, llm, crypto, spawn**, and
-  discovery as **typed async host-calls** (today agents message AMS/DF directly).
-- The **async upcall / reply-by-message** model.
-- **LlmRuntime**.
-- Hard **resource metering** (wasm fuel/memory caps; native thread/process caps).
-- Cross-node **signing** (bundle `SIG`, node keypair attestation, authenticated
-  `from` across nodes).
-- The **audit logging** channel (P6) as a first-class subsystem.
-- The **browser node**.
+- The **browser node** — node-as-wasm via `wasm-bindgen` (a separate project).
+- **FIPA interaction protocols** in `unl-fipa` (request / query / contract-net /
+  auctions / subscribe) — designed only.
+- The **FIPA ACL envelope** (performative / conversation-id / reply-by) — not coded;
+  discovery works today via direct DF/AMS messaging.
+- The **full two-phase migration STAGING** (only the single-round-trip confirmed
+  migration is built) and the **multi-hop attestation chain** (only single-hop
+  handoff is built).
+- **Per-time rate limiting** and the **AMS referral-loop bound**.
+- The libp2p / Raft / Actix / WASI-P2 platform of [Appendix A](#appendix-a-future-directions-not-built)
+  — still aspirational.
 
 ---
 

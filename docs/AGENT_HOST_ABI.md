@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0 (draft spec)
 **Last Updated:** 2026-06-29
-**Status:** design-approved, largely **not yet implemented** — see [§13](#13-mapping-to-code-reuse-vs-new).
+**Status:** the capability ABI + gating + Engine seam are **implemented and tested** — see [§13](#13-mapping-to-code-reuse-vs-new).
 **Parent:** [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 
 This document specifies the contract between an **agent** (a small, untrusted bundle
@@ -46,20 +46,21 @@ security is enforced.
 - Everything the agent receives passes the **in-gate**; everything it emits passes
   the **out-gate**. There is no other channel.
 
-**Cross-node trust (binding — see [`THREAT_MODEL.md`](./THREAT_MODEL.md)).** The
-in-gate's authentication of `from` holds only *intra-node* today; cross-node `from` is
-forgeable, which defeats every authorization decision. The following are **binding
-requirements that block any networked (multi-node) build**, not optional hardening:
-- **R1** — authenticated `from` cross-node (sender node signs `(from,to,unl,body,nonce)`;
-  the in-gate verifies against the peer node identity + the agent's attestation chain,
-  `MOBILITY §7`). Reserved sender-ids (`ams`/`df`/`pa`/`llm`/`node`/`crypto`/`boot`/
-  `resolver`/`result`) are **rejected if inbound from the wire**.
-- **R2** — authenticated, encrypted transport (mutual node auth + Noise/TLS in the
-  `Transport` adapter).
-- **R4** — wire-codec hardening (hard `MAX_FRAME` cap before allocation; read/accept/
-  connect timeouts; non-blocking serve).
-- **R7/R8** — fuel/memory metering; agent state keys confined to the agent's UUID
-  namespace (no `"../"` escape).
+**Cross-node trust (see [`THREAT_MODEL.md`](./THREAT_MODEL.md)).** The in-gate now
+authenticates `from` **cross-node**, so a remote `from` is no longer forgeable. The
+following requirements are **BUILT**:
+- **R1 — BUILT.** Authenticated `from` cross-node: the sender node signs the envelope
+  `(from,to,unl,body,nonce)` and the in-gate verifies it against the peer node identity
+  (`MOBILITY §7`). Reserved sender-ids (`ams`/`df`/`pa`/`llm`/`node`/`crypto`/`boot`/
+  `resolver`/`result`) are **rejected if inbound from the wire**. Each instance is
+  bound to a spawn-minted instance UUID (AID).
+- **R2 — BUILT.** Authenticated, encrypted transport: mutual node auth + Noise in the
+  `Transport` adapter, with TOFU peer-key pinning (R3).
+- **R4 — BUILT.** Wire-codec hardening: hard `MAX_FRAME` cap before allocation;
+  read/accept/connect timeouts; thread-per-connection serve (a slow peer can't stall
+  the loop).
+- **R7/R8 — BUILT.** Fuel/memory metering; agent state keys confined to the agent's
+  UUID namespace (no `"../"` escape).
 The full catalogue, severities, and the worked kill chain are in `THREAT_MODEL.md`.
 
 ---
@@ -391,43 +392,67 @@ node can implement it.
 
 ## 13. Mapping to code (reuse vs new)
 
-**Reuse (already in tree):**
+**Reuse (already in tree, BUILT on):**
 
 - `unl_agent::Agent` / `Ctx` / `Outgoing` and the `export_agent!` ABI
-  (`init`/`run`/`config`/`deliver`/`alloc`, `send-unl` import).
+  (`init`/`run`/`config`/`deliver`/`alloc`, `send-unl` import). ✓
 - `wasm::AgentRuntime` seam (`init`/`config`/`take_sends`/`run`/`shutdown`),
-  `WasmRuntime`, `NativeRuntime` (fault isolation).
-- `wasm::host::OutboundIntent` — the out-gate's unit.
-- `identity::Header` — extended into the manifest.
-- `unl_llm::ReasoningBackend` / `Prompt` — the engine `LlmRuntime` drives.
+  `WasmRuntime`, `NativeRuntime` (fault isolation). ✓
+- `wasm::host::OutboundIntent` — the out-gate's unit. ✓
+- `identity::Header` — extended into the manifest. ✓
+- `unl_llm::ReasoningBackend` / `Prompt` — the engine `LlmRuntime` drives. ✓
 
-**New (to build, in plan order):**
+**Status — BUILT (on `main`, tested; the 5-node book-cluster verifies `obj(bought, LtG)`):**
 
-1. Manifest schema + `SIG` + the **load sequence** (§4) and **load-time fit** (§5/§10).
-2. Profiles (`normal`/`iot`) and budget provisioning.
-3. **Scheduling**: `time` upcalls + slot budget + `tick` downcall (§9).
-4. The **out-gate** as an explicit stage (scope/rate/size on every `OutboundIntent`).
-5. The **async model** (§8): `request_id` issuance + reply-by-`deliver` for
-   `discovery`/`llm`/`crypto.verify`/`spawn`.
-6. Upcall interfaces: `state`, `llm`, `crypto`, `spawn`, and discovery as typed
-   host-calls.
-7. `LlmRuntime`.
-8. Hard resource metering (wasm fuel/memory; native thread/process boundary).
-9. The **audit logging** subsystem (§11).
+1. ✅ Manifest/HEAD (`Capability`/`Profile`/`Brain`/`Budget`) + `SIG` + the **load
+   sequence** (§4), **load-time profile-fit** and the capability gate (§5/§10).
+2. ✅ Profiles (`normal`/`iot`) and budget provisioning.
+3. ✅ **Scheduling**: `time` upcalls (`Ctx::set_timer`/`cancel`) + slot budget +
+   `on_tick` downcall (§9).
+4. ✅ The **out-gate** as an explicit stage: `send-unl` routes via host import to the
+   node out-gate (scope/rate/size on every `OutboundIntent`).
+5. ✅ The **async model** (§8): `request_id` issuance + reply-by-message (`deliver`)
+   for `llm`/`crypto.verify`/`spawn`.
+6. ✅ Upcall interfaces: `state` (`Ctx::state_get`/`put`/`del` → namespace-confined
+   `SledStore` handle + byte quota), `llm` (`Ctx::infer` → off-thread `LlmBackend`,
+   async reply from `"llm"` by `request_id`), `crypto` (`Ctx::sign`/`verify`/`random`,
+   node-held key, domain-separated), `spawn` (child wasm, caps ⊆ parent).
+7. ✅ `LlmRuntime` (`llm`-brained agents) + `LlmBackend` capability path.
+8. ✅ Hard resource metering: the wasm execution seam is the `Engine`/`EngineModule`
+   five-op interface (`refuel`/`call_void`/`call_i32`/`call_io`/`call_packed`) with
+   **two backends** (wasmtime + wasmi/IoT), profile-selected; native fault boundary.
+9. ✅ The **audit logging** subsystem (§11): log-rich node-side / thin-to-agent via
+   `AuditSink`.
+
+**Still NOT built (planned):**
+
+- **Typed discovery host-calls** — discovery today works via direct DF/AMS
+  *messaging*, not a separate discovery host-call surface (item 6 above intentionally
+  omits it).
+- **ACL envelope** — performative / conversation-id / reply-by fields.
+- The **FIPA interaction protocols** (separate doc).
+- A **browser** engine backend.
+- **Full two-phase migration staging.**
 
 ---
 
 ## 14. Open items
 
-- **Sync upcall return convention** — out-param region vs. status word (§12) — fix
-  at implementation.
-- **`spawn` lineage** — exact rule for "child caps ⊆ parent" and quota inheritance.
+Resolved (now BUILT):
+
+- ~~**Sync upcall return convention**~~ — fixed by the `Engine`/`EngineModule` seam:
+  sync results cross via `call_io`/`call_packed` (§12, §13).
+- ~~**`spawn` lineage**~~ — `spawn` enforces "child caps ⊆ parent"; quota inheritance
+  is in place.
+- ~~**Cross-node `from` signing**~~ — the sender node signs the envelope and the
+  in-gate authenticates a remote `from` (R1 + Noise transport R2 + TOFU R3); §1.
+
+Still open:
+
 - **`net` scope grammar** — the precise syntax for `HEAD.budget.net`.
-- **Cross-node `from` signing** — how `crypto.sign` over an outbound message lets a
-  *remote* node authenticate `from` (today only intra-node, via the `Router`).
 - **Key custody on migration** — node-held keys do not travel with a mobile agent; a
-  destination node needs a key-handoff, or per-node ephemeral keys plus attestation
-  (related to cross-node `from` signing, above).
+  destination node needs a key-handoff, or per-node ephemeral keys plus attestation.
+  Tied to full two-phase migration staging (not yet built).
 - **State migration** — whether `STATE` travels with a mobile agent and how it is
   re-bound on the destination node (ties to the migration roadmap in
   `ARCHITECTURE.md` Appendix A).

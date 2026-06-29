@@ -2,8 +2,12 @@
 
 **Version:** 0.2.0 (implementation-spec)
 **Last Updated:** 2026-06-29
-**Status:** spec complete; **not yet implemented**. Needs the keystore, `SIG`, and the
-`Transport`/`StateStore` adapters.
+**Status:** **implemented for wasm agents** — snapshot/restore, signed `AgentSnapshot`,
+single-hop signed handoff, AMS epoch arbiter, crash-safety (ack-then-tombstone), and
+content-addressed `CODE_FETCH` are built on `main` over a Noise-encrypted transport with
+the node keystore. **Remaining (planned):** full two-phase STAGING (separate
+PREPARE/PREPARED before COMMIT/COMMITTED), the multi-hop attestation chain + compaction
+(only single-hop handoff is built), `SIG` wire-field naming, and browser-side migration.
 **Parents:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) · [`NODE_DESIGN.md`](./NODE_DESIGN.md) · [`INTERACTION_PROTOCOLS.md`](./INTERACTION_PROTOCOLS.md)
 
 **Weak, state-based** mobility: agents migrate at message boundaries (no raw
@@ -18,14 +22,14 @@ protection. Every open question from v0.1 is resolved in §1.
 
 | # | Question | Resolution |
 |---|---|---|
-| 1 | Key handoff / attestation | **owner delegation cert + per-hop handoff chain**, each link Ed25519-signed; verifier walks owner→node₀→…→node_k (§7). |
-| 2 | Transactionality | **two-phase move** (PREPARE/PREPARED/COMMIT/COMMITTED/ABORT) + epoch ⇒ exactly-once at a message boundary; crash cases enumerated (§6). |
-| 3 | Snapshot + code transfer | `AgentSnapshot` is JSON (CBOR on IoT); WASM is **content-addressed** (`wasm_hash`) and **fetched on miss** via a `CODE_FETCH` frame, not shipped inline (§4–5). |
-| 4 | Conversation/timer capture | `unl-fipa` exposes `export()/import()` of `ConversationSnapshot`s; timers captured as **remaining-ms** (§4, §8). |
-| 5 | Replay protection | destination keeps a persisted, TTL-bounded **seen-set** of `(uuid, epoch)`; epoch strictly increases (§9). |
+| 1 | Key handoff / attestation | **owner delegation cert + per-hop handoff chain**, each link Ed25519-signed; verifier walks owner→node₀→…→node_k (§7). **DONE (single-hop):** signed `Handoff` updates the destination/AMS-node TOFU key. *Multi-hop chain + compaction: planned.* |
+| 2 | Transactionality | **two-phase move** (PREPARE/PREPARED/COMMIT/COMMITTED/ABORT) + epoch ⇒ exactly-once at a message boundary; crash cases enumerated (§6). **DONE (crash-safety):** single-round-trip confirmed migration — source tombstones only after `KIND_MIGRATE_ACK`. *Full two-phase STAGING (separate PREPARE/PREPARED before COMMIT): planned.* |
+| 3 | Snapshot + code transfer | `AgentSnapshot` is JSON (CBOR on IoT); WASM is **content-addressed** (`wasm_hash`) and **fetched on miss** via a `CODE_FETCH` frame, not shipped inline (§4–5). **DONE:** content-addressed wasm by SHA-256, fetched on miss. |
+| 4 | Conversation/timer capture | `unl-fipa` exposes `export()/import()` of `ConversationSnapshot`s; timers captured as **remaining-ms** (§4, §8). **DONE:** guest snapshot/restore via `export_agent!`. |
+| 5 | Replay protection | destination keeps a persisted, TTL-bounded **seen-set** of `(uuid, epoch)`; epoch strictly increases (§9). **DONE:** AMS epoch arbiter (epoch-monotonic bind = anti-fork). |
 | 6 | Clock skew | timers are **relative remaining-ms**, re-anchored to the destination clock; cert windows use a **±skew tolerance** (§8, §7). |
-| 7 | Native agents | **native (big static) agents do not migrate** — only wasm/llm-brained agents do (§3). |
-| 8 | State store move | `StateStore::export(ns)/import(ns,bytes)`; state is already UUID-namespaced (§4). |
+| 7 | Native agents | **native (big static) agents do not migrate** — only wasm/llm-brained agents do (§3). **DONE:** native/Rust agents are stationary, host-instantiated from templates; only wasm agents are mobile. |
+| 8 | State store move | `StateStore::export(ns)/import(ns,bytes)`; state is already UUID-namespaced (§4). **DONE:** state-based snapshot/restore moves the namespaced durable state. |
 
 ---
 
@@ -216,11 +220,18 @@ increase, preventing a rollback to an older node.
 ## 10. Security invariants
 
 1. Mobility is a **heavy, gated, default-denied** capability (ABI §7); denied on IoT.
+   *Enforced: only wasm agents are mobile; native agents are stationary.*
 2. Snapshots are **signed** by the origin node and verified before a byte is trusted.
+   *Enforced in code: `AgentSnapshot` carries an origin-node Ed25519 signature over
+   `uuid/epoch/code_hash/state/nonce/origin_pub`; verified before mount. MIGRATE runs
+   over a Noise-encrypted transport keyed from the node keystore.*
 3. A migrated agent gets **no elevated trust** — profile-fit + grant-intersection run
    again at the destination, identically to a fresh mount.
 4. Code is **hash-verified** on fetch (§5); chain + epoch give origin authenticity and
-   replay resistance.
+   replay resistance. *Enforced in code: `CODE_FETCH` is content-addressed and the
+   fetched bytes are SHA-256-verified; the AMS epoch arbiter gives epoch-monotonic
+   (anti-fork) binding. Single-hop signed handoff is enforced; the multi-hop chain is
+   still planned.*
 5. Every migration is **audit-logged** node-side (origin, dest, epoch, snapshot hash).
 
 ---
@@ -246,11 +257,19 @@ state-based mobility at message boundaries: engine-portable and far safer.
 
 ## 12. Status
 
+**Implemented for wasm agents** (snapshot/handoff/epoch/crash-safety/CODE_FETCH);
+full two-phase staging + multi-hop chain compaction remain.
+
 | Piece | Status |
 |---|---|
-| `AgentSnapshot` + state/conversation export | ✅ specified |
-| content-addressed code transfer | ✅ specified |
-| two-phase move + crash cases + epoch exactly-once | ✅ specified |
-| attestation chain (delegation + handoff) | ✅ specified |
-| replay protection, clock-skew handling | ✅ specified |
-| **code** | ⬜ post-M5 (needs keystore/SIG M5, Transport M1, StateStore export/import; browser dest M8) |
+| `AgentSnapshot` + state/conversation export (`export_agent!`) | ✅ built |
+| signed `AgentSnapshot` (origin-node Ed25519 sig) | ✅ built |
+| content-addressed code transfer (`CODE_FETCH`, SHA-256-verified) | ✅ built |
+| crash-safety (ack-then-tombstone via `KIND_MIGRATE_ACK`) | ✅ built |
+| epoch arbiter (AMS epoch-monotonic bind = anti-fork) | ✅ built |
+| single-hop signed handoff (TOFU key update) | ✅ built |
+| node keystore + Noise-encrypted MIGRATE transport | ✅ built |
+| full two-phase STAGING (PREPARE/PREPARED before COMMIT/COMMITTED + abort) | ⬜ planned |
+| multi-hop attestation chain (delegation + handoff) + compaction | ⬜ planned |
+| `SIG` wire-field naming | ⬜ planned |
+| browser-side migration | ⬜ planned |
