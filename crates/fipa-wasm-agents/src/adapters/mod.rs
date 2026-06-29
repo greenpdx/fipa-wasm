@@ -9,8 +9,10 @@
 
 pub mod crypto;
 pub mod noise;
+pub mod store;
 pub use crypto::{verify, NodeCrypto};
 pub use noise::{NodeNoise, NoiseSession};
+pub use store::SledStore;
 
 use anyhow::Result;
 

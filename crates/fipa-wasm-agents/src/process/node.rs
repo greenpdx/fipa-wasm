@@ -141,13 +141,24 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
 
 // ── the node ────────────────────────────────────────────────────────────
 
-/// A node: one agent, a TCP address, a routing table, and a signing key.
+/// One mounted agent: its identity, friendly alias, runtime, and offered service.
+struct Mounted {
+    uuid: String,
+    alias: String,
+    runtime: Box<dyn AgentRuntime + Send>,
+    service: Option<String>,
+}
+
+/// A node: one **or more** local agents, a TCP address, a routing table, and the
+/// node's signing + Noise identities. Co-located agents exchange messages through
+/// an in-process work queue (the executor); only cross-node hops touch the wire.
 pub struct Node {
-    me: String,                          // this agent's UUID
-    alias: String,                       // friendly name (also an accepted `to`)
     addr: String,                        // my bind address (return address)
-    agent: Box<dyn AgentRuntime + Send>, // the one hosted agent
-    routes: HashMap<String, String>,     // id/alias -> address (bootstrap + learned)
+    label: String,                       // node label for logs (the primary alias)
+    primary: String,                     // first-mounted agent uuid (kick/inject target)
+    agents: HashMap<String, Mounted>,    // uuid -> mounted agent
+    aliases: HashMap<String, String>,    // local alias -> uuid
+    routes: HashMap<String, String>,     // remote id/alias -> address (bootstrap + learned)
     ams_addr: Option<String>,            // where to RESOLVE unknown UUIDs
     sink: Option<Sender<NodeMsg>>,       // undeliverable (e.g. "result")
     key: NodeCrypto,                     // this node's Ed25519 identity (signs/verifies)
@@ -158,11 +169,12 @@ pub struct Node {
 
 impl Node {
     pub fn new(uuid: &str, alias: &str, addr: &str, agent: Box<dyn AgentRuntime + Send>) -> Self {
-        Node {
-            me: uuid.into(),
-            alias: alias.into(),
+        let mut node = Node {
             addr: addr.into(),
-            agent,
+            label: alias.into(),
+            primary: uuid.into(),
+            agents: HashMap::new(),
+            aliases: HashMap::new(),
             routes: HashMap::new(),
             ams_addr: None,
             sink: None,
@@ -170,7 +182,31 @@ impl Node {
             keys: HashMap::new(),
             noise: NodeNoise::generate(),
             kick_rx: None,
-        }
+        };
+        node.mount(uuid, alias, agent, None);
+        node
+    }
+
+    /// Mount an additional agent (a multi-agent / "platform" node). The agent from
+    /// [`Node::new`] is the `primary`; `mount` co-locates more. Co-located agents
+    /// then message each other in-process, never over the wire.
+    pub fn mount(
+        &mut self,
+        uuid: &str,
+        alias: &str,
+        agent: Box<dyn AgentRuntime + Send>,
+        service: Option<&str>,
+    ) {
+        self.aliases.insert(alias.into(), uuid.into());
+        self.agents.insert(
+            uuid.into(),
+            Mounted {
+                uuid: uuid.into(),
+                alias: alias.into(),
+                runtime: agent,
+                service: service.map(Into::into),
+            },
+        );
     }
 
     /// Use a persisted node key at `path` (mint+persist on first run) instead of an
@@ -209,16 +245,26 @@ impl Node {
         self.sink = Some(tx);
     }
 
-    /// Register with the platform: `bind` my UUID→address with AMS, and `offer`
-    /// a service to DF if I provide one.
+    /// Register with the platform: `bind` each local agent's UUID→address with AMS,
+    /// and `offer` each agent's service to DF. For back-compat, `service` overrides
+    /// the **primary** agent's service (single-agent nodes set it here).
     pub fn register(&mut self, service: Option<&str>) {
-        if self.routes.contains_key("ams") {
-            let body = serde_json::json!({ "agent": self.me, "address": self.addr }).to_string();
-            self.emit("ams", b"obj(bind, agent)", body.as_bytes());
-        }
         if let Some(svc) = service {
-            if self.routes.contains_key("df") {
-                self.emit("df", format!("obj(offer, {svc})").as_bytes(), b"");
+            let primary = self.primary.clone();
+            if let Some(m) = self.agents.get_mut(&primary) {
+                m.service = Some(svc.into());
+            }
+        }
+        let mounts: Vec<(String, Option<String>)> =
+            self.agents.values().map(|m| (m.uuid.clone(), m.service.clone())).collect();
+        let (have_ams, have_df) = (self.routes.contains_key("ams"), self.routes.contains_key("df"));
+        for (uuid, svc) in mounts {
+            if have_ams {
+                let body = serde_json::json!({ "agent": uuid, "address": self.addr }).to_string();
+                self.send_as(&uuid, "ams", b"obj(bind, agent)", body.as_bytes());
+            }
+            if let (Some(svc), true) = (svc, have_df) {
+                self.send_as(&uuid, "df", format!("obj(offer, {svc})").as_bytes(), b"");
             }
         }
     }
@@ -231,15 +277,11 @@ impl Node {
         m.sig = self.key.sign(&signing_bytes(m)).to_vec();
     }
 
-    /// Inject a *local* message (trusted, in-process) — bypasses the wire gate.
+    /// Inject a *local* kickoff to the primary agent (trusted, in-process) —
+    /// bypasses the wire gate and runs the executor to completion.
     pub fn inject(&mut self, unl: &[u8], body: &[u8]) {
-        self.deliver_local(NodeMsg {
-            to: self.me.clone(),
-            from: "boot".into(),
-            unl: unl.to_vec(),
-            body: body.to_vec(),
-            ..Default::default()
-        });
+        let to = self.primary.clone();
+        self.pump(NodeMsg { to: to.clone(), from: to, unl: unl.to_vec(), body: body.to_vec(), ..Default::default() });
     }
 
     /// Serve until `shutdown`: accept connections, gate+deliver messages, answer
@@ -255,13 +297,8 @@ impl Node {
                 }
             }
             for (unl, body) in kicks {
-                self.deliver_local(NodeMsg {
-                    to: self.me.clone(),
-                    from: self.me.clone(),
-                    unl,
-                    body,
-                    ..Default::default()
-                });
+                let to = self.primary.clone();
+                self.pump(NodeMsg { to: to.clone(), from: to, unl, body, ..Default::default() });
             }
 
             match listener.accept() {
@@ -301,7 +338,7 @@ impl Node {
         if !self.wire_admit(&msg) {
             crate::flow!(
                 "[{}] ⛔ dropped wire msg from '{}' (reserved or bad signature)",
-                self.alias,
+                self.label,
                 msg.from
             );
             return;
@@ -309,12 +346,12 @@ impl Node {
         if !self.authorize(&msg) {
             crate::flow!(
                 "[{}] ⛔ impersonation of '{}' — sender key ≠ first-seen (TOFU)",
-                self.alias,
+                self.label,
                 msg.from
             );
             return;
         }
-        self.deliver_local(msg);
+        self.pump(msg);
     }
 
     /// R3: trust-on-first-use from-authorization. The first node key seen signing
@@ -350,40 +387,95 @@ impl Node {
         adapters::verify(&pk, &signing_bytes(m), &sg)
     }
 
-    /// Deliver to the local agent and route its replies (no gate — caller vouches).
-    fn deliver_local(&mut self, msg: NodeMsg) {
-        crate::flow!("[{}] ← {} : {}", self.alias, msg.from, String::from_utf8_lossy(&msg.unl));
-        // Cache the sender's return address so replies have a route.
-        if !msg.from.is_empty() && !msg.from_addr.is_empty() {
-            self.routes.insert(msg.from.clone(), msg.from_addr.clone());
-        }
-        let _ = self.agent.config(&msg.from, &msg.unl, &msg.body);
-        for s in self.agent.take_sends() {
-            self.emit(&s.receiver, &s.unl, &s.body);
+    /// True if `to` names a locally-mounted agent (by uuid or alias) → its uuid.
+    fn local_uuid(&self, to: &str) -> Option<String> {
+        if self.agents.contains_key(to) {
+            Some(to.to_string())
+        } else {
+            self.aliases.get(to).cloned()
         }
     }
 
-    /// Route one outbound message: seal (sign) it, resolve the recipient's address,
-    /// and send it.
-    fn emit(&mut self, to: &str, unl: &[u8], body: &[u8]) {
-        let mut m = NodeMsg {
-            to: to.into(),
-            from: self.me.clone(),
-            from_addr: self.addr.clone(),
-            unl: unl.to_vec(),
-            body: body.to_vec(),
-            ..Default::default()
-        };
+    /// The in-process executor. Deliver a message to its local agent; queue any
+    /// reply bound for a co-located agent (in-process, no wire) and push any
+    /// cross-node reply to the wire. A per-event work budget bounds intra-node
+    /// fan-out so a local message loop cannot exhaust the node.
+    fn pump(&mut self, initial: NodeMsg) {
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(initial);
+        let mut budget = 10_000usize;
+        while let Some(m) = q.pop_front() {
+            budget -= 1;
+            if budget == 0 {
+                crate::flow!("[{}] ⛔ executor budget exhausted — dropping the rest", self.label);
+                break;
+            }
+            let Some(uuid) = self.local_uuid(&m.to) else {
+                // Not for any local agent: surface to the sink (e.g. "result") or drop.
+                if let Some(sink) = &self.sink {
+                    let _ = sink.send(m);
+                }
+                continue;
+            };
+            // Cache the sender's return address so replies have a route.
+            if !m.from.is_empty() && !m.from_addr.is_empty() {
+                self.routes.insert(m.from.clone(), m.from_addr.clone());
+            }
+            let sends = {
+                let mounted = self.agents.get_mut(&uuid).expect("local uuid is mounted");
+                crate::flow!("[{}] ← {} : {}", mounted.alias, m.from, String::from_utf8_lossy(&m.unl));
+                let _ = mounted.runtime.config(&m.from, &m.unl, &m.body);
+                mounted.runtime.take_sends()
+            };
+            for s in sends {
+                let next = NodeMsg {
+                    to: s.receiver,
+                    from: uuid.clone(),
+                    from_addr: self.addr.clone(),
+                    unl: s.unl,
+                    body: s.body,
+                    ..Default::default()
+                };
+                if self.local_uuid(&next.to).is_some() {
+                    q.push_back(next); // co-located → in-process, trusted
+                } else {
+                    self.wire_or_sink(next); // cross-node → seal + Noise, or sink
+                }
+            }
+        }
+    }
+
+    /// Seal a cross-node message and send it over Noise; if the recipient has no
+    /// address (e.g. `result`), surface it to the sink instead.
+    fn wire_or_sink(&mut self, mut m: NodeMsg) {
         self.seal(&mut m);
-        match self.address_of(to) {
+        match self.address_of(&m.to) {
             Some(addr) => {
                 let _ = self.send_to(&addr, &m);
             }
             None => {
                 if let Some(sink) = &self.sink {
-                    let _ = sink.send(m); // e.g. "result" — surfaced, not routed
+                    let _ = sink.send(m);
                 }
             }
+        }
+    }
+
+    /// Emit a node-originated message as agent `from` (used by `register`): in-process
+    /// if the target is co-located, else over the wire.
+    fn send_as(&mut self, from: &str, to: &str, unl: &[u8], body: &[u8]) {
+        let m = NodeMsg {
+            to: to.into(),
+            from: from.into(),
+            from_addr: self.addr.clone(),
+            unl: unl.to_vec(),
+            body: body.to_vec(),
+            ..Default::default()
+        };
+        if self.local_uuid(to).is_some() {
+            self.pump(m);
+        } else {
+            self.wire_or_sink(m);
         }
     }
 
@@ -416,12 +508,14 @@ impl Node {
         Some(addr)
     }
 
-    /// Answer a RESOLVE by asking the local agent to `locate` the UUID. Only the
-    /// AMS agent returns an address; others produce nothing.
+    /// Answer a RESOLVE by asking the locally-mounted AMS agent to `locate` the
+    /// UUID. Nodes that don't host an `ams` agent produce nothing.
     fn resolve_local(&mut self, uuid: &str) -> Option<String> {
+        let ams_uuid = self.aliases.get("ams").cloned()?;
+        let mounted = self.agents.get_mut(&ams_uuid)?;
         let body = serde_json::json!({ "agent": uuid }).to_string();
-        self.agent.config("resolver", b"obj(locate, agent)", body.as_bytes()).ok()?;
-        let reply = self.agent.take_sends().into_iter().next()?;
+        mounted.runtime.config("resolver", b"obj(locate, agent)", body.as_bytes()).ok()?;
+        let reply = mounted.runtime.take_sends().into_iter().next()?;
         let v: serde_json::Value = serde_json::from_slice(&reply.body).ok()?;
         v.get("address")?.as_str().map(str::to_string)
     }
@@ -504,6 +598,35 @@ mod tests {
         let impostor = signed_by(&k2, "X");
         assert!(n.wire_admit(&impostor)); // the signature itself is valid...
         assert!(!n.authorize(&impostor)); // ...but it's a different key for X → rejected
+    }
+
+    #[test]
+    fn two_local_agents_talk_in_process() {
+        // One node hosts both agents; the primary, on a local kick, messages the
+        // co-located agent by alias — entirely in-process (no wire, no AMS).
+        struct Aye;
+        impl Agent for Aye {
+            fn on_message(&mut self, unl: &str, _b: &[u8], ctx: &mut Ctx) {
+                if unl.contains("kick") {
+                    ctx.send("bee", "obj(ping, x)", Vec::new());
+                }
+            }
+        }
+        struct Bee;
+        impl Agent for Bee {
+            fn on_message(&mut self, unl: &str, _b: &[u8], ctx: &mut Ctx) {
+                if unl.contains("ping") {
+                    ctx.send("result", "obj(pong, x)", Vec::new());
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut n = Node::new("AYE", "aye", "127.0.0.1:0", Box::new(NativeRuntime::new(Aye)));
+        n.mount("BEE", "bee", Box::new(NativeRuntime::new(Bee)), None);
+        n.set_sink(tx);
+        n.inject(b"obj(kick, x)", b""); // local kick → primary → bee → result
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("result surfaced in-process");
+        assert_eq!(String::from_utf8_lossy(&got.unl), "obj(pong, x)");
     }
 
     #[test]
