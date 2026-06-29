@@ -63,6 +63,11 @@ pub trait AgentRuntime {
     fn take_infer_reqs(&mut self) -> Vec<unl_agent::InferReq> {
         Vec::new()
     }
+
+    /// Drain the agent's spawn requests this call (the `spawn` capability; default: none).
+    fn take_spawn_reqs(&mut self) -> Vec<unl_agent::SpawnReq> {
+        Vec::new()
+    }
 }
 
 impl AgentRuntime for super::WasmRuntime {
@@ -111,6 +116,7 @@ pub struct NativeRuntime<A: Agent> {
     state: Option<std::sync::Arc<dyn unl_agent::Kv>>,
     keyring: Option<std::sync::Arc<dyn unl_agent::Keyring>>,
     infers: Vec<unl_agent::InferReq>,
+    spawns: Vec<unl_agent::SpawnReq>,
 }
 
 impl<A: Agent> NativeRuntime<A> {
@@ -122,6 +128,7 @@ impl<A: Agent> NativeRuntime<A> {
             state: None,
             keyring: None,
             infers: Vec::new(),
+            spawns: Vec::new(),
         }
     }
 
@@ -154,6 +161,7 @@ impl<A: Agent> NativeRuntime<A> {
                 }
                 self.timer_ops.extend(ctx.take_timers());
                 self.infers.extend(ctx.take_infers());
+                self.spawns.extend(ctx.take_spawns());
                 Ok(())
             }
             Err(_) => Err(anyhow::anyhow!("native agent panicked; output discarded")),
@@ -209,6 +217,10 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
 
     fn take_infer_reqs(&mut self) -> Vec<unl_agent::InferReq> {
         std::mem::take(&mut self.infers)
+    }
+
+    fn take_spawn_reqs(&mut self) -> Vec<unl_agent::SpawnReq> {
+        std::mem::take(&mut self.spawns)
     }
 }
 

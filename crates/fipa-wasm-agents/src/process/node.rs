@@ -43,7 +43,8 @@ use crate::adapters::{self, NodeCrypto, NodeNoise, SledStore, StateStore};
 use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
 use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
 use rand::RngCore;
-use unl_agent::{InferReq, TimerOp};
+use std::collections::HashSet;
+use unl_agent::{InferReq, SpawnReq, TimerOp};
 
 use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
 
@@ -221,6 +222,20 @@ pub trait LlmBackend: Send + Sync {
     fn infer(&self, prompt: &str) -> Result<String, String>;
 }
 
+/// A node-side forensic audit event (M6) — **log-rich** while the agent gets only a
+/// uniform denial (`AGENT_HOST_ABI.md` §11). Node-attributed and agent-unspoofable.
+#[derive(Clone, Debug)]
+pub struct AuditEvent {
+    pub agent: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// Where audit events are recorded (a SIEM, a log, a test recorder).
+pub trait AuditSink: Send + Sync {
+    fn record(&self, event: &AuditEvent);
+}
+
 /// Wall-clock milliseconds since the Unix epoch (the scheduler's clock, M3).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -302,6 +317,9 @@ pub struct Node {
     store: Option<Arc<SledStore>>,       // M4: durable state backend (state capability)
     llm: Option<Arc<dyn LlmBackend>>,    // M5: inference backend (llm capability)
     pending_infers: Vec<(String, u64, String)>, // M5: (agent, req_id, prompt) to run
+    audit: Option<Arc<dyn AuditSink>>,   // M6: forensic event sink (log rich)
+    faults: HashMap<String, u32>,        // M6: consecutive fault count per agent
+    quarantined: HashSet<String>,        // M6: agents stopped after repeated faults
 }
 
 impl Node {
@@ -325,6 +343,9 @@ impl Node {
             store: None,
             llm: None,
             pending_infers: Vec::new(),
+            audit: None,
+            faults: HashMap::new(),
+            quarantined: HashSet::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -427,6 +448,67 @@ impl Node {
         }
         for r in reqs {
             self.pending_infers.push((uuid.to_string(), r.req_id, r.prompt));
+        }
+    }
+
+    /// Set a forensic audit sink (M6). Events are recorded node-side; the agent
+    /// always gets only the uniform denial.
+    pub fn set_audit(&mut self, sink: Arc<dyn AuditSink>) {
+        self.audit = Some(sink);
+    }
+
+    /// Record an audit event (no-op without a sink).
+    fn audit(&self, agent: &str, kind: &str, detail: &str) {
+        if let Some(sink) = &self.audit {
+            sink.record(&AuditEvent { agent: agent.into(), kind: kind.into(), detail: detail.into() });
+        }
+    }
+
+    /// Supervisor (M6): track per-agent faults and quarantine an agent that faults
+    /// repeatedly, so a misbehaving agent is isolated, not the node.
+    fn supervise(&mut self, uuid: &str, result: &anyhow::Result<()>) {
+        const MAX_FAULTS: u32 = 3;
+        match result {
+            Ok(()) => {
+                self.faults.remove(uuid);
+            }
+            Err(e) => {
+                let count = {
+                    let n = self.faults.entry(uuid.to_string()).or_default();
+                    *n += 1;
+                    *n
+                };
+                self.audit(uuid, "fault", &e.to_string());
+                if count >= MAX_FAULTS {
+                    self.quarantined.insert(uuid.to_string());
+                    self.audit(uuid, "quarantined", "fault threshold exceeded");
+                    crate::flow!("[{}] ⛔ quarantined '{}' after {} faults", self.label, uuid, count);
+                }
+            }
+        }
+    }
+
+    /// Spawn child agents (M6), gated by the parent's `Spawn` capability. Each child
+    /// is mounted with its grants intersected with the parent's (child caps ⊆ parent).
+    fn apply_spawn_reqs(&mut self, parent: &str, reqs: Vec<SpawnReq>) {
+        if reqs.is_empty() {
+            return;
+        }
+        if !self.granted(parent, Capability::Spawn) {
+            self.audit(parent, "denied:spawn", "no Spawn grant");
+            return;
+        }
+        let parent_caps = self.agents.get(parent).map(|m| m.grant.caps.clone()).unwrap_or_default();
+        for r in reqs {
+            let Some(mut manifest) = Manifest::from_json(&r.manifest_json) else {
+                self.audit(parent, "spawn:bad-manifest", &r.uuid);
+                continue;
+            };
+            manifest.grants.retain(|c| parent_caps.contains(c)); // child caps ⊆ parent
+            match self.mount_wasm(&r.uuid, &r.alias, r.code, &manifest, None) {
+                Ok(()) => self.audit(parent, "spawned", &r.uuid),
+                Err(e) => self.audit(parent, "spawn:failed", &e.to_string()),
+            }
         }
     }
 
@@ -810,6 +892,7 @@ impl Node {
                     crate::flow!("[{}] ↪ key handoff accepted for '{}'", self.label, m.from);
                     true
                 } else {
+                    self.audit(&m.from, "impersonation", "sender key != TOFU");
                     false
                 }
             }
@@ -874,24 +957,34 @@ impl Node {
                 }
                 continue;
             };
+            // A quarantined agent (M6) receives nothing further.
+            if self.quarantined.contains(&uuid) {
+                self.audit(&uuid, "quarantined", "message dropped");
+                continue;
+            }
             // Cache the sender's return address so replies have a route.
             if !m.from.is_empty() && !m.from_addr.is_empty() {
                 self.routes.insert(m.from.clone(), m.from_addr.clone());
             }
-            let (sends, ops, infers) = {
+            let (result, sends, ops, infers, spawns) = {
                 let mounted = self.agents.get_mut(&uuid).expect("local uuid is mounted");
                 crate::flow!("[{}] ← {} : {}", mounted.alias, m.from, String::from_utf8_lossy(&m.unl));
-                let _ = mounted.runtime.config(&m.from, &m.unl, &m.body);
+                let result = mounted.runtime.config(&m.from, &m.unl, &m.body);
                 (
+                    result,
                     mounted.runtime.take_sends(),
                     mounted.runtime.take_timer_ops(),
                     mounted.runtime.take_infer_reqs(),
+                    mounted.runtime.take_spawn_reqs(),
                 )
             };
+            self.supervise(&uuid, &result);
             self.apply_timer_ops(&uuid, ops);
             self.apply_infer_reqs(&uuid, infers);
+            self.apply_spawn_reqs(&uuid, spawns);
             for s in sends {
                 if !self.net_allows(&uuid, &s.receiver) {
+                    self.audit(&uuid, "denied:net", &s.receiver);
                     crate::flow!("[{}] ⛔ net-scope denied: '{}' → '{}'", self.label, uuid, s.receiver);
                     continue;
                 }
@@ -979,13 +1072,21 @@ impl Node {
     /// timers it (re-)armed.
     fn fire_tick(&mut self, uuid: &str, timer_id: u64) {
         let now = now_ms();
-        let (sends, ops, infers) = {
+        let (result, sends, ops, infers, spawns) = {
             let Some(m) = self.agents.get_mut(uuid) else { return };
-            let _ = m.runtime.tick(timer_id, now);
-            (m.runtime.take_sends(), m.runtime.take_timer_ops(), m.runtime.take_infer_reqs())
+            let result = m.runtime.tick(timer_id, now);
+            (
+                result,
+                m.runtime.take_sends(),
+                m.runtime.take_timer_ops(),
+                m.runtime.take_infer_reqs(),
+                m.runtime.take_spawn_reqs(),
+            )
         };
+        self.supervise(uuid, &result);
         self.apply_timer_ops(uuid, ops);
         self.apply_infer_reqs(uuid, infers);
+        self.apply_spawn_reqs(uuid, spawns);
         self.dispatch(uuid, sends);
     }
 
@@ -1187,6 +1288,55 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(1)).expect("state load surfaced");
         assert_eq!(got.body, b"hello"); // persisted via the state capability
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audit_records_a_supervised_fault_and_quarantine() {
+        struct Rec(std::sync::Mutex<Vec<String>>);
+        impl AuditSink for Rec {
+            fn record(&self, e: &AuditEvent) {
+                self.0.lock().unwrap().push(e.kind.clone());
+            }
+        }
+        struct Boom;
+        impl Agent for Boom {
+            fn on_message(&mut self, _u: &str, _b: &[u8], _c: &mut Ctx) {
+                panic!("boom");
+            }
+        }
+        let rec = Arc::new(Rec(std::sync::Mutex::new(Vec::new())));
+        let mut n = Node::new("B", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Boom)));
+        n.set_audit(rec.clone());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the panics
+        for _ in 0..3 {
+            n.pump(NodeMsg { to: "B".into(), from: "B".into(), unl: b"x".to_vec(), ..Default::default() });
+        }
+        std::panic::set_hook(prev);
+        assert!(n.quarantined.contains("B")); // supervisor isolated the faulting agent
+        let kinds = rec.0.lock().unwrap();
+        assert!(kinds.iter().any(|k| k == "fault")); // audit recorded the faults
+        assert!(kinds.iter().any(|k| k == "quarantined")); // and the quarantine
+    }
+
+    #[test]
+    fn spawn_restricts_child_caps_to_parent() {
+        use crate::manifest::Capability;
+        let mut n = Node::new("P", "p", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        // restrict the parent to Spawn + State (NOT Llm)
+        n.agents.get_mut("P").unwrap().grant.caps =
+            [Capability::Messaging, Capability::Log, Capability::Spawn, Capability::State].into_iter().collect();
+        // the child requests State + Llm; only State is within the parent's authority
+        let child = wmanifest(&[Capability::State, Capability::Llm]);
+        let req = unl_agent::SpawnReq {
+            uuid: "CHILD".into(),
+            alias: "child".into(),
+            code: COUNTER_WASM.as_bytes().to_vec(),
+            manifest_json: child.to_json(),
+        };
+        n.apply_spawn_reqs("P", vec![req]);
+        assert!(n.granted("CHILD", Capability::State)); // ⊆ parent → kept
+        assert!(!n.granted("CHILD", Capability::Llm)); // not in parent → stripped
     }
 
     #[test]

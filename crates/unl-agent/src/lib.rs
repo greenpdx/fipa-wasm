@@ -89,6 +89,17 @@ pub struct InferReq {
     pub prompt: String,
 }
 
+/// A request to spawn a child wasm agent ([`Ctx::spawn`]). The host mounts it with
+/// the child's grants **intersected with the parent's** (child caps ⊆ parent), and
+/// only if the parent holds the `spawn` capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnReq {
+    pub uuid: String,
+    pub alias: String,
+    pub code: Vec<u8>,
+    pub manifest_json: Vec<u8>,
+}
+
 /// The per-call context handed to an agent: the sender of the current message,
 /// and a sink for outgoing replies. The host driver sets the sender and drains
 /// the replies, so the agent is oblivious to whether it runs native or in wasm.
@@ -100,6 +111,7 @@ pub struct Ctx {
     state: Option<std::sync::Arc<dyn Kv>>,
     keyring: Option<std::sync::Arc<dyn Keyring>>,
     infers: Vec<InferReq>,
+    spawns: Vec<SpawnReq>,
 }
 
 impl Ctx {
@@ -206,6 +218,18 @@ impl Ctx {
     /// Drain the inference requests emitted this call (host-internal).
     pub fn take_infers(&mut self) -> Vec<InferReq> {
         core::mem::take(&mut self.infers)
+    }
+
+    /// Spawn a child wasm agent from `code` + a manifest (JSON). The host mounts it
+    /// with the child's grants intersected with this agent's (child caps ⊆ parent);
+    /// requires the `spawn` capability.
+    pub fn spawn(&mut self, uuid: impl Into<String>, alias: impl Into<String>, code: Vec<u8>, manifest_json: Vec<u8>) {
+        self.spawns.push(SpawnReq { uuid: uuid.into(), alias: alias.into(), code, manifest_json });
+    }
+
+    /// Drain the spawn requests emitted this call (host-internal).
+    pub fn take_spawns(&mut self) -> Vec<SpawnReq> {
+        core::mem::take(&mut self.spawns)
     }
 }
 
