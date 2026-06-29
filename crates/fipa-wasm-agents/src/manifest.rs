@@ -121,6 +121,16 @@ impl Grant {
     pub fn granted(&self, cap: Capability) -> bool {
         self.caps.contains(&cap)
     }
+
+    /// Full authority — used for native/infrastructure agents (DF/AMS/PA), which are
+    /// trusted, host-instantiated templates rather than gated tenant code.
+    pub fn full() -> Self {
+        use Capability::*;
+        Grant {
+            caps: [Messaging, Log, Discovery, State, Time, Llm, Crypto, Spawn].into_iter().collect(),
+            budget: Budget::default(),
+        }
+    }
 }
 
 /// Why a manifest does not fit a node profile (load-time, operator-facing — the

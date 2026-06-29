@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::adapters::{self, NodeCrypto, NodeNoise};
+use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
 use crate::wasm::{AgentRuntime, WasmRuntime};
 
 use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
@@ -190,6 +191,7 @@ struct Mounted {
     service: Option<String>,
     code: Option<Vec<u8>>, // wasm bytes for a mobile agent; None for native templates
     epoch: u64,            // this agent's location epoch (R6)
+    grant: Grant,          // M2: the agent's effective capability authority
 }
 
 /// A node: one **or more** local agents, a TCP address, a routing table, and the
@@ -209,6 +211,7 @@ pub struct Node {
     noise: NodeNoise,                    // R2: static Noise identity (encrypts the channel)
     kick_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>, // local, trusted kickoff injections
     seen: HashMap<String, u64>,          // migration replay guard: uuid -> last epoch
+    profile: NodeProfile,                // M2: which capabilities this node offers
 }
 
 impl Node {
@@ -227,6 +230,7 @@ impl Node {
             noise: NodeNoise::generate(),
             kick_rx: None,
             seen: HashMap::new(),
+            profile: NodeProfile::normal(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -252,22 +256,47 @@ impl Node {
                 service: service.map(Into::into),
                 code: None,
                 epoch: 0,
+                grant: Grant::full(), // native = trusted infra template
             },
         );
     }
 
-    /// Mount a **mobile wasm agent** from its module bytes — only wasm agents move
-    /// (native agents are stationary, host-instantiated templates). The code is
-    /// retained so the agent can later be migrated.
+    /// Set this node's profile (e.g. `NodeProfile::iot()`), which determines the
+    /// capabilities and budget ceilings a mounted agent's manifest must fit.
+    pub fn set_profile(&mut self, profile: NodeProfile) {
+        self.profile = profile;
+    }
+
+    /// Whether `uuid`'s agent holds `cap` — the gate every host-call consults
+    /// (M2). A `false` is the uniform, opaque `denied` at runtime.
+    pub fn granted(&self, uuid: &str, cap: Capability) -> bool {
+        self.agents.get(uuid).map(|m| m.grant.granted(cap)).unwrap_or(false)
+    }
+
+    /// Mount a **mobile wasm agent** from its module bytes + `manifest` (HEAD) — only
+    /// wasm agents move (native agents are stationary, host-instantiated templates).
+    /// The manifest is fit against the node profile (M2 load-time gate); on success
+    /// the effective [`Grant`] is stored and the wasm engine caps are derived from
+    /// the budget. The code is retained so the agent can later be migrated.
     pub fn mount_wasm(
         &mut self,
         uuid: &str,
         alias: &str,
         code: Vec<u8>,
-        caps: &crate::proto::AgentCapabilities,
+        manifest: &Manifest,
         service: Option<&str>,
     ) -> anyhow::Result<()> {
-        let mut rt = WasmRuntime::new(&code, caps)?;
+        let grant = self
+            .profile
+            .fit(manifest)
+            .map_err(|e| anyhow::anyhow!("manifest does not fit node profile: {e:?}"))?;
+        let caps = crate::proto::AgentCapabilities {
+            max_memory_bytes: grant.budget.mem_kb.saturating_mul(1024),
+            max_execution_time_ms: (grant.budget.fuel / 1_000_000).max(1),
+            storage_quota_bytes: grant.budget.state_kb.saturating_mul(1024),
+            ..Default::default()
+        };
+        let mut rt = WasmRuntime::new(&code, &caps)?;
         rt.call_init()?;
         self.aliases.insert(alias.into(), uuid.into());
         self.agents.insert(
@@ -279,6 +308,7 @@ impl Node {
                 service: service.map(Into::into),
                 code: Some(code),
                 epoch: 0,
+                grant,
             },
         );
         Ok(())
@@ -422,6 +452,7 @@ impl Node {
                 service: None,
                 code: Some(snap.code.clone()),
                 epoch: snap.epoch,
+                grant: Grant::full(), // TODO(M2): carry the manifest in the snapshot + re-fit
             },
         );
         self.seen.insert(snap.uuid.clone(), snap.epoch);
@@ -897,15 +928,46 @@ mod tests {
         (global.set $n (i32.load (local.get $p)))))
     "#;
 
-    fn wcaps() -> crate::proto::AgentCapabilities {
-        crate::proto::AgentCapabilities { max_execution_time_ms: 1000, ..Default::default() }
+    fn wmanifest(grants: &[crate::manifest::Capability]) -> crate::manifest::Manifest {
+        use crate::manifest::*;
+        Manifest {
+            type_id: uuid::Uuid::nil(),
+            desc: "counter".into(),
+            name: None,
+            profile: Profile::Either,
+            brain: Brain::Wasm,
+            grants: grants.to_vec(),
+            budget: Budget::default(),
+        }
+    }
+
+    #[test]
+    fn capability_gate_reflects_the_manifest() {
+        use crate::manifest::Capability;
+        let mut a = Node::new("seed", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::State, Capability::Time]), None)
+            .unwrap();
+        assert!(a.granted("W", Capability::State)); // requested + offered
+        assert!(a.granted("W", Capability::Messaging)); // core
+        assert!(!a.granted("W", Capability::Llm)); // not granted → denied
+        assert!(a.granted("seed", Capability::Llm)); // native infra = full grant
+    }
+
+    #[test]
+    fn iot_node_rejects_a_heavy_agent_at_load() {
+        use crate::manifest::{Capability, NodeProfile};
+        let mut a = Node::new("seed", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.set_profile(NodeProfile::iot());
+        // iot offers no llm → load-time rejection, operator-facing
+        let r = a.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::Llm]), None);
+        assert!(r.is_err());
     }
 
     #[test]
     fn wasm_agent_migrates_with_state_between_nodes() {
         // source A hosts a mobile wasm counter, incremented to 3
         let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
-        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wcaps(), None).unwrap();
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
         for _ in 0..3 {
             a.pump(NodeMsg { to: "CTR".into(), from: "CTR".into(), unl: b"inc".to_vec(), ..Default::default() });
         }
