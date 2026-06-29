@@ -40,11 +40,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::adapters::{self, NodeCrypto, NodeNoise};
-use crate::wasm::AgentRuntime;
+use crate::wasm::{AgentRuntime, WasmRuntime};
+
+use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
 
 const KIND_MSG: u8 = 1;
 const KIND_RESOLVE_REQ: u8 = 2;
 const KIND_RESOLVE_RESP: u8 = 3;
+const KIND_MIGRATE: u8 = 4;
 
 /// A short dial timeout bounds connect/read/write so a slow or hostile peer cannot
 /// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3). The frame-size
@@ -149,6 +152,7 @@ fn handle_conn(
     noise: &NodeNoise,
     in_tx: &Sender<NodeMsg>,
     rz_tx: &Sender<(String, Sender<String>)>,
+    mg_tx: &Sender<Vec<u8>>,
 ) {
     s.set_read_timeout(Some(DIAL_TIMEOUT)).ok();
     s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
@@ -159,6 +163,9 @@ fn handle_conn(
             if let Some(m) = decode_msg(&payload) {
                 let _ = in_tx.send(m);
             }
+        }
+        KIND_MIGRATE => {
+            let _ = mg_tx.send(payload); // hand the move payload to the main loop
         }
         KIND_RESOLVE_REQ => {
             let uuid = String::from_utf8_lossy(&payload).to_string();
@@ -181,6 +188,8 @@ struct Mounted {
     alias: String,
     runtime: Box<dyn AgentRuntime + Send>,
     service: Option<String>,
+    code: Option<Vec<u8>>, // wasm bytes for a mobile agent; None for native templates
+    epoch: u64,            // this agent's location epoch (R6)
 }
 
 /// A node: one **or more** local agents, a TCP address, a routing table, and the
@@ -199,6 +208,7 @@ pub struct Node {
     keys: HashMap<String, [u8; 32]>,     // R3: from-uuid -> authorized node pubkey (TOFU)
     noise: NodeNoise,                    // R2: static Noise identity (encrypts the channel)
     kick_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>, // local, trusted kickoff injections
+    seen: HashMap<String, u64>,          // migration replay guard: uuid -> last epoch
 }
 
 impl Node {
@@ -216,6 +226,7 @@ impl Node {
             keys: HashMap::new(),
             noise: NodeNoise::generate(),
             kick_rx: None,
+            seen: HashMap::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -239,8 +250,38 @@ impl Node {
                 alias: alias.into(),
                 runtime: agent,
                 service: service.map(Into::into),
+                code: None,
+                epoch: 0,
             },
         );
+    }
+
+    /// Mount a **mobile wasm agent** from its module bytes — only wasm agents move
+    /// (native agents are stationary, host-instantiated templates). The code is
+    /// retained so the agent can later be migrated.
+    pub fn mount_wasm(
+        &mut self,
+        uuid: &str,
+        alias: &str,
+        code: Vec<u8>,
+        caps: &crate::proto::AgentCapabilities,
+        service: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut rt = WasmRuntime::new(&code, caps)?;
+        rt.call_init()?;
+        self.aliases.insert(alias.into(), uuid.into());
+        self.agents.insert(
+            uuid.into(),
+            Mounted {
+                uuid: uuid.into(),
+                alias: alias.into(),
+                runtime: Box::new(rt),
+                service: service.map(Into::into),
+                code: Some(code),
+                epoch: 0,
+            },
+        );
+        Ok(())
     }
 
     /// Use a persisted node key at `path` (mint+persist on first run) instead of an
@@ -303,6 +344,100 @@ impl Node {
         }
     }
 
+    /// This node's Ed25519 public key (its signing identity), e.g. the handoff
+    /// target a source node must authorize before migrating an agent here.
+    pub fn node_pub(&self) -> [u8; 32] {
+        self.key.public_key()
+    }
+
+    /// Build the signed move payload (snapshot of code+state at epoch+1, plus a
+    /// handoff authorizing `dest_pub`) for a mobile agent — without sending it.
+    pub fn build_migrate_payload(&mut self, uuid: &str, dest_pub: &[u8]) -> Option<Vec<u8>> {
+        let m = self.agents.get_mut(uuid)?;
+        let code = m.code.clone()?; // only wasm (mobile) agents have code
+        let epoch = m.epoch + 1;
+        let state = m.runtime.snapshot();
+        let snapshot = AgentSnapshot::sealed(uuid, epoch, code, state, &self.key);
+        let handoff = Handoff::sealed(uuid, dest_pub.to_vec(), epoch, &self.key);
+        Some(MigratePayload { snapshot, handoff }.encode())
+    }
+
+    /// Migrate a mobile (wasm) agent to `dest_addr`, authorizing `dest_pub` to act
+    /// for it: send the signed snapshot + handoff over Noise, then tombstone the
+    /// local copy. The epoch arbiter (R6) + handoff prevent forking (H1); full
+    /// two-phase crash-safety is the remaining hardening.
+    pub fn migrate(&mut self, uuid: &str, dest_addr: &str, dest_pub: &[u8]) -> io::Result<()> {
+        let payload = self
+            .build_migrate_payload(uuid, dest_pub)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "agent not mobile / absent"))?;
+        let mut s = dial(dest_addr)?;
+        let mut sess = self.noise.connect(&mut s)?;
+        sess.send(&mut s, KIND_MIGRATE, &payload)?;
+        if let Some(m) = self.agents.remove(uuid) {
+            self.aliases.remove(&m.alias);
+        }
+        Ok(())
+    }
+
+    /// Receive a migrated agent: verify the snapshot + handoff, confirm it is for
+    /// this node, guard against replay (epoch must advance), instantiate the wasm
+    /// from the carried code, restore state, mount it, and re-bind at AMS carrying
+    /// the handoff so the AMS node can move the agent's authorized key.
+    fn process_migrate(&mut self, payload: &[u8]) {
+        let Some(mp) = MigratePayload::decode(payload) else { return };
+        let (snap, ho) = (mp.snapshot, mp.handoff);
+        if !snap.verify() || !ho.verify() {
+            crate::flow!("[{}] ⛔ migrate: bad snapshot/handoff signature", self.label);
+            return;
+        }
+        if ho.to_pub != self.key.public_key()
+            || ho.agent != snap.uuid
+            || ho.epoch != snap.epoch
+            || ho.from_pub != snap.origin_pub
+        {
+            crate::flow!("[{}] ⛔ migrate: handoff not for me / inconsistent", self.label);
+            return;
+        }
+        if self.seen.get(&snap.uuid).is_some_and(|&e| snap.epoch <= e) {
+            crate::flow!("[{}] ⛔ migrate: replayed epoch {} for '{}'", self.label, snap.epoch, snap.uuid);
+            return;
+        }
+        let caps = crate::proto::AgentCapabilities::default();
+        let mut rt = match WasmRuntime::new(&snap.code, &caps) {
+            Ok(rt) => rt,
+            Err(_) => {
+                crate::flow!("[{}] ⛔ migrate: code won't instantiate", self.label);
+                return;
+            }
+        };
+        let _ = rt.call_init();
+        rt.call_restore(&snap.state);
+        self.aliases.insert(snap.uuid.clone(), snap.uuid.clone());
+        self.agents.insert(
+            snap.uuid.clone(),
+            Mounted {
+                uuid: snap.uuid.clone(),
+                alias: snap.uuid.clone(),
+                runtime: Box::new(rt),
+                service: None,
+                code: Some(snap.code.clone()),
+                epoch: snap.epoch,
+            },
+        );
+        self.seen.insert(snap.uuid.clone(), snap.epoch);
+        crate::flow!("[{}] ⇇ migrated '{}' arrived (epoch {})", self.label, snap.uuid, snap.epoch);
+
+        // Re-bind at AMS, carrying the handoff so the AMS node moves the TOFU key.
+        if self.routes.contains_key("ams") {
+            let ho_json = serde_json::to_value(&ho).unwrap_or_default();
+            let body = serde_json::json!({
+                "agent": snap.uuid, "address": self.addr, "epoch": snap.epoch, "handoff": ho_json
+            })
+            .to_string();
+            self.send_as(&snap.uuid, "ams", b"obj(bind, agent)", body.as_bytes());
+        }
+    }
+
     /// Stamp `sender_pub`/`nonce` and sign a message with this node's key (R1).
     fn seal(&self, m: &mut NodeMsg) {
         m.sender_pub = self.key.public_key().to_vec();
@@ -327,6 +462,7 @@ impl Node {
         listener.set_nonblocking(true).ok();
         let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
         let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
+        let (mg_tx, mg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let conns = Arc::new(AtomicUsize::new(0));
 
         while !shutdown.load(Ordering::Relaxed) {
@@ -353,6 +489,11 @@ impl Node {
                 let _ = resp.send(addr);
             }
 
+            // 3b. Migrated agents handed over by a connection thread (M5).
+            while let Ok(payload) = mg_rx.try_recv() {
+                self.process_migrate(&payload);
+            }
+
             // 4. Accept new connections; each is handshaked + read in its own thread
             //    so a slow peer cannot stall the loop (H3/R7). Shed load past the cap.
             match listener.accept() {
@@ -361,10 +502,15 @@ impl Node {
                         continue; // drop (the connection closes) — bounded resource use
                     }
                     conns.fetch_add(1, Ordering::Relaxed);
-                    let (noise, in_tx, rz_tx, conns2) =
-                        (self.noise.clone(), in_tx.clone(), rz_tx.clone(), conns.clone());
+                    let (noise, in_tx, rz_tx, mg_tx, conns2) = (
+                        self.noise.clone(),
+                        in_tx.clone(),
+                        rz_tx.clone(),
+                        mg_tx.clone(),
+                        conns.clone(),
+                    );
                     std::thread::spawn(move || {
-                        handle_conn(s, &noise, &in_tx, &rz_tx);
+                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx);
                         conns2.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -406,13 +552,36 @@ impl Node {
     fn authorize(&mut self, m: &NodeMsg) -> bool {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&m.sender_pub); // length already checked in wire_admit
-        match self.keys.get(&m.from) {
-            Some(known) => *known == pk,
+        match self.keys.get(&m.from).copied() {
             None => {
                 self.keys.insert(m.from.clone(), pk);
                 true
             }
+            Some(known) if known == pk => true,
+            // Key changed: accept only with a valid handoff from the CURRENT key to
+            // this new key (a legitimate migration — MOBILITY §7); else impersonation.
+            Some(known) => {
+                if self.handoff_authorizes(m, &known, &pk) {
+                    self.keys.insert(m.from.clone(), pk);
+                    crate::flow!("[{}] ↪ key handoff accepted for '{}'", self.label, m.from);
+                    true
+                } else {
+                    false
+                }
+            }
         }
+    }
+
+    /// True if `m.body` carries a handoff signed by `from_key` (the agent's current
+    /// authorized key) that authorizes `to_key` (the new sender key) for this agent.
+    fn handoff_authorizes(&self, m: &NodeMsg, from_key: &[u8; 32], to_key: &[u8; 32]) -> bool {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.body) else { return false };
+        let Some(ho_val) = v.get("handoff") else { return false };
+        let Ok(ho) = serde_json::from_value::<Handoff>(ho_val.clone()) else { return false };
+        ho.verify()
+            && ho.agent == m.from
+            && ho.from_pub.as_slice() == &from_key[..]
+            && ho.to_pub.as_slice() == &to_key[..]
     }
 
     /// Admission check for a message arriving over the wire: not a reserved sender,
@@ -705,5 +874,78 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         ha.join().ok();
         hb.join().ok();
+    }
+
+    // A mobile counter: each deliver increments n; snapshot/restore carry n.
+    const COUNTER_WASM: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $n (mut i32) (i32.const 0))
+      (global $bump (mut i32) (i32.const 1024))
+      (func (export "init"))
+      (func (export "alloc") (param $len i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $bump))
+        (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+        (local.get $p))
+      (func (export "deliver") (param i32 i32 i32 i32 i32 i32)
+        (global.set $n (i32.add (global.get $n) (i32.const 1))))
+      (func (export "snapshot") (result i64)
+        (i32.store (i32.const 0) (global.get $n))
+        (i64.or (i64.shl (i64.const 0) (i64.const 32)) (i64.const 4)))
+      (func (export "restore") (param $p i32) (param $l i32)
+        (global.set $n (i32.load (local.get $p)))))
+    "#;
+
+    fn wcaps() -> crate::proto::AgentCapabilities {
+        crate::proto::AgentCapabilities { max_execution_time_ms: 1000, ..Default::default() }
+    }
+
+    #[test]
+    fn wasm_agent_migrates_with_state_between_nodes() {
+        // source A hosts a mobile wasm counter, incremented to 3
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wcaps(), None).unwrap();
+        for _ in 0..3 {
+            a.pump(NodeMsg { to: "CTR".into(), from: "CTR".into(), unl: b"inc".to_vec(), ..Default::default() });
+        }
+        // destination B authorizes the move; A builds the signed snapshot + handoff
+        let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let payload = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+
+        b.process_migrate(&payload);
+        // B now hosts CTR with the migrated state (n = 3)
+        assert_eq!(b.agents.get_mut("CTR").unwrap().runtime.snapshot(), vec![3, 0, 0, 0]);
+        assert_eq!(b.seen.get("CTR"), Some(&1));
+
+        // a replay of the same epoch is rejected (E)
+        b.process_migrate(&payload);
+        assert_eq!(b.seen.get("CTR"), Some(&1));
+    }
+
+    #[test]
+    fn handoff_authorizes_a_key_change() {
+        let mut n = dummy_node();
+        let (ka, kb) = (NodeCrypto::generate(), NodeCrypto::generate());
+        let sign = |k: &NodeCrypto, from: &str, body: Vec<u8>| {
+            let mut m = NodeMsg { to: "ams".into(), from: from.into(), body, ..Default::default() };
+            m.sender_pub = k.public_key().to_vec();
+            m.nonce = k.nonce().to_vec();
+            m.sig = k.sign(&signing_bytes(&m)).to_vec();
+            m
+        };
+        // "X" first seen under key A → A owns it (TOFU)
+        let m1 = sign(&ka, "X", Vec::new());
+        assert!(n.wire_admit(&m1) && n.authorize(&m1));
+        // X under key B with NO handoff → impersonation, rejected
+        let m2 = sign(&kb, "X", Vec::new());
+        assert!(n.wire_admit(&m2) && !n.authorize(&m2));
+        // X under key B WITH a valid handoff A→B → accepted, TOFU moves to B
+        let ho = Handoff::sealed("X", kb.public_key().to_vec(), 1, &ka);
+        let body = serde_json::json!({ "handoff": serde_json::to_value(&ho).unwrap() }).to_string();
+        let m3 = sign(&kb, "X", body.into_bytes());
+        assert!(n.wire_admit(&m3) && n.authorize(&m3));
+        // B is now the owner: a further message under B (no handoff) is fine
+        assert!(n.authorize(&sign(&kb, "X", Vec::new())));
     }
 }
