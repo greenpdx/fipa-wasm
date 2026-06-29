@@ -41,7 +41,8 @@ use std::time::Duration;
 
 use crate::adapters::{self, NodeCrypto, NodeNoise};
 use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
-use crate::wasm::{AgentRuntime, WasmRuntime};
+use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
+use unl_agent::TimerOp;
 
 use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
 
@@ -143,6 +144,14 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
+/// Wall-clock milliseconds since the Unix epoch (the scheduler's clock, M3).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Handle one accepted connection in its own thread (so a slow or hostile peer
 /// cannot stall the accept loop or the single-threaded agent executor, H3/R7):
 /// run the Noise handshake, read one frame, and hand it to the node's main loop —
@@ -212,6 +221,7 @@ pub struct Node {
     kick_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>, // local, trusted kickoff injections
     seen: HashMap<String, u64>,          // migration replay guard: uuid -> last epoch
     profile: NodeProfile,                // M2: which capabilities this node offers
+    timers: HashMap<String, HashMap<u64, u64>>, // M3: uuid -> timer_id -> deadline_ms
 }
 
 impl Node {
@@ -231,6 +241,7 @@ impl Node {
             kick_rx: None,
             seen: HashMap::new(),
             profile: NodeProfile::normal(),
+            timers: HashMap::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -525,6 +536,23 @@ impl Node {
                 self.process_migrate(&payload);
             }
 
+            // 3c. Fire any due timers (M3 scheduling — agent autonomy).
+            let now = now_ms();
+            let mut due: Vec<(String, u64)> = Vec::new();
+            for (uuid, slots) in &self.timers {
+                for (id, deadline) in slots {
+                    if *deadline <= now {
+                        due.push((uuid.clone(), *id));
+                    }
+                }
+            }
+            for (uuid, id) in due {
+                if let Some(slots) = self.timers.get_mut(&uuid) {
+                    slots.remove(&id);
+                }
+                self.fire_tick(&uuid, id);
+            }
+
             // 4. Accept new connections; each is handshaked + read in its own thread
             //    so a slow peer cannot stall the loop (H3/R7). Shed load past the cap.
             match listener.accept() {
@@ -665,12 +693,13 @@ impl Node {
             if !m.from.is_empty() && !m.from_addr.is_empty() {
                 self.routes.insert(m.from.clone(), m.from_addr.clone());
             }
-            let sends = {
+            let (sends, ops) = {
                 let mounted = self.agents.get_mut(&uuid).expect("local uuid is mounted");
                 crate::flow!("[{}] ← {} : {}", mounted.alias, m.from, String::from_utf8_lossy(&m.unl));
                 let _ = mounted.runtime.config(&m.from, &m.unl, &m.body);
-                mounted.runtime.take_sends()
+                (mounted.runtime.take_sends(), mounted.runtime.take_timer_ops())
             };
+            self.apply_timer_ops(&uuid, ops);
             for s in sends {
                 let next = NodeMsg {
                     to: s.receiver,
@@ -720,6 +749,68 @@ impl Node {
             self.pump(m);
         } else {
             self.wire_or_sink(m);
+        }
+    }
+
+    /// Apply an agent's timer requests (M3), gated by the `Time` capability and the
+    /// per-agent slot budget. Denials are silent to the agent, logged node-side.
+    fn apply_timer_ops(&mut self, uuid: &str, ops: Vec<TimerOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        if !self.granted(uuid, Capability::Time) {
+            crate::flow!("[{}] ⛔ timer denied for '{}' (no Time grant)", self.label, uuid);
+            return;
+        }
+        let budget = self.agents.get(uuid).map(|m| m.grant.budget.timers as usize).unwrap_or(0);
+        let now = now_ms();
+        let slots = self.timers.entry(uuid.to_string()).or_default();
+        for op in ops {
+            match op {
+                TimerOp::Set { id, delay_ms } => {
+                    if !slots.contains_key(&id) && slots.len() >= budget {
+                        crate::flow!("[{}] ⛔ timer budget exhausted for '{}'", self.label, uuid);
+                        continue;
+                    }
+                    slots.insert(id, now.saturating_add(delay_ms));
+                }
+                TimerOp::Cancel { id } => {
+                    slots.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Fire a due timer: run the agent's `tick`, then route its sends and apply any
+    /// timers it (re-)armed.
+    fn fire_tick(&mut self, uuid: &str, timer_id: u64) {
+        let now = now_ms();
+        let (sends, ops) = {
+            let Some(m) = self.agents.get_mut(uuid) else { return };
+            let _ = m.runtime.tick(timer_id, now);
+            (m.runtime.take_sends(), m.runtime.take_timer_ops())
+        };
+        self.apply_timer_ops(uuid, ops);
+        self.dispatch(uuid, sends);
+    }
+
+    /// Route a batch of an agent's emitted sends (as `from`): co-located → in-process
+    /// via the executor, cross-node → sealed over Noise / sink.
+    fn dispatch(&mut self, from: &str, sends: Vec<OutboundIntent>) {
+        for s in sends {
+            let next = NodeMsg {
+                to: s.receiver,
+                from: from.into(),
+                from_addr: self.addr.clone(),
+                unl: s.unl,
+                body: s.body,
+                ..Default::default()
+            };
+            if self.local_uuid(&next.to).is_some() {
+                self.pump(next);
+            } else {
+                self.wire_or_sink(next);
+            }
         }
     }
 
@@ -871,6 +962,38 @@ mod tests {
         n.inject(b"obj(kick, x)", b""); // local kick → primary → bee → result
         let got = rx.recv_timeout(Duration::from_secs(2)).expect("result surfaced in-process");
         assert_eq!(String::from_utf8_lossy(&got.unl), "obj(pong, x)");
+    }
+
+    #[test]
+    fn timer_fires_a_tick_for_autonomy() {
+        struct Ticker;
+        impl Agent for Ticker {
+            fn on_message(&mut self, unl: &str, _b: &[u8], ctx: &mut Ctx) {
+                if unl.contains("arm") {
+                    ctx.set_timer(7, 30); // fire in ~30ms, with no further message
+                }
+            }
+            fn on_tick(&mut self, timer_id: u64, _now: u64, ctx: &mut Ctx) {
+                ctx.send("result", format!("obj(fired, {timer_id})"), Vec::new());
+            }
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut n = Node::new("T", "t", &addr, Box::new(NativeRuntime::new(Ticker)));
+        n.set_sink(tx);
+        let (ktx, krx) = mpsc::channel();
+        n.set_kick(krx);
+        let sd = shutdown.clone();
+        let h = thread::spawn(move || n.serve(l, sd));
+
+        ktx.send((b"obj(arm, x)".to_vec(), Vec::new())).unwrap(); // arm the timer
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect("the timer should fire a tick");
+        assert_eq!(String::from_utf8_lossy(&got.unl), "obj(fired, 7)");
+
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().ok();
     }
 
     #[test]

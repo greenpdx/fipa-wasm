@@ -44,6 +44,15 @@ pub struct Outgoing {
     pub body: Vec<u8>,
 }
 
+/// A timer request an agent makes via [`Ctx::set_timer`] / [`Ctx::cancel_timer`].
+/// The host schedules it (subject to the `Time` grant + slot budget) and later
+/// calls [`Agent::on_tick`] when it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerOp {
+    Set { id: u64, delay_ms: u64 },
+    Cancel { id: u64 },
+}
+
 /// The per-call context handed to an agent: the sender of the current message,
 /// and a sink for outgoing replies. The host driver sets the sender and drains
 /// the replies, so the agent is oblivious to whether it runs native or in wasm.
@@ -51,6 +60,7 @@ pub struct Outgoing {
 pub struct Ctx {
     from: String,
     sends: Vec<Outgoing>,
+    timers: Vec<TimerOp>,
 }
 
 impl Ctx {
@@ -79,6 +89,23 @@ impl Ctx {
     pub fn take(&mut self) -> Vec<Outgoing> {
         core::mem::take(&mut self.sends)
     }
+
+    /// Arm timer `id` to fire after `delay_ms` (the host then calls
+    /// [`Agent::on_tick`]). Requires the `Time` capability; over the slot budget
+    /// the host silently drops it (the agent sees a uniform denial).
+    pub fn set_timer(&mut self, id: u64, delay_ms: u64) {
+        self.timers.push(TimerOp::Set { id, delay_ms });
+    }
+
+    /// Cancel timer `id`.
+    pub fn cancel_timer(&mut self, id: u64) {
+        self.timers.push(TimerOp::Cancel { id });
+    }
+
+    /// Drain the timer requests emitted during this call (host-internal).
+    pub fn take_timers(&mut self) -> Vec<TimerOp> {
+        core::mem::take(&mut self.timers)
+    }
 }
 
 /// An agent. The same trait whether the agent is compiled native or to wasm32.
@@ -103,6 +130,11 @@ pub trait Agent {
 
     /// Restore state previously captured by [`Agent::snapshot`] (default: ignore).
     fn restore(&mut self, _state: &[u8]) {}
+
+    /// Called when a timer armed via [`Ctx::set_timer`] fires (default: ignore).
+    /// `now_ms` is wall-clock milliseconds; reply or re-arm via `ctx`. This is what
+    /// makes an agent **autonomous** — it can act without an inbound message.
+    fn on_tick(&mut self, _timer_id: u64, _now_ms: u64, _ctx: &mut Ctx) {}
 }
 
 // ─────────────────────────────  wasm32 glue  ─────────────────────────────

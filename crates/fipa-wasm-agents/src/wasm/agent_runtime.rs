@@ -40,6 +40,16 @@ pub trait AgentRuntime {
 
     /// Restore migrated state captured by [`AgentRuntime::snapshot`] (default: ignore).
     fn restore(&mut self, _state: &[u8]) {}
+
+    /// Fire a scheduled timer tick into the agent (default: no-op).
+    fn tick(&mut self, _timer_id: u64, _now_ms: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Drain the timer requests the agent made this call (default: none).
+    fn take_timer_ops(&mut self) -> Vec<unl_agent::TimerOp> {
+        Vec::new()
+    }
 }
 
 impl AgentRuntime for super::WasmRuntime {
@@ -84,11 +94,12 @@ impl AgentRuntime for super::WasmRuntime {
 pub struct NativeRuntime<A: Agent> {
     agent: A,
     outbox: Vec<OutboundIntent>,
+    timer_ops: Vec<unl_agent::TimerOp>,
 }
 
 impl<A: Agent> NativeRuntime<A> {
     pub fn new(agent: A) -> Self {
-        NativeRuntime { agent, outbox: Vec::new() }
+        NativeRuntime { agent, outbox: Vec::new(), timer_ops: Vec::new() }
     }
 
     /// Run one agent call with **fault isolation**: a panic is caught so it can
@@ -110,6 +121,7 @@ impl<A: Agent> NativeRuntime<A> {
                         body: out.body,
                     });
                 }
+                self.timer_ops.extend(ctx.take_timers());
                 Ok(())
             }
             Err(_) => Err(anyhow::anyhow!("native agent panicked; output discarded")),
@@ -145,6 +157,14 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
 
     fn restore(&mut self, state: &[u8]) {
         self.agent.restore(state);
+    }
+
+    fn tick(&mut self, timer_id: u64, now_ms: u64) -> Result<()> {
+        self.guarded(|a, ctx| a.on_tick(timer_id, now_ms, ctx))
+    }
+
+    fn take_timer_ops(&mut self) -> Vec<unl_agent::TimerOp> {
+        std::mem::take(&mut self.timer_ops)
     }
 }
 
