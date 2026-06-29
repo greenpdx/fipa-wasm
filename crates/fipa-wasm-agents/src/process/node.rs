@@ -139,6 +139,40 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
+/// Handle one accepted connection in its own thread (so a slow or hostile peer
+/// cannot stall the accept loop or the single-threaded agent executor, H3/R7):
+/// run the Noise handshake, read one frame, and hand it to the node's main loop —
+/// a decoded message via `in_tx`, or a RESOLVE request via `rz_tx` (answered by
+/// the main loop, which owns the agents).
+fn handle_conn(
+    mut s: TcpStream,
+    noise: &NodeNoise,
+    in_tx: &Sender<NodeMsg>,
+    rz_tx: &Sender<(String, Sender<String>)>,
+) {
+    s.set_read_timeout(Some(DIAL_TIMEOUT)).ok();
+    s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
+    let Ok(mut sess) = noise.accept(&mut s) else { return };
+    let Ok((kind, payload)) = sess.recv(&mut s) else { return };
+    match kind {
+        KIND_MSG => {
+            if let Some(m) = decode_msg(&payload) {
+                let _ = in_tx.send(m);
+            }
+        }
+        KIND_RESOLVE_REQ => {
+            let uuid = String::from_utf8_lossy(&payload).to_string();
+            let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+            if rz_tx.send((uuid, resp_tx)).is_ok() {
+                if let Ok(addr) = resp_rx.recv_timeout(DIAL_TIMEOUT) {
+                    let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── the node ────────────────────────────────────────────────────────────
 
 /// One mounted agent: its identity, friendly alias, runtime, and offered service.
@@ -287,9 +321,16 @@ impl Node {
     /// Serve until `shutdown`: accept connections, gate+deliver messages, answer
     /// RESOLVE requests (from the local AMS agent).
     pub fn serve(&mut self, listener: TcpListener, shutdown: Arc<AtomicBool>) {
+        use std::sync::atomic::AtomicUsize;
+        const MAX_CONNS: usize = 64; // bound concurrent handshakes under a flood
+
         listener.set_nonblocking(true).ok();
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
+        let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
+        let conns = Arc::new(AtomicUsize::new(0));
+
         while !shutdown.load(Ordering::Relaxed) {
-            // Drain local kickoff injections (trusted, in-process — never the wire).
+            // 1. Local kickoff injections (trusted, in-process — never the wire).
             let mut kicks = Vec::new();
             if let Some(rx) = &self.kick_rx {
                 while let Ok(k) = rx.try_recv() {
@@ -301,28 +342,31 @@ impl Node {
                 self.pump(NodeMsg { to: to.clone(), from: to, unl, body, ..Default::default() });
             }
 
+            // 2. Messages decoded by connection threads → wire gate + executor.
+            while let Ok(m) = in_rx.try_recv() {
+                self.accept_wire(m);
+            }
+
+            // 3. RESOLVE requests from connection threads → answer from local AMS.
+            while let Ok((uuid, resp)) = rz_rx.try_recv() {
+                let addr = self.resolve_local(&uuid).unwrap_or_default();
+                let _ = resp.send(addr);
+            }
+
+            // 4. Accept new connections; each is handshaked + read in its own thread
+            //    so a slow peer cannot stall the loop (H3/R7). Shed load past the cap.
             match listener.accept() {
-                Ok((mut s, _)) => {
-                    s.set_read_timeout(Some(DIAL_TIMEOUT)).ok();
-                    s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
-                    // R2: every connection begins with a Noise XX handshake — an
-                    // un-handshaked (plaintext / unauthenticated) peer gets nowhere.
-                    let Ok(mut sess) = self.noise.accept(&mut s) else { continue };
-                    if let Ok((kind, payload)) = sess.recv(&mut s) {
-                        match kind {
-                            KIND_MSG => {
-                                if let Some(m) = decode_msg(&payload) {
-                                    self.accept_wire(m);
-                                }
-                            }
-                            KIND_RESOLVE_REQ => {
-                                let uuid = String::from_utf8_lossy(&payload).to_string();
-                                let addr = self.resolve_local(&uuid).unwrap_or_default();
-                                let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
-                            }
-                            _ => {}
-                        }
+                Ok((s, _)) => {
+                    if conns.load(Ordering::Relaxed) >= MAX_CONNS {
+                        continue; // drop (the connection closes) — bounded resource use
                     }
+                    conns.fetch_add(1, Ordering::Relaxed);
+                    let (noise, in_tx, rz_tx, conns2) =
+                        (self.noise.clone(), in_tx.clone(), rz_tx.clone(), conns.clone());
+                    std::thread::spawn(move || {
+                        handle_conn(s, &noise, &in_tx, &rz_tx);
+                        conns2.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(2));

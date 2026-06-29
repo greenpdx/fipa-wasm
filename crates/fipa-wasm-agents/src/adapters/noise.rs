@@ -45,7 +45,9 @@ fn read_blob(s: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
-/// A node's static Noise identity (X25519). Secret-side only.
+/// A node's static Noise identity (X25519). Secret-side only. Cloneable so each
+/// connection-handling thread can run its own handshake.
+#[derive(Clone)]
 pub struct NodeNoise {
     private: Vec<u8>,
 }
