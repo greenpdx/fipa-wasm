@@ -141,7 +141,7 @@ A node MAY link a reduced ABI on IoT for footprint; because mismatches are caugh
 | Capability | `normal` | `iot` | Tier |
 |---|---|---|---|
 | `messaging` | ✓ | ✓ | core |
-| `discovery` | async, federated, multi-result | sync, local DF, single best | core |
+| `discovery` | federated, multi-result | local DF, single best | core |
 | `log` | ✓ | ✓ | core |
 | `state` | ✓ (MB) | ✓ (KB) | opt-in |
 | `time` | ✓ (many slots) | ✓ (few slots) | opt-in |
@@ -152,6 +152,12 @@ A node MAY link a reduced ABI on IoT for footprint; because mismatches are caugh
 
 An agent that wants to be maximally mobile declares `profile: "iot"` or `"either"`
 and requests only IoT-available grants; it is then admissible on any node shape.
+
+**Discovery keeps the async *shape* on every profile** — `find_service`/`locate`
+always return a `request_id` and reply by message (§8), even where an IoT node
+resolves the answer instantly and replies on the next tick. This preserves a single
+agent code path across profiles; only the *quality* of the answer (federated vs
+local, multi vs single) differs, never the ABI shape.
 
 ---
 
@@ -205,6 +211,30 @@ Design rules:
   stalls.
 - `discovery` is a *typed façade* over the node's AMS/DF platform agents — promotion
   to host-calls does not bypass or replace them.
+
+### 7.1 Where LLM processing happens
+
+LLM inference is always a **node service** — never the agent. It lives behind one
+adapter (`LlmBackend`, an `unl_llm::ReasoningBackend`) and is reached two ways:
+
+- **as a brain** — an `llm`-brained agent: the node runs inference *as* the agent's
+  think step (`LlmRuntime` maps each `deliver` → prompt → inference → outbound);
+- **as a capability** — a wasm/native agent calls `infer(prompt)` as a tool and gets
+  the result back by message (§8).
+
+Both go through the same adapter, which decides *where the model runs*:
+
+| `LLM` block | backend | where compute runs |
+|---|---|---|
+| weights (bytes) | embedded / local | in-node (CPU/GPU) |
+| `ollama:<model>` | `OllamaBackend` | local Ollama (edge, CPU-only) |
+| URL / model-id | HTTP backend | remote hosted API |
+| (browser) URL or WebGPU | fetch / WebGPU | remote, or in-page GPU |
+
+The node always mediates: it checks the `llm` grant, meters the **cost budget**,
+holds the model and keys (the agent never sees them), logs the call, and for UNL
+agents **constrains and validates** the output (`unl-llm`: the model proposes, the
+validator disposes). **IoT denies `llm` outright.**
 
 ---
 
@@ -260,6 +290,13 @@ Two times, two audiences:
   disallowed call — ungranted-by-manifest, absent-by-profile, over-budget,
   rate-limited, scope-violation — returns the **same opaque `denied`**. The agent
   cannot tell the reasons apart and cannot probe the host.
+
+**Denial vs operational failure.** The uniform opaque `denied` covers only
+*permission / capability / budget gate* failures — the anti-probing surface. The
+*operational outcome* of a **granted** call is informative: `find_service` with no
+provider, `infer` against an unreachable model, or `verify` returning false are the
+legitimate answers to a call the agent was allowed to make, and are delivered as
+normal (async) replies (§8). Gate failures are opaque; granted-call results are not.
 
 Budgets enforced at runtime: memory, fuel/CPU, state quota, timer slots, outbound
 message rate, in-flight async cap. Exceeding any → `denied` (for a call) or
