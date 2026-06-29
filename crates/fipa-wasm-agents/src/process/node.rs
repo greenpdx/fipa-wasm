@@ -54,6 +54,7 @@ const KIND_RESOLVE_RESP: u8 = 3;
 const KIND_MIGRATE: u8 = 4;
 const KIND_CODE_FETCH: u8 = 5; // request a wasm module by content hash
 const KIND_CODE_BLOB: u8 = 6; // the module bytes (empty = unknown hash)
+const KIND_MIGRATE_ACK: u8 = 7; // destination confirms it mounted the migrated agent
 
 /// A short dial timeout bounds connect/read/write so a slow or hostile peer cannot
 /// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3). The frame-size
@@ -256,7 +257,7 @@ fn handle_conn(
     noise: &NodeNoise,
     in_tx: &Sender<NodeMsg>,
     rz_tx: &Sender<(String, Sender<String>)>,
-    mg_tx: &Sender<Vec<u8>>,
+    mg_tx: &Sender<(Vec<u8>, Sender<bool>)>,
     code_store: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
 ) {
     s.set_read_timeout(Some(DIAL_TIMEOUT)).ok(); // bound the handshake
@@ -278,7 +279,12 @@ fn handle_conn(
                 // keep reading — the channel is persistent
             }
             KIND_MIGRATE => {
-                let _ = mg_tx.send(payload); // hand the move payload to the main loop
+                let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+                if mg_tx.send((payload, resp_tx)).is_ok() {
+                    if let Ok(true) = resp_rx.recv_timeout(Duration::from_secs(5)) {
+                        let _ = sess.send(&mut s, KIND_MIGRATE_ACK, b""); // confirm mount
+                    }
+                }
                 return; // one-shot
             }
             KIND_RESOLVE_REQ => {
@@ -700,6 +706,12 @@ impl Node {
         let mut s = dial(dest_addr)?;
         let mut sess = self.noise.connect(&mut s)?;
         sess.send(&mut s, KIND_MIGRATE, &payload)?;
+        // Crash-safety: tombstone the local copy only after the destination confirms
+        // it mounted the agent (KIND_MIGRATE_ACK); otherwise the agent is kept (no loss).
+        let (kind, _) = sess.recv(&mut s)?;
+        if kind != KIND_MIGRATE_ACK {
+            return Err(io::Error::new(io::ErrorKind::Other, "migration not acknowledged"));
+        }
         if let Some(m) = self.agents.remove(uuid) {
             self.aliases.remove(&m.alias);
         }
@@ -804,7 +816,7 @@ impl Node {
         listener.set_nonblocking(true).ok();
         let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
         let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
-        let (mg_tx, mg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (mg_tx, mg_rx) = std::sync::mpsc::channel::<(Vec<u8>, Sender<bool>)>();
         let (llm_tx, llm_rx) = std::sync::mpsc::channel::<(String, u64, String)>();
         let conns = Arc::new(AtomicUsize::new(0));
 
@@ -832,9 +844,12 @@ impl Node {
                 let _ = resp.send(addr);
             }
 
-            // 3b. Migrated agents handed over by a connection thread (M5).
-            while let Ok(payload) = mg_rx.try_recv() {
+            // 3b. Migrated agents handed over by a connection thread; confirm mount
+            //     so the source can safely tombstone (crash-safety).
+            while let Ok((payload, resp)) = mg_rx.try_recv() {
+                let uuid = MigratePayload::decode(&payload).map(|mp| mp.snapshot.uuid).unwrap_or_default();
                 self.process_migrate(&payload);
+                let _ = resp.send(!uuid.is_empty() && self.agents.contains_key(&uuid));
             }
 
             // 3c. Fire any due timers (M3 scheduling — agent autonomy).
@@ -1621,6 +1636,34 @@ mod tests {
         // iot offers no llm → load-time rejection, operator-facing
         let r = a.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::Llm]), None);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn migrate_tombstones_only_after_destination_acks() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dst = Node::new("d-seed", "d", &addr, Box::new(NativeRuntime::new(Ponger)));
+        let dst_pub = dst.node_pub();
+        let sd = shutdown.clone();
+        let h = thread::spawn(move || {
+            let mut dst = dst;
+            dst.serve(l, sd);
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut src = Node::new("s-seed", "s", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        src.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
+        src.migrate("CTR", &addr, &dst_pub).unwrap(); // round-trips; tombstones on ack
+        assert!(!src.agents.contains_key("CTR")); // dropped only after the dest confirmed
+
+        // a migration to an unreachable destination FAILS and keeps the agent (no loss)
+        src.mount_wasm("CTR2", "ctr2", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
+        assert!(src.migrate("CTR2", "127.0.0.1:1", &dst_pub).is_err());
+        assert!(src.agents.contains_key("CTR2")); // kept — not lost
+
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().ok();
     }
 
     #[test]
