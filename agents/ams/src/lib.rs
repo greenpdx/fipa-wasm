@@ -103,12 +103,17 @@ impl Agent for Ams {
         let from = ctx.from().to_string();
         match action.as_str() {
             "bind" => {
-                if let (Some(agent), Some(addr)) =
-                    (json_field(body, "agent"), json_field(body, "address"))
-                {
-                    self.records.insert(agent, addr);
+                // R3: an agent binds only itself — the authenticated sender must be
+                // the agent being bound, else the bind is refused (THREAT_MODEL C2).
+                match (json_field(body, "agent"), json_field(body, "address")) {
+                    (Some(agent), Some(addr)) if agent == from => {
+                        self.records.insert(agent, addr);
+                        ctx.send(from, "obj(bound, agent)", Vec::new());
+                    }
+                    _ => {
+                        ctx.send(from, "obj(refuse, agent)", Vec::new());
+                    }
                 }
-                ctx.send(from, "obj(bound, agent)", Vec::new());
             }
             "locate" => {
                 let Some(agent) = json_field(body, "agent") else {
@@ -177,6 +182,15 @@ mod tests {
         assert_eq!(out[0].unl, "obj(at, agent)");
         assert_eq!(json_field(&out[0].body, "agent").unwrap(), "S"); // echoed for correlation
         assert_eq!(json_field(&out[0].body, "address").unwrap(), "127.0.0.1:9001");
+    }
+
+    #[test]
+    fn bind_of_another_agent_is_refused() {
+        // R3: sender "attacker" tries to bind victim "V" → refused, no record.
+        let mut ams = Ams::new();
+        let out = run(&mut ams, "attacker", "obj(bind, agent)", br#"{"agent":"V","address":"6.6.6.6:9000"}"#);
+        assert_eq!(out[0].unl, "obj(refuse, agent)");
+        assert!(ams.address("V").is_none());
     }
 
     #[test]

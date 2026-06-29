@@ -180,6 +180,7 @@ pub struct Node {
     ams_addr: Option<String>,            // where to RESOLVE unknown UUIDs
     sink: Option<Sender<NodeMsg>>,       // undeliverable (e.g. "result")
     key: NodeCrypto,                     // this node's Ed25519 identity (signs/verifies)
+    keys: HashMap<String, [u8; 32]>,     // R3: from-uuid -> authorized node pubkey (TOFU)
 }
 
 impl Node {
@@ -193,6 +194,7 @@ impl Node {
             ams_addr: None,
             sink: None,
             key: NodeCrypto::generate(),
+            keys: HashMap::new(),
         }
     }
 
@@ -310,7 +312,32 @@ impl Node {
             );
             return;
         }
+        if !self.authorize(&msg) {
+            crate::flow!(
+                "[{}] ⛔ impersonation of '{}' — sender key ≠ first-seen (TOFU)",
+                self.alias,
+                msg.from
+            );
+            return;
+        }
         self.deliver_local(msg);
+    }
+
+    /// R3: trust-on-first-use from-authorization. The first node key seen signing
+    /// for a given `from` uuid owns it; a later message claiming that uuid under a
+    /// different key is rejected as impersonation (`THREAT_MODEL.md` C1/C2/C5).
+    /// Authoritative AMS-distributed keys + owner delegation (`MOBILITY.md` §7)
+    /// strengthen this in M5.
+    fn authorize(&mut self, m: &NodeMsg) -> bool {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&m.sender_pub); // length already checked in wire_admit
+        match self.keys.get(&m.from) {
+            Some(known) => *known == pk,
+            None => {
+                self.keys.insert(m.from.clone(), pk);
+                true
+            }
+        }
     }
 
     /// Admission check for a message arriving over the wire: not a reserved sender,
@@ -431,6 +458,15 @@ mod tests {
         Node::new("N", "n", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)))
     }
 
+    /// Build a NodeMsg from `from`, signed by an arbitrary node key `k`.
+    fn signed_by(k: &NodeCrypto, from: &str) -> NodeMsg {
+        let mut m = NodeMsg { to: "x".into(), from: from.into(), ..Default::default() };
+        m.sender_pub = k.public_key().to_vec();
+        m.nonce = k.nonce().to_vec();
+        m.sig = k.sign(&signing_bytes(&m)).to_vec();
+        m
+    }
+
     #[test]
     fn read_frame_rejects_oversized_length() {
         // kind=1, len = MAX_FRAME+1, then nothing: must error before allocating.
@@ -460,6 +496,20 @@ mod tests {
             n.seal(&mut m); // even a valid signature can't launder a reserved sender
             assert!(!n.wire_admit(&m), "reserved '{who}' must be rejected");
         }
+    }
+
+    #[test]
+    fn authorize_is_tofu_and_rejects_impersonation() {
+        let mut n = dummy_node();
+        let (k1, k2) = (NodeCrypto::generate(), NodeCrypto::generate());
+
+        let first = signed_by(&k1, "X");
+        assert!(n.wire_admit(&first) && n.authorize(&first)); // first key for X — owns it
+        assert!(n.authorize(&signed_by(&k1, "X"))); // same key — still fine
+
+        let impostor = signed_by(&k2, "X");
+        assert!(n.wire_admit(&impostor)); // the signature itself is valid...
+        assert!(!n.authorize(&impostor)); // ...but it's a different key for X → rejected
     }
 
     #[test]
