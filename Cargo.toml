@@ -23,6 +23,7 @@ members = [
     "agents/ams",
     "agents/pa",
     "agents/ba",
+    "agents/bs",
     "xtask",
 ]
 

@@ -1,0 +1,80 @@
+# Five FIPA nodes, one agent each, on a Docker network — cross-node over IP.
+#
+# Same base image (fipa-node:base); each service "adds" its agent via FIPA_AGENT.
+# Containers reach each other by service name (Docker DNS → container IP), which
+# is the address AMS hands out and nodes route to.
+#
+#   docker build -t fipa-node:base -f docker/Dockerfile ..
+#   docker compose -f docker/docker-compose.yml up
+#
+# Watch the `ba` service: it prints `RESULT → 'result' : obj(bought, LtG) ...`.
+
+x-node: &node
+  image: fipa-node:base
+  networks: [fipa]
+  restart: on-failure
+
+services:
+  # White pages (AMS) and yellow pages (DF) — the platform roots; no upstream.
+  ams:
+    <<: *node
+    environment:
+      FIPA_AGENT: ams
+      FIPA_ADVERTISE: ams:9000
+    volumes: [ams-data:/data]
+
+  df:
+    <<: *node
+    environment:
+      FIPA_AGENT: df
+      FIPA_ADVERTISE: df:9000
+    volumes: [df-data:/data]
+
+  # Escrow. Seeded so the (pinned) buyer UUID has funds.
+  pa:
+    <<: *node
+    depends_on: [ams, df]
+    environment:
+      FIPA_AGENT: pa
+      FIPA_ADVERTISE: pa:9000
+      FIPA_AMS: ams:9000
+      FIPA_DF: df:9000
+      FIPA_SEED: '{"ledger":{"ba000000000000000000000000000000":10000}}'
+    volumes: [pa-data:/data]
+
+  # Seller — registers "bookselling" with DF and its address with AMS at startup.
+  bs:
+    <<: *node
+    depends_on: [ams, df]
+    environment:
+      FIPA_AGENT: bs
+      FIPA_ADVERTISE: bs:9000
+      FIPA_AMS: ams:9000
+      FIPA_DF: df:9000
+      FIPA_PA: pa:9000
+    volumes: [bs-data:/data]
+
+  # Buyer — UUID pinned (so PA can be pre-funded); kicks off after discovery is up.
+  ba:
+    <<: *node
+    depends_on: [ams, df, pa, bs]
+    environment:
+      FIPA_AGENT: ba
+      FIPA_ADVERTISE: ba:9000
+      FIPA_AMS: ams:9000
+      FIPA_DF: df:9000
+      FIPA_PA: pa:9000
+      FIPA_UUID: ba000000000000000000000000000000
+      FIPA_BOOT_DELAY: "2"
+      FIPA_KICK: "4"
+    volumes: [ba-data:/data]
+
+networks:
+  fipa: {}
+
+volumes:
+  ams-data: {}
+  df-data: {}
+  pa-data: {}
+  bs-data: {}
+  ba-data: {}

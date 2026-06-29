@@ -111,6 +111,7 @@ df-agent = { path = "../../agents/df" }
 ams-agent = { path = "../../agents/ams" }
 pa-agent = { path = "../../agents/pa" }
 ba-agent = { path = "../../agents/ba" }
+bs-agent = { path = "../../agents/bs" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -153,6 +154,14 @@ path = "src/bin/agent_host.rs"
 [[bin]]
 name = "book-demo"
 path = "src/bin/book_demo.rs"
+
+[[bin]]
+name = "mesh-node"
+path = "src/bin/mesh_node.rs"
+
+[[bin]]
+name = "book-cluster"
+path = "src/bin/book_cluster.rs"
 
 [lib]
 name = "fipa_wasm_agents"
