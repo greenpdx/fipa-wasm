@@ -30,6 +30,7 @@ anyhow = "1.0"
 sha2 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 rand = "0.9"
+snow = "0.9"  # Noise protocol — authenticated, encrypted node transport (R2)
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }

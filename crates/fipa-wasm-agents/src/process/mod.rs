@@ -28,7 +28,7 @@ mod resolve;
 mod router;
 pub use agents::native_agent;
 pub use manage::{build_runtime, build_wasm, ManagedAgent, Profile, Recipe};
-pub use node::{send_message, Node, NodeMsg};
+pub use node::{Node, NodeMsg};
 pub use resolve::{resolve, Resolution};
 pub use router::{Envelope, Router};
 

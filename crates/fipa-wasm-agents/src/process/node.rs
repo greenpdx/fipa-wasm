@@ -32,26 +32,23 @@
 //!   request to the AMS node (unsigned control frame; authenticating it is R3/M2).
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::adapters::{self, NodeCrypto};
+use crate::adapters::{self, NodeCrypto, NodeNoise};
 use crate::wasm::AgentRuntime;
 
 const KIND_MSG: u8 = 1;
 const KIND_RESOLVE_REQ: u8 = 2;
 const KIND_RESOLVE_RESP: u8 = 3;
 
-/// Hard cap on a single wire frame (R4) — reject before allocating, so a forged
-/// length cannot exhaust memory (`THREAT_MODEL.md` C4).
-const MAX_FRAME: usize = 1 << 20; // 1 MiB
-
 /// A short dial timeout bounds connect/read/write so a slow or hostile peer cannot
-/// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3).
+/// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3). The frame-size
+/// cap now lives in the Noise transport ([`crate::adapters::noise`]).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A message in flight between nodes. `from_addr` is the sender's return address;
@@ -89,26 +86,6 @@ fn get(buf: &[u8], p: &mut usize) -> Option<Vec<u8>> {
     let v = buf[*p..*p + n].to_vec();
     *p += n;
     Some(v)
-}
-
-fn write_frame(s: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    s.write_all(&[kind])?;
-    s.write_all(&(payload.len() as u32).to_be_bytes())?;
-    s.write_all(payload)?;
-    s.flush()
-}
-fn read_frame(s: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
-    let mut k = [0u8; 1];
-    s.read_exact(&mut k)?;
-    let mut l = [0u8; 4];
-    s.read_exact(&mut l)?;
-    let n = u32::from_be_bytes(l) as usize;
-    if n > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
-    }
-    let mut p = vec![0u8; n];
-    s.read_exact(&mut p)?;
-    Ok((k[0], p))
 }
 
 fn encode_msg(m: &NodeMsg) -> Vec<u8> {
@@ -162,12 +139,6 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
-/// Send one (already-sealed) message to a node at `addr`.
-pub fn send_message(addr: &str, m: &NodeMsg) -> io::Result<()> {
-    let mut s = dial(addr)?;
-    write_frame(&mut s, KIND_MSG, &encode_msg(m))
-}
-
 // ── the node ────────────────────────────────────────────────────────────
 
 /// A node: one agent, a TCP address, a routing table, and a signing key.
@@ -181,6 +152,8 @@ pub struct Node {
     sink: Option<Sender<NodeMsg>>,       // undeliverable (e.g. "result")
     key: NodeCrypto,                     // this node's Ed25519 identity (signs/verifies)
     keys: HashMap<String, [u8; 32]>,     // R3: from-uuid -> authorized node pubkey (TOFU)
+    noise: NodeNoise,                    // R2: static Noise identity (encrypts the channel)
+    kick_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>, // local, trusted kickoff injections
 }
 
 impl Node {
@@ -195,6 +168,8 @@ impl Node {
             sink: None,
             key: NodeCrypto::generate(),
             keys: HashMap::new(),
+            noise: NodeNoise::generate(),
+            kick_rx: None,
         }
     }
 
@@ -203,6 +178,20 @@ impl Node {
     pub fn load_key(&mut self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
         self.key = NodeCrypto::load_or_mint(path)?;
         Ok(())
+    }
+
+    /// Use a persisted Noise static key at `path` (R2) so the node's channel
+    /// identity is stable across restarts.
+    pub fn load_noise(&mut self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
+        self.noise = NodeNoise::load_or_mint(path)?;
+        Ok(())
+    }
+
+    /// Provide a channel of local, trusted kickoff injections `(unl, body)`. The
+    /// serve loop delivers them in-process — they never touch the wire (so a
+    /// kickoff needs no reserved `boot` sender, `THREAT_MODEL.md` C5).
+    pub fn set_kick(&mut self, rx: Receiver<(Vec<u8>, Vec<u8>)>) {
+        self.kick_rx = Some(rx);
     }
 
     /// Bootstrap: a well-known peer (alias or UUID) lives at `addr`.
@@ -242,22 +231,6 @@ impl Node {
         m.sig = self.key.sign(&signing_bytes(m)).to_vec();
     }
 
-    /// Build a self-addressed, self-signed kickoff message — the authenticated
-    /// replacement for an unauthenticated `boot` send. The node sends this to its
-    /// own listener to start its agent (e.g. the buyer's purchase).
-    pub fn sealed_kick(&self, unl: &[u8], body: &[u8]) -> NodeMsg {
-        let mut m = NodeMsg {
-            to: self.me.clone(),
-            from: self.me.clone(),
-            from_addr: self.addr.clone(),
-            unl: unl.to_vec(),
-            body: body.to_vec(),
-            ..Default::default()
-        };
-        self.seal(&mut m);
-        m
-    }
-
     /// Inject a *local* message (trusted, in-process) — bypasses the wire gate.
     pub fn inject(&mut self, unl: &[u8], body: &[u8]) {
         self.deliver_local(NodeMsg {
@@ -274,10 +247,31 @@ impl Node {
     pub fn serve(&mut self, listener: TcpListener, shutdown: Arc<AtomicBool>) {
         listener.set_nonblocking(true).ok();
         while !shutdown.load(Ordering::Relaxed) {
+            // Drain local kickoff injections (trusted, in-process — never the wire).
+            let mut kicks = Vec::new();
+            if let Some(rx) = &self.kick_rx {
+                while let Ok(k) = rx.try_recv() {
+                    kicks.push(k);
+                }
+            }
+            for (unl, body) in kicks {
+                self.deliver_local(NodeMsg {
+                    to: self.me.clone(),
+                    from: self.me.clone(),
+                    unl,
+                    body,
+                    ..Default::default()
+                });
+            }
+
             match listener.accept() {
                 Ok((mut s, _)) => {
                     s.set_read_timeout(Some(DIAL_TIMEOUT)).ok();
-                    if let Ok((kind, payload)) = read_frame(&mut s) {
+                    s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
+                    // R2: every connection begins with a Noise XX handshake — an
+                    // un-handshaked (plaintext / unauthenticated) peer gets nowhere.
+                    let Ok(mut sess) = self.noise.accept(&mut s) else { continue };
+                    if let Ok((kind, payload)) = sess.recv(&mut s) {
                         match kind {
                             KIND_MSG => {
                                 if let Some(m) = decode_msg(&payload) {
@@ -287,7 +281,7 @@ impl Node {
                             KIND_RESOLVE_REQ => {
                                 let uuid = String::from_utf8_lossy(&payload).to_string();
                                 let addr = self.resolve_local(&uuid).unwrap_or_default();
-                                let _ = write_frame(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
+                                let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
                             }
                             _ => {}
                         }
@@ -383,7 +377,7 @@ impl Node {
         self.seal(&mut m);
         match self.address_of(to) {
             Some(addr) => {
-                let _ = send_message(&addr, &m);
+                let _ = self.send_to(&addr, &m);
             }
             None => {
                 if let Some(sink) = &self.sink {
@@ -393,6 +387,14 @@ impl Node {
         }
     }
 
+    /// Send one sealed message to `addr` over a fresh Noise channel — the R1
+    /// signed envelope travels inside the R2 encrypted, mutually-authenticated link.
+    fn send_to(&self, addr: &str, m: &NodeMsg) -> io::Result<()> {
+        let mut s = dial(addr)?;
+        let mut sess = self.noise.connect(&mut s)?;
+        sess.send(&mut s, KIND_MSG, &encode_msg(m))
+    }
+
     /// Find a recipient's address: bootstrap/cache, else ask the AMS node.
     fn address_of(&mut self, to: &str) -> Option<String> {
         if let Some(a) = self.routes.get(to) {
@@ -400,8 +402,9 @@ impl Node {
         }
         let ams = self.ams_addr.clone()?;
         let mut s = dial(&ams).ok()?;
-        write_frame(&mut s, KIND_RESOLVE_REQ, to.as_bytes()).ok()?;
-        let (kind, payload) = read_frame(&mut s).ok()?;
+        let mut sess = self.noise.connect(&mut s).ok()?;
+        sess.send(&mut s, KIND_RESOLVE_REQ, to.as_bytes()).ok()?;
+        let (kind, payload) = sess.recv(&mut s).ok()?;
         if kind != KIND_RESOLVE_RESP {
             return None;
         }
@@ -468,15 +471,6 @@ mod tests {
     }
 
     #[test]
-    fn read_frame_rejects_oversized_length() {
-        // kind=1, len = MAX_FRAME+1, then nothing: must error before allocating.
-        let mut buf = vec![KIND_MSG];
-        buf.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
-        let mut cur = std::io::Cursor::new(buf);
-        assert!(read_frame(&mut cur).is_err());
-    }
-
-    #[test]
     fn wire_admit_accepts_sealed_self_message_and_rejects_tamper() {
         let n = dummy_node();
         let mut m = NodeMsg { to: "x".into(), from: "agent-uuid".into(), ..Default::default() };
@@ -530,12 +524,13 @@ mod tests {
         let mut na = Node::new("A", "a", &aa, Box::new(NativeRuntime::new(Pinger { target: "b".into() })));
         na.add_route("b", &bb);
         na.set_sink(tx);
-        let kick = na.sealed_kick(b"obj(kick, x)", b""); // authenticated self-kick
+        let (ktx, krx) = mpsc::channel();
+        na.set_kick(krx);
         let sda = shutdown.clone();
         let ha = thread::spawn(move || na.serve(la, sda));
 
-        // Kick A over TCP with its own signed message; A → ping → B → pong → A → result.
-        send_message(&aa, &kick).unwrap();
+        // Kick A locally; A → ping → B (over Noise) → pong → A → result(sink).
+        ktx.send((b"obj(kick, x)".to_vec(), Vec::new())).unwrap();
 
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("A should surface a result");
         assert_eq!(String::from_utf8_lossy(&got.unl), "obj(done, x)");

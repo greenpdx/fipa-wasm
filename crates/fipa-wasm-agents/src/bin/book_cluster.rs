@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use fipa_wasm_agents::identity::{AgentId, Header};
-use fipa_wasm_agents::process::{send_message, Node};
+use fipa_wasm_agents::process::Node;
 use fipa_wasm_agents::wasm::NativeRuntime;
 use uuid::Uuid;
 
@@ -81,13 +81,14 @@ fn main() {
     let mut ba_node = Node::new(&ba.id(), "BA", &ba_a, Box::new(NativeRuntime::new(ba_agent::Buyer::new())));
     platform(&mut ba_node, &ams_a, &df_a, &pa_a);
     ba_node.set_sink(tx);
-    let ba_kick = ba_node.sealed_kick(b"obj(start, buy)", b""); // authenticated self-kick
+    let (kick_tx, kick_rx) = mpsc::channel();
+    ba_node.set_kick(kick_rx);
     serve!(ba_node, lba);
 
     thread::sleep(Duration::from_millis(300)); // registrations settle
 
     println!("  → kicking off the buyer\n");
-    let _ = send_message(&ba_a, &ba_kick);
+    let _ = kick_tx.send((b"obj(start, buy)".to_vec(), Vec::new()));
 
     match rx.recv_timeout(Duration::from_secs(8)) {
         Ok(m) => println!("RESULT: {} {}", String::from_utf8_lossy(&m.unl), String::from_utf8_lossy(&m.body)),

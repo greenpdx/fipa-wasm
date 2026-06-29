@@ -8,7 +8,9 @@
 //! shapes for [`Transport`], [`Clock`], and [`StateStore`].
 
 pub mod crypto;
+pub mod noise;
 pub use crypto::{verify, NodeCrypto};
+pub use noise::{NodeNoise, NoiseSession};
 
 use anyhow::Result;
 
