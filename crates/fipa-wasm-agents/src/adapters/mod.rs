@@ -8,9 +8,11 @@
 //! shapes for [`Transport`], [`Clock`], and [`StateStore`].
 
 pub mod crypto;
+pub mod engine;
 pub mod noise;
 pub mod store;
 pub use crypto::{verify, NodeCrypto};
+pub use engine::{Engine, EngineModule, HostHooks, Limits};
 pub use noise::{NodeNoise, NoiseSession};
 pub use store::SledStore;
 
