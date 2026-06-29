@@ -12,13 +12,14 @@ use anyhow::{anyhow, Result};
 use wasmi::{Caller, Config, Engine as WasmiCore, Extern, Linker, Module, Store, Val};
 
 use crate::adapters::{EngineModule, HostHooks, Limits};
-use crate::wasm::OutboundIntent;
+use crate::wasm::{AgentRuntime, OutboundIntent};
 
 /// An instantiated agent module on the wasmi interpreter.
 pub struct WasmiModule {
     store: Store<()>,
     instance: wasmi::Instance,
     hooks: HostHooks,
+    fuel: u64, // per-call CPU budget
 }
 
 /// The wasmi backend (IoT). Implements the Engine seam alongside `WasmtimeEngine`.
@@ -61,7 +62,56 @@ impl crate::adapters::Engine for WasmiEngine {
             .map_err(|e| anyhow!("wasmi instantiate: {e}"))?
             .start(&mut store)
             .map_err(|e| anyhow!("wasmi start: {e}"))?;
-        Ok(WasmiModule { store, instance, hooks })
+        Ok(WasmiModule { store, instance, hooks, fuel: limits.fuel.max(1) })
+    }
+}
+
+// Drive a wasmi agent through the node's `AgentRuntime` seam — so a WasmiModule
+// mounts in a Node exactly like the wasmtime WasmRuntime (E2 integration).
+impl AgentRuntime for WasmiModule {
+    fn init(&mut self) -> Result<()> {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        self.call_void("init")
+    }
+
+    fn config(&mut self, from: &str, unl: &[u8], body: &[u8]) -> Result<()> {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        if self.call_io("deliver", &[from.as_bytes(), unl, body])? {
+            Ok(())
+        } else {
+            self.refuel(fuel);
+            self.call_io("config", &[unl, body]).map(|_| ())
+        }
+    }
+
+    fn take_sends(&mut self) -> Vec<OutboundIntent> {
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+    }
+
+    fn run(&mut self) -> Result<bool> {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        Ok(self.call_i32("run")? != 0)
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        self.call_void("shutdown")
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        self.call_packed("snapshot").unwrap_or_default()
+    }
+
+    fn restore(&mut self, state: &[u8]) {
+        let fuel = self.fuel;
+        self.refuel(fuel);
+        let _ = self.call_io("restore", &[state]);
     }
 }
 

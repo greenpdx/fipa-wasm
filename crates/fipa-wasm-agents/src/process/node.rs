@@ -39,9 +39,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::adapters::{self, NodeCrypto, NodeNoise, NoiseSession, SledStore, StateStore};
-use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
-use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
+use crate::adapters::{self, Engine, HostHooks, Limits, NodeCrypto, NodeNoise, NoiseSession, SledStore, StateStore};
+use crate::manifest::{Capability, Grant, Manifest, NodeProfile, Profile};
+use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime, WasmiEngine};
 use rand::RngCore;
 use std::collections::HashSet;
 use unl_agent::{InferReq, SpawnReq, TimerOp};
@@ -569,21 +569,34 @@ impl Node {
             .profile
             .fit(manifest)
             .map_err(|e| anyhow::anyhow!("manifest does not fit node profile: {e:?}"))?;
-        let caps = crate::proto::AgentCapabilities {
-            max_memory_bytes: grant.budget.mem_kb.saturating_mul(1024),
-            max_execution_time_ms: (grant.budget.fuel / 1_000_000).max(1),
-            storage_quota_bytes: grant.budget.state_kb.saturating_mul(1024),
-            ..Default::default()
+        // Select the wasm engine by node profile: the wasmi interpreter on an IoT
+        // node, wasmtime otherwise — the same agent ABI runs on either (E2).
+        let runtime: Box<dyn AgentRuntime + Send> = if self.profile.profile == Profile::Iot {
+            let limits = Limits {
+                fuel: grant.budget.fuel,
+                mem_bytes: grant.budget.mem_kb.saturating_mul(1024) as usize,
+            };
+            let mut m = WasmiEngine.instantiate(&code, limits, HostHooks::default())?;
+            m.init()?;
+            Box::new(m)
+        } else {
+            let caps = crate::proto::AgentCapabilities {
+                max_memory_bytes: grant.budget.mem_kb.saturating_mul(1024),
+                max_execution_time_ms: (grant.budget.fuel / 1_000_000).max(1),
+                storage_quota_bytes: grant.budget.state_kb.saturating_mul(1024),
+                ..Default::default()
+            };
+            let mut rt = WasmRuntime::new(&code, &caps)?;
+            rt.call_init()?;
+            Box::new(rt)
         };
-        let mut rt = WasmRuntime::new(&code, &caps)?;
-        rt.call_init()?;
         self.aliases.insert(alias.into(), uuid.into());
         self.agents.insert(
             uuid.into(),
             Mounted {
                 uuid: uuid.into(),
                 alias: alias.into(),
-                runtime: Box::new(rt),
+                runtime,
                 service: service.map(Into::into),
                 code: Some(code),
                 epoch: 0,
@@ -1688,6 +1701,20 @@ mod tests {
 
         shutdown.store(true, Ordering::Relaxed);
         h.join().ok();
+    }
+
+    #[test]
+    fn iot_node_mounts_a_wasm_agent_via_the_wasmi_backend() {
+        use crate::manifest::{Budget, NodeProfile};
+        let mut n = Node::new("seed", "s", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        n.set_profile(NodeProfile::iot());
+        let mut m = wmanifest(&[]);
+        m.budget = Budget { mem_kb: 256, fuel: 1_000_000, state_kb: 64, timers: 2, msg_per_s: 50, net: "platform".into() };
+        let code = wat::parse_str(COUNTER_WASM).unwrap(); // wasmi needs binary wasm
+        n.mount_wasm("CTR", "ctr", code, &m, None).unwrap(); // → wasmi interpreter
+        n.pump(NodeMsg { to: "CTR".into(), from: "CTR".into(), unl: b"inc".to_vec(), ..Default::default() });
+        // the wasmi-backed agent incremented; read its state back
+        assert_eq!(n.agents.get_mut("CTR").unwrap().runtime.snapshot(), vec![1, 0, 0, 0]);
     }
 
     #[test]
