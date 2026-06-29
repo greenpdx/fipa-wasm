@@ -6,6 +6,12 @@
 envelope/async/interaction layers marked *planned* are not.
 **Parents:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) · [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) · [`NODE_DESIGN.md`](./NODE_DESIGN.md)
 
+> ⚠️ **Security.** The protocols below are **not safe across untrusted nodes as
+> specified** — `from` is forgeable cross-node and DF/AMS/PA authorize on it. See
+> [§12 Security requirements](#12-security-requirements) and
+> [`THREAT_MODEL.md`](./THREAT_MODEL.md) (kill chain in its §7). R1–R4 block any
+> networked build.
+
 Where `AGENT_HOST_ABI.md` specifies the *agent↔host* contract, this document
 specifies the *agent↔agent* and *node↔node* protocols: the message envelope, the UNL
 verb convention, the TCP wire format, and the conversation verb-tables for the
@@ -249,3 +255,25 @@ Not implemented; specified here so the gap is explicit (also tracked in
 | `not-understood` / error acts | ⬜ planned |
 | Signed messages & receipts | ⬜ planned |
 | FIPA interaction protocols (contract-net, auction, subscribe) | ⬜ future |
+
+---
+
+## 12. Security requirements
+
+These protocols are described **as currently coded**, which is **only safe within a
+single trusted node**. Across untrusted nodes they are exploitable (full analysis +
+kill chain in [`THREAT_MODEL.md`](./THREAT_MODEL.md)). The following are **binding**
+before any networked deployment:
+
+| Req | Applies to | Requirement |
+|---|---|---|
+| **R1** | the envelope (§1) | authenticated `from` cross-node (signed by the sending node); reject reserved sender-ids inbound from the wire |
+| **R2** | the wire (§3) | mutual node auth + encryption (Noise/TLS) |
+| **R3** | DF (§4), AMS (§5) | **authorize registration/binding**: DF `offer` requires `offerer == from`; AMS `bind` requires `from == agent` (or owner-signed); rate + quota limited |
+| **R4** | the wire (§3) | hard `MAX_FRAME` cap before allocation; read/accept/connect timeouts; non-blocking serve |
+| **R5** | DF, AMS, PA (§4–7) | quotas + TTL/GC; **PA hold expiry + auto-refund**; bound referral hops; `checked_add` in PA |
+
+Today's verb tables assume a **trusted `from`** (e.g. PA's authorization, DF
+self-registration). That assumption is valid intra-node and **invalid across nodes**
+until R1–R3 land. The threat model maps each finding (C1–C5, H1–H4, M1–M7) to these
+requirements and to milestones.

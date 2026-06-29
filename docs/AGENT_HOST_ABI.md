@@ -46,6 +46,22 @@ security is enforced.
 - Everything the agent receives passes the **in-gate**; everything it emits passes
   the **out-gate**. There is no other channel.
 
+**Cross-node trust (binding — see [`THREAT_MODEL.md`](./THREAT_MODEL.md)).** The
+in-gate's authentication of `from` holds only *intra-node* today; cross-node `from` is
+forgeable, which defeats every authorization decision. The following are **binding
+requirements that block any networked (multi-node) build**, not optional hardening:
+- **R1** — authenticated `from` cross-node (sender node signs `(from,to,unl,body,nonce)`;
+  the in-gate verifies against the peer node identity + the agent's attestation chain,
+  `MOBILITY §7`). Reserved sender-ids (`ams`/`df`/`pa`/`llm`/`node`/`crypto`/`boot`/
+  `resolver`/`result`) are **rejected if inbound from the wire**.
+- **R2** — authenticated, encrypted transport (mutual node auth + Noise/TLS in the
+  `Transport` adapter).
+- **R4** — wire-codec hardening (hard `MAX_FRAME` cap before allocation; read/accept/
+  connect timeouts; non-blocking serve).
+- **R7/R8** — fuel/memory metering; agent state keys confined to the agent's UUID
+  namespace (no `"../"` escape).
+The full catalogue, severities, and the worked kill chain are in `THREAT_MODEL.md`.
+
 ---
 
 ## 2. Block layout
