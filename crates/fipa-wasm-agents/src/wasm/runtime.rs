@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use wasmtime::*;
 
+use crate::adapters::{EngineModule, HostHooks, Limits};
 use crate::proto;
 use super::host::{HostState, OutboundIntent};
 
@@ -27,49 +28,37 @@ pub struct WasmRuntime {
 
     /// Agent capabilities
     capabilities: proto::AgentCapabilities,
+
+    /// The host import table (the `send-unl` sink the node drains) — Engine seam.
+    hooks: HostHooks,
 }
 
 impl WasmRuntime {
     /// Create a new runtime from WASM bytecode
     pub fn new(wasm_bytes: &[u8], capabilities: &proto::AgentCapabilities) -> Result<Self> {
-        // Configure engine
+        Self::build(wasm_bytes, capabilities.clone(), HostHooks::default())
+    }
+
+    /// Instantiate with an explicit host import table — the Engine seam's path.
+    fn build(code: &[u8], capabilities: proto::AgentCapabilities, hooks: HostHooks) -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(false);
         config.consume_fuel(true);
-
         let engine = Engine::new(&config)?;
-
-        // Compile module
-        let module = Module::new(&engine, wasm_bytes)?;
-
-        // Create host state
+        let module = Module::new(&engine, code)?;
         let host_state = HostState::new(capabilities.clone());
-
-        // Create store with fuel + memory limits (H3/R7).
         let mut store = Store::new(&engine, host_state);
         store.limiter(|state| &mut state.limits);
-        store.set_fuel(capabilities.max_execution_time_ms as u64 * 1_000_000)?;
-
-        // Create linker with host functions
+        store.set_fuel(capabilities.max_execution_time_ms.max(1) as u64 * 1_000_000)?;
         let mut linker = Linker::new(&engine);
-        Self::define_host_functions(&mut linker)?;
-
-        // Instantiate module
+        Self::define_host_functions(&mut linker, &hooks)?;
         let instance = linker.instantiate(&mut store, &module)?;
-
-        Ok(Self {
-            engine,
-            module,
-            module_bytes: wasm_bytes.to_vec(),
-            store,
-            instance,
-            capabilities: capabilities.clone(),
-        })
+        Ok(Self { engine, module, module_bytes: code.to_vec(), store, instance, capabilities, hooks })
     }
 
     /// Define host functions in the linker
-    fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
+    fn define_host_functions(linker: &mut Linker<HostState>, hooks: &HostHooks) -> Result<()> {
         // Messaging functions
         linker.func_wrap("fipa:agent/messaging", "send-message", |mut caller: Caller<'_, HostState>, _msg_ptr: i32, _msg_len: i32| -> i32 {
             // Implementation would extract message from WASM memory and send
@@ -95,10 +84,11 @@ impl WasmRuntime {
 
         // The agent emits a message: send-unl(receiver, unl, body) as (ptr,len)
         // triples into WASM memory. The node validates + packages + transmits it.
+        let sends = hooks.sends.clone();
         linker.func_wrap(
             "fipa:agent/messaging",
             "send-unl",
-            |mut caller: Caller<'_, HostState>,
+            move |mut caller: Caller<'_, HostState>,
              rp: i32, rl: i32, up: i32, ul: i32, bp: i32, bl: i32| {
                 let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
                 else {
@@ -120,10 +110,7 @@ impl WasmRuntime {
                     unl.len(),
                     body.len()
                 );
-                caller
-                    .data_mut()
-                    .unl_sends
-                    .push(OutboundIntent { receiver, unl, body });
+                sends.lock().unwrap().push(OutboundIntent { receiver, unl, body });
             },
         )?;
 
@@ -188,38 +175,25 @@ impl WasmRuntime {
         (self.capabilities.max_execution_time_ms.max(1) as u64).saturating_mul(1_000_000)
     }
 
-    /// Call the agent's init function
+    /// Call the agent's init function (via the Engine seam).
     pub fn call_init(&mut self) -> Result<()> {
-        self.store.set_fuel(self.call_fuel())?;
-        let init = self.instance
-            .get_typed_func::<(), ()>(&mut self.store, "init")
-            .map_err(|_| anyhow!("init function not found"))?;
-
-        init.call(&mut self.store, ())?;
-        Ok(())
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        self.call_void("init")
     }
 
-    /// Call the agent's run function
+    /// Call the agent's run function.
     pub fn call_run(&mut self) -> Result<bool> {
-        // Fresh per-call CPU budget (H3/R7).
-        self.store.set_fuel(self.call_fuel())?;
-
-        let run = self.instance
-            .get_typed_func::<(), i32>(&mut self.store, "run")
-            .map_err(|_| anyhow!("run function not found"))?;
-
-        let result = run.call(&mut self.store, ())?;
-        Ok(result != 0)
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        Ok(self.call_i32("run")? != 0)
     }
 
-    /// Call the agent's shutdown function
+    /// Call the agent's shutdown function.
     pub fn call_shutdown(&mut self) -> Result<()> {
-        let shutdown = self.instance
-            .get_typed_func::<(), ()>(&mut self.store, "shutdown")
-            .map_err(|_| anyhow!("shutdown function not found"))?;
-
-        shutdown.call(&mut self.store, ())?;
-        Ok(())
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        self.call_void("shutdown")
     }
 
     /// Handle an incoming message
@@ -247,26 +221,10 @@ impl WasmRuntime {
     /// startup to seed state and again per inbound message. A guest without a
     /// `config` export is a graceful no-op.
     pub fn call_config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
-        self.store.set_fuel(self.call_fuel())?;
-        let config = match self
-            .instance
-            .get_typed_func::<(i32, i32, i32, i32), ()>(&mut self.store, "config")
-        {
-            Ok(f) => f,
-            Err(_) => {
-                crate::flow!("wasm: no `config` export → skip (agent ignores content)");
-                return Ok(());
-            }
-        };
-        crate::flow!("wasm: → config(unl={} bytes, body={} bytes) into agent", unl.len(), body.len());
-        let unl_ptr = self.guest_alloc(unl.len())?;
-        self.write_bytes(unl_ptr, unl)?;
-        let body_ptr = self.guest_alloc(body.len())?;
-        self.write_bytes(body_ptr, body)?;
-        config.call(
-            &mut self.store,
-            (unl_ptr, unl.len() as i32, body_ptr, body.len() as i32),
-        )?;
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        crate::flow!("wasm: → config(unl={} bytes, body={} bytes)", unl.len(), body.len());
+        self.call_io("config", &[unl, body])?; // Ok(false) if absent → graceful no-op
         Ok(())
     }
 
@@ -274,69 +232,32 @@ impl WasmRuntime {
     /// (from-aware). Returns `Ok(false)` if the guest has no `deliver` export, so
     /// the caller can fall back to `call_config`.
     pub fn call_deliver(&mut self, from: &[u8], unl: &[u8], body: &[u8]) -> Result<bool> {
-        self.store.set_fuel(self.call_fuel())?;
-        let deliver = match self
-            .instance
-            .get_typed_func::<(i32, i32, i32, i32, i32, i32), ()>(&mut self.store, "deliver")
-        {
-            Ok(f) => f,
-            Err(_) => return Ok(false),
-        };
-        crate::flow!("wasm: → deliver(from={} bytes, unl={} bytes) into agent", from.len(), unl.len());
-        let fp = self.guest_alloc(from.len())?;
-        self.write_bytes(fp, from)?;
-        let up = self.guest_alloc(unl.len())?;
-        self.write_bytes(up, unl)?;
-        let bp = self.guest_alloc(body.len())?;
-        self.write_bytes(bp, body)?;
-        deliver.call(
-            &mut self.store,
-            (fp, from.len() as i32, up, unl.len() as i32, bp, body.len() as i32),
-        )?;
-        Ok(true)
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        crate::flow!("wasm: → deliver(from={} bytes, unl={} bytes)", from.len(), unl.len());
+        self.call_io("deliver", &[from, unl, body])
     }
 
     /// Drain the UNL send intents the agent emitted via `send-unl`. The node
     /// validates each against the receiver's vocabulary, packages it, and
     /// transmits it.
     pub fn take_unl_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut self.store.data_mut().unl_sends)
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
     }
 
     /// Capture the agent's state via its `snapshot` export (state-based migration).
     /// Empty if the guest exports no `snapshot` (a stateless agent).
     pub fn call_snapshot(&mut self) -> Vec<u8> {
-        let f = match self.instance.get_typed_func::<(), i64>(&mut self.store, "snapshot") {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
-        self.store.set_fuel(self.call_fuel()).ok();
-        let packed = match f.call(&mut self.store, ()) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-        let ptr = (packed >> 32) as usize;
-        let len = (packed & 0xffff_ffff) as usize;
-        let memory = match self.instance.get_memory(&mut self.store, "memory") {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-        let data = memory.data(&self.store);
-        data.get(ptr..ptr.saturating_add(len)).map(<[u8]>::to_vec).unwrap_or_default()
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        self.call_packed("snapshot").unwrap_or_default()
     }
 
     /// Restore state captured by [`Self::call_snapshot`] via the `restore` export.
     pub fn call_restore(&mut self, state: &[u8]) {
-        let f = match self.instance.get_typed_func::<(i32, i32), ()>(&mut self.store, "restore") {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        self.store.set_fuel(self.call_fuel()).ok();
-        let Ok(ptr) = self.guest_alloc(state.len()) else { return };
-        if self.write_bytes(ptr, state).is_err() {
-            return;
-        }
-        let _ = f.call(&mut self.store, (ptr, state.len() as i32));
+        let fuel = self.call_fuel();
+        self.refuel(fuel);
+        let _ = self.call_io("restore", &[state]);
     }
 
     /// Allocate `n` bytes in WASM memory via the guest's `alloc` export.
@@ -418,6 +339,78 @@ impl WasmRuntime {
             .get_memory(&mut self.store.as_context_mut(), "memory")
             .map(|m| m.data_size(&self.store))
             .unwrap_or(0)
+    }
+}
+
+// The wasmtime backend's implementation of the Engine seam: the five mechanical
+// ops every wasm engine (wasmtime today; wasmi/browser next) must provide.
+impl EngineModule for WasmRuntime {
+    fn refuel(&mut self, fuel: u64) {
+        let _ = self.store.set_fuel(fuel);
+    }
+
+    fn call_void(&mut self, func: &str) -> Result<()> {
+        let f = self
+            .instance
+            .get_typed_func::<(), ()>(&mut self.store, func)
+            .map_err(|_| anyhow!("{func} not found"))?;
+        f.call(&mut self.store, ())?;
+        Ok(())
+    }
+
+    fn call_i32(&mut self, func: &str) -> Result<i32> {
+        let f = self
+            .instance
+            .get_typed_func::<(), i32>(&mut self.store, func)
+            .map_err(|_| anyhow!("{func} not found"))?;
+        Ok(f.call(&mut self.store, ())?)
+    }
+
+    fn call_io(&mut self, func: &str, args: &[&[u8]]) -> Result<bool> {
+        let Some(f) = self.instance.get_func(&mut self.store, func) else {
+            return Ok(false);
+        };
+        let mut params = Vec::with_capacity(args.len() * 2);
+        for a in args {
+            let ptr = self.guest_alloc(a.len())?;
+            self.write_bytes(ptr, a)?;
+            params.push(Val::I32(ptr));
+            params.push(Val::I32(a.len() as i32));
+        }
+        f.call(&mut self.store, &params, &mut [])?;
+        Ok(true)
+    }
+
+    fn call_packed(&mut self, func: &str) -> Result<Vec<u8>> {
+        let f = match self.instance.get_typed_func::<(), i64>(&mut self.store, func) {
+            Ok(f) => f,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let packed = f.call(&mut self.store, ())?;
+        let ptr = (packed >> 32) as usize;
+        let len = (packed & 0xffff_ffff) as usize;
+        let Some(memory) = self.instance.get_memory(&mut self.store, "memory") else {
+            return Ok(Vec::new());
+        };
+        let data = memory.data(&self.store);
+        Ok(data.get(ptr..ptr.saturating_add(len)).map(<[u8]>::to_vec).unwrap_or_default())
+    }
+}
+
+/// The wasmtime backend — the reference [`crate::adapters::Engine`] impl. wasmi
+/// (IoT) and browser-WASM implement the same trait against their own engines.
+pub struct WasmtimeEngine;
+
+impl crate::adapters::Engine for WasmtimeEngine {
+    type Module = WasmRuntime;
+
+    fn instantiate(&self, code: &[u8], limits: Limits, hooks: HostHooks) -> Result<WasmRuntime> {
+        let caps = proto::AgentCapabilities {
+            max_execution_time_ms: (limits.fuel / 1_000_000).max(1),
+            max_memory_bytes: limits.mem_bytes as u64,
+            ..Default::default()
+        };
+        WasmRuntime::build(code, caps, hooks)
     }
 }
 
