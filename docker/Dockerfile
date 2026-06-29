@@ -4,6 +4,9 @@
 #   docker build -t fipa-node:base -f docker/Dockerfile .
 
 FROM rust:1-bookworm AS build
+# protoc: fipa-wasm-agents' build.rs runs tonic/prost protobuf codegen.
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --bin mesh-node
