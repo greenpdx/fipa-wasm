@@ -39,7 +39,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::adapters::{self, NodeCrypto, NodeNoise};
+use crate::adapters::{self, NodeCrypto, NodeNoise, SledStore, StateStore};
 use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
 use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
 use unl_agent::TimerOp;
@@ -144,6 +144,24 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
+/// A namespaced state handle: an agent's [`unl_agent::Kv`] confined to its own
+/// namespace, backed by the node's [`SledStore`] (R8 — keys cannot escape).
+struct ScopedKv {
+    store: Arc<SledStore>,
+    ns: String,
+}
+impl unl_agent::Kv for ScopedKv {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.store.get(&self.ns, key).ok().flatten()
+    }
+    fn put(&self, key: &str, val: &[u8]) {
+        let _ = self.store.put(&self.ns, key, val);
+    }
+    fn del(&self, key: &str) {
+        let _ = self.store.del(&self.ns, key);
+    }
+}
+
 /// Wall-clock milliseconds since the Unix epoch (the scheduler's clock, M3).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -222,6 +240,7 @@ pub struct Node {
     seen: HashMap<String, u64>,          // migration replay guard: uuid -> last epoch
     profile: NodeProfile,                // M2: which capabilities this node offers
     timers: HashMap<String, HashMap<u64, u64>>, // M3: uuid -> timer_id -> deadline_ms
+    store: Option<Arc<SledStore>>,       // M4: durable state backend (state capability)
 }
 
 impl Node {
@@ -242,6 +261,7 @@ impl Node {
             seen: HashMap::new(),
             profile: NodeProfile::normal(),
             timers: HashMap::new(),
+            store: None,
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -270,6 +290,7 @@ impl Node {
                 grant: Grant::full(), // native = trusted infra template
             },
         );
+        self.provision_state(uuid);
     }
 
     /// Set this node's profile (e.g. `NodeProfile::iot()`), which determines the
@@ -282,6 +303,29 @@ impl Node {
     /// (M2). A `false` is the uniform, opaque `denied` at runtime.
     pub fn granted(&self, uuid: &str, cap: Capability) -> bool {
         self.agents.get(uuid).map(|m| m.grant.granted(cap)).unwrap_or(false)
+    }
+
+    /// Provide a durable state store for agents that hold the `state` capability
+    /// (re-provisions any already-mounted agents, e.g. the primary from `new`).
+    pub fn set_store(&mut self, store: SledStore) {
+        self.store = Some(Arc::new(store));
+        let uuids: Vec<String> = self.agents.keys().cloned().collect();
+        for u in uuids {
+            self.provision_state(&u);
+        }
+    }
+
+    /// If `uuid` holds the `State` capability and the node has a store, hand the
+    /// agent a namespace-confined Kv handle (M4).
+    fn provision_state(&mut self, uuid: &str) {
+        if !self.granted(uuid, Capability::State) {
+            return;
+        }
+        let Some(store) = self.store.clone() else { return };
+        let kv = Arc::new(ScopedKv { store, ns: uuid.to_string() });
+        if let Some(m) = self.agents.get_mut(uuid) {
+            m.runtime.set_state(kv);
+        }
     }
 
     /// Mount a **mobile wasm agent** from its module bytes + `manifest` (HEAD) — only
@@ -322,6 +366,7 @@ impl Node {
                 grant,
             },
         );
+        self.provision_state(uuid);
         Ok(())
     }
 
@@ -962,6 +1007,33 @@ mod tests {
         n.inject(b"obj(kick, x)", b""); // local kick → primary → bee → result
         let got = rx.recv_timeout(Duration::from_secs(2)).expect("result surfaced in-process");
         assert_eq!(String::from_utf8_lossy(&got.unl), "obj(pong, x)");
+    }
+
+    #[test]
+    fn state_capability_persists_per_agent() {
+        struct Saver;
+        impl Agent for Saver {
+            fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx) {
+                if unl.contains("save") {
+                    ctx.state_put("k", body); // durable, namespace-confined
+                } else if unl.contains("load") {
+                    let v = ctx.state_get("k").unwrap_or_default();
+                    ctx.send("result", "obj(loaded, x)", v);
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("m4-state-{}", std::process::id()));
+        let store = crate::adapters::SledStore::open(&dir).unwrap();
+        let mut n = Node::new("S", "s", "127.0.0.1:0", Box::new(NativeRuntime::new(Saver)));
+        n.set_store(store);
+        let (tx, rx) = mpsc::channel();
+        n.set_sink(tx);
+        // save in one call, load in a later call: state outlives the message
+        n.pump(NodeMsg { to: "S".into(), from: "S".into(), unl: b"save".to_vec(), body: b"hello".to_vec(), ..Default::default() });
+        n.pump(NodeMsg { to: "S".into(), from: "S".into(), unl: b"load".to_vec(), ..Default::default() });
+        let got = rx.recv_timeout(Duration::from_secs(1)).expect("state load surfaced");
+        assert_eq!(got.body, b"hello"); // persisted via the state capability
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

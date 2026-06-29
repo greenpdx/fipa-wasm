@@ -44,6 +44,17 @@ pub struct Outgoing {
     pub body: Vec<u8>,
 }
 
+/// A namespaced, durable key-value handle the host grants to an agent that holds
+/// the `state` capability. Reads/writes are **synchronous** and confined to the
+/// agent's own namespace by the host (the agent cannot escape it). An agent without
+/// the capability simply has no handle, so reads return `None` and writes are no-ops
+/// (the uniform denial).
+pub trait Kv: Send + Sync {
+    fn get(&self, key: &str) -> Option<Vec<u8>>;
+    fn put(&self, key: &str, val: &[u8]);
+    fn del(&self, key: &str);
+}
+
 /// A timer request an agent makes via [`Ctx::set_timer`] / [`Ctx::cancel_timer`].
 /// The host schedules it (subject to the `Time` grant + slot budget) and later
 /// calls [`Agent::on_tick`] when it fires.
@@ -61,6 +72,7 @@ pub struct Ctx {
     from: String,
     sends: Vec<Outgoing>,
     timers: Vec<TimerOp>,
+    state: Option<std::sync::Arc<dyn Kv>>,
 }
 
 impl Ctx {
@@ -105,6 +117,31 @@ impl Ctx {
     /// Drain the timer requests emitted during this call (host-internal).
     pub fn take_timers(&mut self) -> Vec<TimerOp> {
         core::mem::take(&mut self.timers)
+    }
+
+    /// Install the agent's durable-state handle (host-internal; set before delivery
+    /// only when the agent holds the `state` capability).
+    pub fn set_state(&mut self, kv: std::sync::Arc<dyn Kv>) {
+        self.state = Some(kv);
+    }
+
+    /// Read durable state (`None` without the `state` capability, or if absent).
+    pub fn state_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.state.as_ref()?.get(key)
+    }
+
+    /// Write durable state (a no-op without the `state` capability).
+    pub fn state_put(&self, key: &str, val: &[u8]) {
+        if let Some(s) = &self.state {
+            s.put(key, val);
+        }
+    }
+
+    /// Delete durable state (a no-op without the `state` capability).
+    pub fn state_del(&self, key: &str) {
+        if let Some(s) = &self.state {
+            s.del(key);
+        }
     }
 }
 

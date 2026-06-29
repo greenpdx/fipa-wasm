@@ -50,6 +50,10 @@ pub trait AgentRuntime {
     fn take_timer_ops(&mut self) -> Vec<unl_agent::TimerOp> {
         Vec::new()
     }
+
+    /// Provision the agent's durable-state handle (the `state` capability; default:
+    /// ignore). The node calls this at mount only when `State` is granted.
+    fn set_state(&mut self, _kv: std::sync::Arc<dyn unl_agent::Kv>) {}
 }
 
 impl AgentRuntime for super::WasmRuntime {
@@ -95,11 +99,12 @@ pub struct NativeRuntime<A: Agent> {
     agent: A,
     outbox: Vec<OutboundIntent>,
     timer_ops: Vec<unl_agent::TimerOp>,
+    state: Option<std::sync::Arc<dyn unl_agent::Kv>>,
 }
 
 impl<A: Agent> NativeRuntime<A> {
     pub fn new(agent: A) -> Self {
-        NativeRuntime { agent, outbox: Vec::new(), timer_ops: Vec::new() }
+        NativeRuntime { agent, outbox: Vec::new(), timer_ops: Vec::new(), state: None }
     }
 
     /// Run one agent call with **fault isolation**: a panic is caught so it can
@@ -108,8 +113,12 @@ impl<A: Agent> NativeRuntime<A> {
     /// can quarantine or restart it. (Requires `panic = "unwind"`; with
     /// `panic = "abort"` only a process boundary contains a faulting agent.)
     fn guarded(&mut self, call: impl FnOnce(&mut A, &mut Ctx)) -> Result<()> {
+        let kv = self.state.clone();
         let agent = &mut self.agent;
         let mut ctx = Ctx::new();
+        if let Some(s) = kv {
+            ctx.set_state(s);
+        }
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(agent, &mut ctx)));
         match outcome {
@@ -165,6 +174,10 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
 
     fn take_timer_ops(&mut self) -> Vec<unl_agent::TimerOp> {
         std::mem::take(&mut self.timer_ops)
+    }
+
+    fn set_state(&mut self, kv: std::sync::Arc<dyn unl_agent::Kv>) {
+        self.state = Some(kv);
     }
 }
 
