@@ -59,17 +59,27 @@ pub struct HostState {
     pub messages_sent: u64,
     pub messages_received: u64,
     pub log_count: u64,
+
+    /// wasm store resource limits (linear-memory cap) — H3/R7.
+    pub limits: wasmtime::StoreLimits,
 }
 
 impl HostState {
     /// Create new host state
     pub fn new(capabilities: proto::AgentCapabilities) -> Self {
+        // Cap linear memory; fall back to a sane default when unset (0).
+        let mem_cap = if capabilities.max_memory_bytes == 0 {
+            64 * 1024 * 1024
+        } else {
+            capabilities.max_memory_bytes as usize
+        };
         Self {
             agent_id: proto::AgentId {
                 name: String::new(),
                 addresses: vec![],
                 resolvers: vec![],
             },
+            limits: wasmtime::StoreLimitsBuilder::new().memory_size(mem_cap).build(),
             capabilities,
             node_id: String::new(),
             mailbox: VecDeque::new(),

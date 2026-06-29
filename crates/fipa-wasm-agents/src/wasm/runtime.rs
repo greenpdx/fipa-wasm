@@ -46,8 +46,9 @@ impl WasmRuntime {
         // Create host state
         let host_state = HostState::new(capabilities.clone());
 
-        // Create store with fuel limit
+        // Create store with fuel + memory limits (H3/R7).
         let mut store = Store::new(&engine, host_state);
+        store.limiter(|state| &mut state.limits);
         store.set_fuel(capabilities.max_execution_time_ms as u64 * 1_000_000)?;
 
         // Create linker with host functions
@@ -180,8 +181,16 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// Per-call CPU budget (wasmtime fuel). Each agent entry point gets a *fresh*
+    /// budget, so a looping or runaway agent traps (out of fuel) and is contained,
+    /// while a well-behaved agent gets the full budget on every message (H3/R7).
+    fn call_fuel(&self) -> u64 {
+        (self.capabilities.max_execution_time_ms.max(1) as u64).saturating_mul(1_000_000)
+    }
+
     /// Call the agent's init function
     pub fn call_init(&mut self) -> Result<()> {
+        self.store.set_fuel(self.call_fuel())?;
         let init = self.instance
             .get_typed_func::<(), ()>(&mut self.store, "init")
             .map_err(|_| anyhow!("init function not found"))?;
@@ -192,8 +201,8 @@ impl WasmRuntime {
 
     /// Call the agent's run function
     pub fn call_run(&mut self) -> Result<bool> {
-        // Refuel for this tick
-        self.store.set_fuel(self.capabilities.max_execution_time_ms as u64 * 1_000)?;
+        // Fresh per-call CPU budget (H3/R7).
+        self.store.set_fuel(self.call_fuel())?;
 
         let run = self.instance
             .get_typed_func::<(), i32>(&mut self.store, "run")
@@ -238,6 +247,7 @@ impl WasmRuntime {
     /// startup to seed state and again per inbound message. A guest without a
     /// `config` export is a graceful no-op.
     pub fn call_config(&mut self, unl: &[u8], body: &[u8]) -> Result<()> {
+        self.store.set_fuel(self.call_fuel())?;
         let config = match self
             .instance
             .get_typed_func::<(i32, i32, i32, i32), ()>(&mut self.store, "config")
@@ -264,6 +274,7 @@ impl WasmRuntime {
     /// (from-aware). Returns `Ok(false)` if the guest has no `deliver` export, so
     /// the caller can fall back to `call_config`.
     pub fn call_deliver(&mut self, from: &[u8], unl: &[u8], body: &[u8]) -> Result<bool> {
+        self.store.set_fuel(self.call_fuel())?;
         let deliver = match self
             .instance
             .get_typed_func::<(i32, i32, i32, i32, i32, i32), ()>(&mut self.store, "deliver")
@@ -419,6 +430,39 @@ mod config_abi_tests {
         let data = mem.data(&rt.store);
         assert_eq!(&data[0..16], b"agt(detect,gate)"); // the UNL the guest received
         assert_eq!(&data[512..514], &[0x17, 0x2a]); // the body the guest received
+    }
+
+    // A guest whose `config` never returns (infinite loop) — fuel must trap it.
+    const LOOP_GUEST: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "init"))
+      (func (export "alloc") (param i32) (result i32) (i32.const 0))
+      (func (export "config") (param i32 i32 i32 i32)
+        (loop (br 0))))
+    "#;
+
+    #[test]
+    fn looping_agent_is_capped_by_fuel() {
+        // a tiny CPU budget so the trap is fast
+        let caps = proto::AgentCapabilities { max_execution_time_ms: 1, ..Default::default() };
+        let mut rt = WasmRuntime::new(LOOP_GUEST.as_bytes(), &caps).unwrap();
+        rt.call_init().unwrap();
+        // the infinite loop runs out of fuel and traps — contained as an Err,
+        // never an unbounded hang of the node (H3/R7).
+        assert!(rt.call_config(b"x", b"y").is_err());
+    }
+
+    #[test]
+    fn oversized_memory_is_refused() {
+        // a guest demanding 100 pages (6.4 MiB) against a 1 MiB cap won't instantiate
+        let caps = proto::AgentCapabilities {
+            max_memory_bytes: 1024 * 1024,
+            max_execution_time_ms: 1000,
+            ..Default::default()
+        };
+        const BIG: &str = r#"(module (memory (export "memory") 100))"#;
+        assert!(WasmRuntime::new(BIG.as_bytes(), &caps).is_err());
     }
 
     #[test]
