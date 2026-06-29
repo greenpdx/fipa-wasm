@@ -8,6 +8,7 @@
 // If the BA wasm isn't built, the demo falls back to running the same Buyer
 // natively (ba-agent is cdylib+rlib — one source, both targets).
 
+use fipa_wasm_agents::identity::{AgentId, Header};
 use fipa_wasm_agents::process::Router;
 use fipa_wasm_agents::proto;
 use fipa_wasm_agents::wasm::{AgentRuntime, NativeRuntime, WasmRuntime};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unl_agent::{Agent, Ctx};
 use unl_core::{NodeRef, Uci};
 use unl_parser::parse_sentence;
+use uuid::Uuid;
 
 // ── message helpers (for BS + reading BA's verdict) ─────────────────────
 
@@ -120,26 +122,45 @@ struct Scenario {
     bs_has_book: bool,
 }
 
+/// Mint a UUID identity with a friendly name (infra would persist in production).
+fn aid(name: &str) -> AgentId {
+    let header = Header { type_id: Uuid::new_v4(), desc: format!("{name} service"), name: Some(name.into()) };
+    AgentId::spawn(&header)
+}
+
 fn run(s: &Scenario) -> String {
-    let mut df = df_agent::Df::new();
+    // Every agent is a UUID; df/ams/pa keep well-known aliases (bootstrap), the
+    // seller's UUID is discovered via DF, BA's via the kickoff.
+    let df = aid("df");
+    let ams = aid("ams");
+    let pa = aid("pa");
+    let seller = aid("bookSeller");
+    let ba = aid("BA");
+
+    let mut df_agent = df_agent::Df::new();
     if s.df_has_provider {
-        df.on_seed(br#"{"bookselling":["bookSeller"]}"#, &mut Ctx::new());
+        let seed = serde_json::json!({ "bookselling": [seller.id()] });
+        df_agent.on_seed(seed.to_string().as_bytes(), &mut Ctx::new());
     }
-    let mut ams = ams_agent::Ams::new();
+    let mut ams_agent = ams_agent::Ams::new();
     if s.ams_has_address {
-        ams.on_seed(br#"{"records":{"bookSeller":"127.0.0.1:9001"}}"#, &mut Ctx::new());
+        let seed = serde_json::json!({ "records": { seller.id(): "127.0.0.1:9001" } });
+        ams_agent.on_seed(seed.to_string().as_bytes(), &mut Ctx::new());
     }
-    let mut pa = pa_agent::Pa::open(temp_path()).unwrap();
-    pa.credit("BA", s.ba_funds);
+    let mut pa_agent = pa_agent::Pa::open(temp_path()).unwrap();
+    pa_agent.credit(ba.id(), s.ba_funds);
 
     let mut r = Router::new();
-    r.add("df", Box::new(NativeRuntime::new(df)));
-    r.add("ams", Box::new(NativeRuntime::new(ams)));
-    r.add("pa", Box::new(NativeRuntime::new(pa)));
-    r.add("bookSeller", Box::new(NativeRuntime::new(Seller::new(s.bs_has_book))));
-    r.add("BA", ba_runtime()); // ← the buyer, as wasm (or native fallback)
+    for a in [&df, &ams, &pa, &seller, &ba] {
+        r.bind_alias(a.name.clone().unwrap(), a.id()); // readable traces + bootstrap
+    }
+    r.add(df.id(), Box::new(NativeRuntime::new(df_agent)));
+    r.add(ams.id(), Box::new(NativeRuntime::new(ams_agent)));
+    r.add(pa.id(), Box::new(NativeRuntime::new(pa_agent)));
+    r.add(seller.id(), Box::new(NativeRuntime::new(Seller::new(s.bs_has_book))));
+    r.add(ba.id(), ba_runtime()); // ← the buyer, as wasm (or native fallback)
 
-    r.send("boot", "BA", b"obj(start, buy)", b"");
+    r.send("boot", &ba.id(), b"obj(start, buy)", b"");
     r.run(200);
 
     match r.outbox.iter().find(|e| e.to == "result") {

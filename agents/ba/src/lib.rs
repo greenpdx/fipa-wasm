@@ -86,7 +86,9 @@ impl Agent for Buyer {
                 match providers.first() {
                     Some(p) => {
                         self.seller = p.clone();
-                        ctx.send("ams", format!("obj(locate, {p})"), vec![]);
+                        // the seller is a UUID → ask AMS with it in the body.
+                        let q = serde_json::json!({ "agent": p });
+                        ctx.send("ams", "obj(locate, agent)", serde_json::to_vec(&q).unwrap());
                         self.st = St::Address;
                     }
                     None => self.fail(ctx, "no-provider"),

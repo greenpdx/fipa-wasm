@@ -23,17 +23,20 @@
 //!
 //! ## Message model
 //!
-//! `(from, unl, body)` — UNL carries the action + subject agent; JSON body
-//! carries structured data (the address, the referral target).
+//! `(from, unl, body)` — UNL carries only the **action verb** (a placeholder
+//! subject `agent`); the agent in question is a **UUID**, which is structured
+//! machine data and so travels in the **JSON body**, never in the UNL graph (UNL
+//! stays human/semantic). The body also carries the address / referral target.
 //!
 //! ## Actions
 //!
 //! | Action | in: `unl` / `body` | AMS does | reply → `from`: `unl` / `body` |
 //! |---|---|---|---|
-//! | bind   | `obj(bind, <agent>)` / `{"address":"<addr>"}` | store `<agent> → addr` | `obj(bound, <agent>)` / — |
-//! | locate | `obj(locate, <agent>)` / — | resolve | `obj(at, <agent>)` / `{"address":…}` **or** `obj(refer, <agent>)` / `{"ams":…}` |
+//! | bind   | `obj(bind, agent)` / `{"agent":"<uuid>","address":"<addr>"}` | store `<uuid> → addr` | `obj(bound, agent)` / — |
+//! | locate | `obj(locate, agent)` / `{"agent":"<uuid>"}` | resolve | `obj(at, agent)` / `{"agent","address"}` **or** `obj(refer, agent)` / `{"agent","ams"}` |
 //!
-//! An `at` with empty `{}` means not-found (unknown agent, no upstream).
+//! An `at` reply with no `address` means not-found (unknown agent, no upstream).
+//! Each reply echoes `"agent"` so a resolver chasing referrals can correlate.
 //!
 //! ## Data model
 //!
@@ -94,29 +97,35 @@ impl Agent for Ams {
     }
 
     fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx) {
-        let Some((action, agent)) = action_and_subject(unl) else {
+        let Some(action) = action_verb(unl) else {
             return;
         };
         let from = ctx.from().to_string();
         match action.as_str() {
             "bind" => {
-                if let Some(addr) = json_field(body, "address") {
-                    self.records.insert(agent.clone(), addr);
+                if let (Some(agent), Some(addr)) =
+                    (json_field(body, "agent"), json_field(body, "address"))
+                {
+                    self.records.insert(agent, addr);
                 }
-                ctx.send(from, format!("obj(bound, {agent})"), Vec::new());
+                ctx.send(from, "obj(bound, agent)", Vec::new());
             }
             "locate" => {
+                let Some(agent) = json_field(body, "agent") else {
+                    return;
+                };
                 if let Some(addr) = self.records.get(&agent) {
                     // "I have it right here" (authoritative or cached).
-                    let b = format!("{{\"address\":\"{addr}\"}}").into_bytes();
-                    ctx.send(from, format!("obj(at, {agent})"), b);
+                    let b = serde_json::json!({ "agent": agent, "address": addr });
+                    ctx.send(from, "obj(at, agent)", serde_json::to_vec(&b).unwrap_or_default());
                 } else if let Some(up) = &self.upstream {
                     // "check XYZ AMS" (referral; the node may chase it recursively).
-                    let b = format!("{{\"ams\":\"{up}\"}}").into_bytes();
-                    ctx.send(from, format!("obj(refer, {agent})"), b);
+                    let b = serde_json::json!({ "agent": agent, "ams": up });
+                    ctx.send(from, "obj(refer, agent)", serde_json::to_vec(&b).unwrap_or_default());
                 } else {
-                    // not found
-                    ctx.send(from, format!("obj(at, {agent})"), b"{}".to_vec());
+                    // not found: no address field
+                    let b = serde_json::json!({ "agent": agent });
+                    ctx.send(from, "obj(at, agent)", serde_json::to_vec(&b).unwrap_or_default());
                 }
             }
             _ => {}
@@ -124,11 +133,11 @@ impl Agent for Ams {
     }
 }
 
-/// Parse `obj(<action>, <agent>)` → (action word, agent word).
-fn action_and_subject(unl: &str) -> Option<(String, String)> {
+/// Parse `obj(<action>, agent)` → the action verb (the subject is a placeholder).
+fn action_verb(unl: &str) -> Option<String> {
     let graph = parse_sentence(unl).ok()?;
     let rel = graph.relations.first()?;
-    Some((inline_word(&rel.source)?, inline_word(&rel.target)?))
+    inline_word(&rel.source)
 }
 
 fn inline_word(node: &NodeRef) -> Option<String> {
@@ -156,15 +165,17 @@ mod tests {
         ctx.take()
     }
 
+    // The agent is a UUID; here a short stand-in "S" carried in the body.
     #[test]
     fn bind_then_locate_is_direct() {
         let mut ams = Ams::new();
-        let out = run(&mut ams, "bookSeller", "obj(bind, bookSeller)", br#"{"address":"127.0.0.1:9001"}"#);
-        assert_eq!(out[0].unl, "obj(bound, bookSeller)");
+        let out = run(&mut ams, "S", "obj(bind, agent)", br#"{"agent":"S","address":"127.0.0.1:9001"}"#);
+        assert_eq!(out[0].unl, "obj(bound, agent)");
 
-        let out = run(&mut ams, "BA", "obj(locate, bookSeller)", b"");
+        let out = run(&mut ams, "BA", "obj(locate, agent)", br#"{"agent":"S"}"#);
         assert_eq!(out[0].to, "BA");
-        assert_eq!(out[0].unl, "obj(at, bookSeller)");
+        assert_eq!(out[0].unl, "obj(at, agent)");
+        assert_eq!(json_field(&out[0].body, "agent").unwrap(), "S"); // echoed for correlation
         assert_eq!(json_field(&out[0].body, "address").unwrap(), "127.0.0.1:9001");
     }
 
@@ -172,17 +183,17 @@ mod tests {
     fn locate_unknown_with_upstream_refers() {
         let mut ams = Ams::new();
         ams.set_upstream("ams-root");
-        let out = run(&mut ams, "BA", "obj(locate, bookSeller)", b"");
-        assert_eq!(out[0].unl, "obj(refer, bookSeller)");
+        let out = run(&mut ams, "BA", "obj(locate, agent)", br#"{"agent":"S"}"#);
+        assert_eq!(out[0].unl, "obj(refer, agent)");
         assert_eq!(json_field(&out[0].body, "ams").unwrap(), "ams-root");
     }
 
     #[test]
     fn locate_unknown_no_upstream_is_not_found() {
         let mut ams = Ams::new();
-        let out = run(&mut ams, "BA", "obj(locate, ghost)", b"");
-        assert_eq!(out[0].unl, "obj(at, ghost)");
-        assert!(json_field(&out[0].body, "address").is_none()); // empty {}
+        let out = run(&mut ams, "BA", "obj(locate, agent)", br#"{"agent":"ghost"}"#);
+        assert_eq!(out[0].unl, "obj(at, agent)");
+        assert!(json_field(&out[0].body, "address").is_none()); // no address ⇒ not found
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::identity::Aliases;
 use crate::wasm::AgentRuntime;
 
 /// A message in flight: `from` is the authenticated sender, stamped by the router.
@@ -31,10 +32,15 @@ pub struct Envelope {
 }
 
 /// Routes messages between local agents, stamping the authenticated sender.
+///
+/// Agents are keyed by their canonical id (a UUID). A `to` may also be a
+/// well-known **alias** (e.g. `"df"`) which is resolved to its UUID before
+/// lookup, so bootstrap handles stay legible while identity stays a UUID.
 #[derive(Default)]
 pub struct Router {
     agents: HashMap<String, Box<dyn AgentRuntime>>,
     queue: VecDeque<Envelope>,
+    aliases: Aliases,
     /// Messages addressed to non-local recipients (would go cross-node / to an
     /// external gateway). Useful for inspection in tests.
     pub outbox: Vec<Envelope>,
@@ -43,6 +49,12 @@ pub struct Router {
 impl Router {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind a well-known `name` to an agent `id` (UUID): callers may address the
+    /// `name`, and traces render the `id` as the `name`. Display + bootstrap only.
+    pub fn bind_alias(&mut self, name: impl Into<String>, id: impl Into<String>) {
+        self.aliases.bind(name, id);
     }
 
     /// Add a local agent under `id`, run its `init`, and queue any init output
@@ -76,23 +88,23 @@ impl Router {
                 break;
             }
             steps += 1;
-            match self.agents.get_mut(&env.to) {
+            // Resolve a well-known alias `to` to its UUID; labels for the trace.
+            let to = self.aliases.id_of(&env.to).map(str::to_string).unwrap_or_else(|| env.to.clone());
+            let from_label = self.aliases.label(&env.from).to_string();
+            let to_label = self.aliases.label(&to).to_string();
+            let unl_text = String::from_utf8_lossy(&env.unl);
+            match self.agents.get_mut(&to) {
                 Some(agent) => {
-                    crate::flow!(
-                        "  {} → {} : {}",
-                        env.from,
-                        env.to,
-                        String::from_utf8_lossy(&env.unl)
-                    );
+                    crate::flow!("  {from_label} → {to_label} : {unl_text}");
                     if agent.config(&env.from, &env.unl, &env.body).is_err() {
                         continue;
                     }
-                    // Authenticated: the agent that just processed is `env.to`;
-                    // everything it sends is therefore *from* `env.to`.
-                    let sender = env.to;
-                    for s in agent.take_sends() {
+                    // Authenticated: the agent that just processed is `to`;
+                    // everything it sends is therefore *from* `to` (its UUID).
+                    let sends = agent.take_sends();
+                    for s in sends {
                         self.queue.push_back(Envelope {
-                            from: sender.clone(),
+                            from: to.clone(),
                             to: s.receiver,
                             unl: s.unl,
                             body: s.body,
@@ -100,12 +112,7 @@ impl Router {
                     }
                 }
                 None => {
-                    crate::flow!(
-                        "  {} → {} : {} (external/undelivered)",
-                        env.from,
-                        env.to,
-                        String::from_utf8_lossy(&env.unl)
-                    );
+                    crate::flow!("  {from_label} → {to_label} : {unl_text} (external/undelivered)");
                     self.outbox.push(env); // non-local recipient
                 }
             }

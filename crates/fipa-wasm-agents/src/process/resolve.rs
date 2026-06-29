@@ -42,8 +42,9 @@ pub fn resolve(
         let Some(ams) = amses.get_mut(&current) else {
             return Resolution::NotFound;
         };
-        let unl = format!("obj(locate, {agent})");
-        if ams.config("resolver", unl.as_bytes(), b"{}").is_err() {
+        // The agent is a UUID → it travels in the body, not the UNL.
+        let body = serde_json::json!({ "agent": agent }).to_string();
+        if ams.config("resolver", b"obj(locate, agent)", body.as_bytes()).is_err() {
             return Resolution::NotFound;
         }
         let Some(reply) = ams.take_sends().into_iter().next() else {
