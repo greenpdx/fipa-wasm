@@ -1,0 +1,114 @@
+//! Agent migration — the move payload (`docs/MOBILITY.md`).
+//!
+//! Migration is **state-based** (engine-portable): a moving agent carries an
+//! [`AgentSnapshot`] of its serialized state, **signed by the origin node**, not a
+//! raw memory image. The destination verifies the signature before trusting a
+//! byte, restores the state into the agent, and (R6) re-binds the agent's location
+//! at AMS with a **higher epoch** so the move is the single forward step — a
+//! replayed or forked snapshot at a lower/equal epoch cannot double-bind (H1).
+//!
+//! This module is the move payload + its signing. The orchestration (the two-phase
+//! commit, the attestation chain for the destination's key, content-addressed code
+//! transfer when the destination lacks the agent) is the remaining M5 hardening;
+//! the happy-path state transfer + signed snapshot + epoch arbiter are implemented.
+
+use serde::{Deserialize, Serialize};
+
+use crate::adapters::{self, NodeCrypto};
+
+/// A signed, state-based migration payload for one wasm agent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentSnapshot {
+    /// The migrating agent's instance UUID (unchanged across the move).
+    pub uuid: String,
+    /// The new location epoch (strictly greater than the agent's current epoch).
+    pub epoch: u64,
+    /// The agent's wasm module (Phase C will replace this with a content hash +
+    /// fetch-on-miss). Only wasm agents are mobile.
+    pub code: Vec<u8>,
+    /// The agent's serialized state (from the guest's `snapshot` export).
+    pub state: Vec<u8>,
+    /// Anti-replay nonce.
+    pub nonce: Vec<u8>,
+    /// The origin node's Ed25519 public key.
+    pub origin_pub: Vec<u8>,
+    /// Signature by the origin node over everything above.
+    pub sig: Vec<u8>,
+}
+
+impl AgentSnapshot {
+    /// Build a snapshot signed by the origin node `key`.
+    pub fn sealed(uuid: &str, epoch: u64, code: Vec<u8>, state: Vec<u8>, key: &NodeCrypto) -> Self {
+        let mut s = AgentSnapshot {
+            uuid: uuid.into(),
+            epoch,
+            code,
+            state,
+            nonce: key.nonce().to_vec(),
+            origin_pub: key.public_key().to_vec(),
+            sig: Vec::new(),
+        };
+        s.sig = key.sign(&s.signing_bytes()).to_vec();
+        s
+    }
+
+    /// The bytes covered by the signature: every field except `sig`.
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(self.uuid.as_bytes());
+        b.push(0);
+        b.extend_from_slice(&self.epoch.to_be_bytes());
+        b.extend_from_slice(&self.code);
+        b.extend_from_slice(&self.state);
+        b.extend_from_slice(&self.nonce);
+        b.extend_from_slice(&self.origin_pub);
+        b
+    }
+
+    /// Verify the origin signature (integrity + origin authenticity).
+    pub fn verify(&self) -> bool {
+        if self.sig.len() != 64 || self.origin_pub.len() != 32 {
+            return false;
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&self.origin_pub);
+        let mut sg = [0u8; 64];
+        sg.copy_from_slice(&self.sig);
+        adapters::verify(&pk, &self.signing_bytes(), &sg)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_sign_verify_roundtrip() {
+        let k = NodeCrypto::generate();
+        let snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa, 0xbb], vec![0, 0, 0, 7], &k);
+        assert!(snap.verify());
+        let back = AgentSnapshot::decode(&snap.encode()).unwrap();
+        assert!(back.verify());
+        assert_eq!(back.code, vec![0xaa, 0xbb]);
+        assert_eq!(back.state, vec![0, 0, 0, 7]);
+        assert_eq!(back.epoch, 1);
+    }
+
+    #[test]
+    fn tampered_snapshot_is_rejected() {
+        let k = NodeCrypto::generate();
+        let mut snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![0, 0, 0, 7], &k);
+        snap.state = vec![9, 9, 9, 9]; // tamper with the state after signing
+        assert!(!snap.verify());
+        let mut snap2 = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![7], &k);
+        snap2.code = vec![0xff]; // tamper with the code after signing
+        assert!(!snap2.verify());
+    }
+}

@@ -93,6 +93,16 @@ pub trait Agent {
     /// Called per inbound message with the decoded UNL text and the data
     /// payload; the sender is `ctx.from()`. Reply via `ctx.send(...)`.
     fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx);
+
+    /// Serialize the agent's durable state for **migration** (default: stateless,
+    /// so a stateless agent migrates trivially). State-based mobility carries this
+    /// blob, not raw memory, so it is engine-portable (see `docs/MOBILITY.md`).
+    fn snapshot(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Restore state previously captured by [`Agent::snapshot`] (default: ignore).
+    fn restore(&mut self, _state: &[u8]) {}
 }
 
 // ─────────────────────────────  wasm32 glue  ─────────────────────────────
@@ -222,6 +232,30 @@ macro_rules! export_agent {
                 let unl = unsafe { ::core::slice::from_raw_parts(up, ul) };
                 let body = unsafe { ::core::slice::from_raw_parts(bp, bl) };
                 handle(from, unl, body);
+            }
+
+            // State-based migration: `snapshot` returns the agent's serialized
+            // state as a packed (ptr<<32 | len); `restore` re-applies it. Only wasm
+            // agents are mobile, so this is the move payload's state half.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn snapshot() -> i64 {
+                let bytes = unsafe {
+                    let slot = ::core::ptr::addr_of_mut!(AGENT);
+                    if (*slot).is_none() {
+                        *slot = ::core::option::Option::Some(::std::boxed::Box::new($init));
+                    }
+                    (*slot).as_ref().unwrap().snapshot()
+                };
+                let len = bytes.len() as i64;
+                let ptr = bytes.as_ptr() as i64;
+                ::core::mem::forget(bytes); // host reads it, then the instance is torn down
+                (ptr << 32) | len
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn restore(p: *const u8, l: usize) {
+                let state = unsafe { ::core::slice::from_raw_parts(p, l) };
+                drive(|a, _ctx| a.restore(state));
             }
 
             // re-export the host allocator so the linker keeps it

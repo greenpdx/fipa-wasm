@@ -32,6 +32,14 @@ pub trait AgentRuntime {
     fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Capture the agent's state for migration (default: empty / stateless).
+    fn snapshot(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Restore migrated state captured by [`AgentRuntime::snapshot`] (default: ignore).
+    fn restore(&mut self, _state: &[u8]) {}
 }
 
 impl AgentRuntime for super::WasmRuntime {
@@ -59,6 +67,14 @@ impl AgentRuntime for super::WasmRuntime {
 
     fn shutdown(&mut self) -> Result<()> {
         self.call_shutdown()
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        self.call_snapshot()
+    }
+
+    fn restore(&mut self, state: &[u8]) {
+        self.call_restore(state);
     }
 }
 
@@ -121,6 +137,14 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
         std::mem::take(&mut self.outbox)
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        self.agent.snapshot()
+    }
+
+    fn restore(&mut self, state: &[u8]) {
+        self.agent.restore(state);
     }
 }
 

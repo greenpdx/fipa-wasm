@@ -303,6 +303,42 @@ impl WasmRuntime {
         std::mem::take(&mut self.store.data_mut().unl_sends)
     }
 
+    /// Capture the agent's state via its `snapshot` export (state-based migration).
+    /// Empty if the guest exports no `snapshot` (a stateless agent).
+    pub fn call_snapshot(&mut self) -> Vec<u8> {
+        let f = match self.instance.get_typed_func::<(), i64>(&mut self.store, "snapshot") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        self.store.set_fuel(self.call_fuel()).ok();
+        let packed = match f.call(&mut self.store, ()) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let ptr = (packed >> 32) as usize;
+        let len = (packed & 0xffff_ffff) as usize;
+        let memory = match self.instance.get_memory(&mut self.store, "memory") {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let data = memory.data(&self.store);
+        data.get(ptr..ptr.saturating_add(len)).map(<[u8]>::to_vec).unwrap_or_default()
+    }
+
+    /// Restore state captured by [`Self::call_snapshot`] via the `restore` export.
+    pub fn call_restore(&mut self, state: &[u8]) {
+        let f = match self.instance.get_typed_func::<(i32, i32), ()>(&mut self.store, "restore") {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        self.store.set_fuel(self.call_fuel()).ok();
+        let Ok(ptr) = self.guest_alloc(state.len()) else { return };
+        if self.write_bytes(ptr, state).is_err() {
+            return;
+        }
+        let _ = f.call(&mut self.store, (ptr, state.len() as i32));
+    }
+
     /// Allocate `n` bytes in WASM memory via the guest's `alloc` export.
     fn guest_alloc(&mut self, n: usize) -> Result<i32> {
         let alloc = self
@@ -451,6 +487,47 @@ mod config_abi_tests {
         // the infinite loop runs out of fuel and traps — contained as an Err,
         // never an unbounded hang of the node (H3/R7).
         assert!(rt.call_config(b"x", b"y").is_err());
+    }
+
+    // A counter: each `deliver` increments n; `snapshot` returns n (4 bytes LE);
+    // `restore` sets n. Exercises state-based migration of a wasm agent.
+    const COUNTER_GUEST: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $n (mut i32) (i32.const 0))
+      (global $bump (mut i32) (i32.const 1024))
+      (func (export "init"))
+      (func (export "alloc") (param $len i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $bump))
+        (global.set $bump (i32.add (global.get $bump) (local.get $len)))
+        (local.get $p))
+      (func (export "deliver") (param i32 i32 i32 i32 i32 i32)
+        (global.set $n (i32.add (global.get $n) (i32.const 1))))
+      (func (export "snapshot") (result i64)
+        (i32.store (i32.const 0) (global.get $n))
+        (i64.or (i64.shl (i64.const 0) (i64.const 32)) (i64.const 4)))
+      (func (export "restore") (param $p i32) (param $l i32)
+        (global.set $n (i32.load (local.get $p)))))
+    "#;
+
+    #[test]
+    fn wasm_agent_state_snapshots_and_restores() {
+        use crate::wasm::AgentRuntime;
+        // origin: increment three times, then capture state
+        let mut a = WasmRuntime::new(COUNTER_GUEST.as_bytes(), &caps()).unwrap();
+        a.call_init().unwrap();
+        for _ in 0..3 {
+            a.config("x", b"inc", b"").unwrap();
+        }
+        let snap = a.snapshot();
+        assert_eq!(snap, vec![3, 0, 0, 0]); // n = 3 (little-endian i32)
+
+        // destination: a fresh instance restores the captured state
+        let mut b = WasmRuntime::new(COUNTER_GUEST.as_bytes(), &caps()).unwrap();
+        b.call_init().unwrap();
+        b.restore(&snap);
+        assert_eq!(b.snapshot(), vec![3, 0, 0, 0]); // state migrated
     }
 
     #[test]

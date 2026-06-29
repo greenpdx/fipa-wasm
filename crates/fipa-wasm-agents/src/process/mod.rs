@@ -23,6 +23,7 @@ use crate::wasm::{AgentRuntime, OutboundIntent};
 
 mod agents;
 mod manage;
+mod migrate;
 mod node;
 mod resolve;
 mod router;
