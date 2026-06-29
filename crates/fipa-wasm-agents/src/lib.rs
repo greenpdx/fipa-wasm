@@ -26,6 +26,7 @@ macro_rules! flow {
 }
 
 pub mod actor;
+pub mod adapters;
 pub mod behavior;
 pub mod consensus;
 pub mod content;

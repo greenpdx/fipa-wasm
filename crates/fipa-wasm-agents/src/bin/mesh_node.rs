@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use fipa_wasm_agents::identity::{AgentId, Header};
-use fipa_wasm_agents::process::{send_message, Node, NodeMsg};
+use fipa_wasm_agents::process::{send_message, Node};
 use fipa_wasm_agents::wasm::{AgentRuntime, NativeRuntime};
 use unl_agent::{Agent, Ctx};
 use uuid::Uuid;
@@ -70,6 +70,8 @@ fn main() {
 
     let (agent, service) = build_agent(&name, &data);
     let mut node = Node::new(&uuid, &name, &advertise, agent);
+    // Persisted node signing identity (R1): stable across restarts.
+    let _ = node.load_key(format!("{data}/node_key"));
     if let Some(a) = env("FIPA_AMS") {
         node.add_route("ams", &a);
         node.set_ams(&a);
@@ -94,17 +96,20 @@ fn main() {
     node.register(service.as_deref());
     eprintln!("[{name} {short}] registered with the platform");
 
+    // Capture an authenticated self-kick before the node moves into the serve thread
+    // (replaces the old unauthenticated `boot` send — THREAT_MODEL C5).
+    let kick = if name == "ba" { Some(node.sealed_kick(b"obj(start, buy)", b"")) } else { None };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     let handle = thread::spawn(move || node.serve(listener, sd));
 
-    // The buyer kicks itself off once discovery is ready (self-addressed message).
-    if name == "ba" {
+    // The buyer kicks itself off once discovery is ready (signed self-addressed message).
+    if let Some(k) = kick {
         let delay: u64 = env_or("FIPA_KICK", "2").parse().unwrap_or(2);
         thread::sleep(Duration::from_secs(delay));
         eprintln!("[{name} {short}] starting the purchase");
-        let m = NodeMsg { to: uuid.clone(), from: "boot".into(), unl: b"obj(start, buy)".to_vec(), ..Default::default() };
-        let _ = send_message(&advertise, &m);
+        let _ = send_message(&advertise, &k);
     }
 
     // Surface undeliverable messages (the buyer's verdict lands here as "result").
