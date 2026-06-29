@@ -1,831 +1,391 @@
-# FIPA-WASM Distributed Agent System Architecture
+# FIPA-UNL Agent System — Architecture
 
-**Version:** 0.2.0
-**Last Updated:** December 2024
-**Author:** SavageS
+**Version:** 0.3.0
+**Last Updated:** 2026-06-29
+**Author:** Shaun Savage (SavageS)
+**Companion spec:** [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md) — the detailed agent↔host contract.
+
+> **Reading note.** This document describes the system as it is **actually built**,
+> plus the **agreed design direction** for the agent↔host boundary. What is built
+> versus planned is stated explicitly in [§12 Status](#12-status-built-vs-planned).
+> An earlier draft of this file described a libp2p/Raft/Actix/WASI-P2 platform that
+> was largely never implemented; that vision is preserved, clearly labelled, in
+> [Appendix A](#appendix-a-future-directions-not-built).
 
 ---
 
 ## Table of Contents
 
-1. [Executive Summary](#executive-summary)
-2. [System Overview](#system-overview)
-3. [Architecture Decisions](#architecture-decisions)
-4. [Module Structure](#module-structure)
-5. [Core Components](#core-components)
-6. [Network Architecture](#network-architecture)
-7. [WASM Runtime](#wasm-runtime)
-8. [Distributed Consensus](#distributed-consensus)
-9. [Security Model](#security-model)
-10. [Message Formats](#message-formats)
-11. [API Reference](#api-reference)
-12. [Deployment](#deployment)
+1. [Executive summary](#1-executive-summary)
+2. [Governing principles](#2-governing-principles)
+3. [System overview](#3-system-overview)
+4. [The node as resource manager](#4-the-node-as-resource-manager)
+5. [Agents are block bundles](#5-agents-are-block-bundles)
+6. [Identity](#6-identity)
+7. [The message model](#7-the-message-model)
+8. [Discovery and the platform agents](#8-discovery-and-the-platform-agents)
+9. [Node initialization](#9-node-initialization)
+10. [Security model](#10-security-model)
+11. [The three brains — one seam](#11-the-three-brains--one-seam)
+12. [Status: built vs planned](#12-status-built-vs-planned)
+13. [Glossary](#13-glossary)
+- [Appendix A: Future directions (not built)](#appendix-a-future-directions-not-built)
 
 ---
 
-## Executive Summary
+## 1. Executive summary
 
-The FIPA-WASM Distributed Agent System is a next-generation implementation of FIPA (Foundation for Intelligent Physical Agents) protocols combined with WebAssembly-based mobile agents. The system enables autonomous software agents to:
+This is a [FIPA](http://www.fipa.org/)-aligned multi-agent platform whose agents
+carry semantic content as [UNL](http://www.unlweb.net/) (Universal Networking
+Language) graphs. It is built around two ideas:
 
-- **Communicate** using standardized FIPA ACL (Agent Communication Language) protocols
-- **Migrate** between distributed nodes while preserving state
-- **Coordinate** using Raft consensus for reliable distributed operations
-- **Discover** each other via peer-to-peer networking with automatic service discovery
+1. **The agent is small.** An agent is a *passive bundle of blocks* — code,
+   vocabulary, optional model, data, state — that computes nothing on its own.
+2. **The node gates everything.** A trusted **Rust** node loads the agent, *runs*
+   its brain, and mediates every byte in and out. The node is the **reference
+   monitor**; the agent has no ambient authority.
 
-### Key Technologies
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Concurrency | **Actix** | Actor model for message passing and supervision |
-| Networking | **libp2p** | Peer discovery, NAT traversal, transport multiplexing |
-| RPC | **gRPC/tonic** | Typed inter-service communication |
-| Serialization | **Protocol Buffers** | Efficient binary message encoding |
-| WASM Runtime | **Wasmtime** | Component model with WASI Preview 2 |
-| Consensus | **openraft** | Raft-based distributed state machine |
-| Storage | **RocksDB** | Persistent storage for Raft logs and agent state |
+A running example — a book-buying conversation — exercises the whole platform: a
+Buyer (BA) discovers a book seller through the **DF** (yellow pages), resolves its
+address through the **AMS** (white pages), buys *Limits to Growth* through a
+Payment Agent (**PA**) escrow, and the seller ships. This runs across five nodes
+(one agent each) over TCP/IP, in Docker containers by IP, today.
 
 ---
 
-## System Overview
+## 2. Governing principles
 
-### High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           FIPA-WASM Node                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
-│  │   Agent Actor   │  │   Agent Actor   │  │   Agent Actor   │  ...        │
-│  │  ┌───────────┐  │  │  ┌───────────┐  │  │  ┌───────────┐  │             │
-│  │  │WASM Module│  │  │  │WASM Module│  │  │  │WASM Module│  │             │
-│  │  └───────────┘  │  │  └───────────┘  │  │  └───────────┘  │             │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘             │
-│           │                    │                    │                       │
-│  ┌────────┴────────────────────┴────────────────────┴────────┐             │
-│  │                      Supervisor Tree                       │             │
-│  └────────────────────────────┬──────────────────────────────┘             │
-│                               │                                             │
-│  ┌────────────────────────────┼──────────────────────────────┐             │
-│  │                    Actor Registry                          │             │
-│  └────────────────────────────┬──────────────────────────────┘             │
-│                               │                                             │
-├───────────────────────────────┼─────────────────────────────────────────────┤
-│  ┌────────────────┐  ┌────────┴───────┐  ┌─────────────────┐               │
-│  │ Agent Directory│  │ Service Registry│  │ Raft Consensus │               │
-│  │   (Replicated) │  │   (Replicated)  │  │                 │               │
-│  └────────────────┘  └────────────────┘  └─────────────────┘               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        Network Layer                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │   │
-│  │  │  libp2p  │  │  gRPC    │  │  mDNS    │  │ Kademlia │            │   │
-│  │  │ Transport│  │ Services │  │ Discovery│  │   DHT    │            │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘            │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                          ┌─────────┴─────────┐
-                          │    Other Nodes    │
-                          └───────────────────┘
-```
-
-### Data Flow
-
-1. **Incoming Message**: libp2p → gRPC Service → Actor Registry → Agent Actor → WASM Module
-2. **Outgoing Message**: WASM Module → Host Functions → Actor → Network Layer → libp2p
-3. **Migration**: Agent Actor → Capture State → Serialize → Network → Target Node → Restore
+| # | Principle | Consequence |
+|---|---|---|
+| P1 | **Small agent, gating node** | The node is the only trust boundary; agents are sandboxed and capability-bounded. |
+| P2 | **The node is Rust, native, trusted** | The reference monitor cannot be a sandboxed wasm agent — it *is* the sandbox. |
+| P3 | **Least privilege, declared in the manifest** | The agent's `HEAD` block is read **first, always**; it declares which capabilities the agent may use. The node grants nothing else. |
+| P4 | **wasm-first for mobility** | wasm agents run on every node shape (including IoT and, in future, the browser). Native Rust is reserved for big, stationary agents. |
+| P5 | **OS/transport-agnostic ABI** | The agent↔host ABI assumes no filesystem and no sockets — only host calls — so a browser node can implement the same contract. |
+| P6 | **Log rich, reply thin** | Every gate logs maximal forensic detail node-side and returns a single uniform `denied` agent-side. The asymmetry is absolute. |
+| P7 | **UNL for human/semantic content, JSON for structured machine data** | UNL graphs carry meaning (services, requests); JSON bodies carry UUIDs, amounts, addresses. UUIDs never appear as UNL words. |
 
 ---
 
-## Architecture Decisions
+## 3. System overview
 
-### ADR-001: Actor Model with Actix
+```
+            ┌──────────────────────── NODE (Rust, trusted reference monitor) ───────────────────────┐
+            │                                                                                        │
+ inbound    │   IN-GATE                         BRAIN                       OUT-GATE                  │  outbound
+ ─────────► │  decode · authenticate ─►  wasm │ native │ llm  ─►  validate · scope · rate  ─────────►│ ─────────►
+ (from,     │  rate-limit                  (runs the agent's blocks)        (OutboundIntent)          │  (from,
+  unl,body) │       │                            │                              │                     │   unl,body)
+            │       └──── audit log (rich) ──────┴──────── audit log (rich) ────┘                     │
+            │                                                                                        │
+            │   PLATFORM AGENTS (native, trusted):  AMS · DF · [PA …]   ── back the discovery host-calls
+            │   TENANT AGENTS  (bundle-loaded, gated):  BA · BS · …                                  │
+            └────────────────────────────────────────────────────────────────────────────────────────┘
+                                                   │ TCP/IP (today)  ·  browser channel (future)
+                                            ┌──────┴───────┐
+                                            │  Other nodes │
+                                            └──────────────┘
+```
 
-**Decision:** Use Actix actor framework for concurrency and supervision.
-
-**Rationale:**
-- Mature ecosystem with extensive documentation
-- Built-in supervision trees for fault tolerance
-- Async-first design integrates well with Tokio
-- Message-passing model aligns with FIPA agent semantics
-
-**Alternatives Considered:**
-- Bastion: Erlang-inspired but less mature
-- Raw Tokio tasks: No built-in supervision
-
-### ADR-002: Hybrid libp2p + gRPC Networking
-
-**Decision:** Use libp2p for peer discovery and transport, gRPC for typed RPC.
-
-**Rationale:**
-- libp2p provides peer discovery (mDNS, Kademlia), NAT traversal, and transport encryption
-- gRPC provides strongly-typed service interfaces and code generation
-- Combined approach leverages strengths of both
-
-**Implementation:**
-- libp2p handles node discovery and connection management
-- gRPC services run over libp2p streams using request-response protocol
-- Protobuf used for both gRPC and libp2p message encoding
-
-### ADR-003: WASI Preview 2 Component Model
-
-**Decision:** Use WASI Preview 2 with the Component Model for WASM agents.
-
-**Rationale:**
-- Typed interfaces via WIT (WebAssembly Interface Types)
-- Better composability than Preview 1
-- Resource types for handles and capabilities
-- Future-proof as WASI stabilizes
-
-### ADR-004: Raft Consensus for Distributed State
-
-**Decision:** Use openraft for consensus on critical shared state.
-
-**Rationale:**
-- Agent directory requires consistent view across nodes
-- Service registry needs linearizable operations
-- Leader election simplifies coordination protocols
-
-**What's Replicated:**
-- Agent location mapping (agent ID → node ID)
-- Service registry (service name → provider agents)
-- Global configuration
-
-**What's NOT Replicated:**
-- Individual agent state (migrates with agent)
-- Conversation state (local to agent)
-- Transient messages
+- A **node** hosts one or more agents, runs a small **platform** (AMS/DF/PA),
+  and routes messages to other nodes.
+- An **agent** is a bundle of blocks the node runs behind a single seam
+  (`AgentRuntime`). It reacts to messages and timer ticks; it emits messages and
+  gated host-calls — all of which pass through the node's gates.
+- Today's cross-node transport is a hand-rolled length-prefixed **TCP** protocol
+  (`process::node`). One agent per node maps cleanly onto one container per agent.
 
 ---
 
-## Module Structure
+## 4. The node as resource manager
 
-```
-src/
-├── lib.rs                      # Public API, re-exports
-│
-├── actor/                      # Actor Framework Integration
-│   ├── mod.rs                  # Module exports
-│   ├── agent_actor.rs          # WASM agent wrapper actor
-│   ├── supervisor.rs           # Supervision tree management
-│   ├── registry.rs             # Actor name/address registry
-│   └── messages.rs             # Inter-actor message types
-│
-├── protocol/                   # FIPA Protocol Implementations
-│   ├── mod.rs                  # Protocol trait, exports
-│   ├── state_machine.rs        # Generic state machine trait
-│   ├── request.rs              # FIPA Request protocol
-│   ├── query.rs                # FIPA Query protocol
-│   ├── contract_net.rs         # FIPA Contract Net protocol
-│   ├── subscribe.rs            # FIPA Subscribe protocol
-│   ├── auction.rs              # English/Dutch auction protocols
-│   └── brokering.rs            # Brokering/Recruiting protocols
-│
-├── network/                    # Network Layer
-│   ├── mod.rs                  # Network subsystem entry
-│   ├── transport.rs            # libp2p swarm configuration
-│   ├── discovery.rs            # mDNS + Kademlia discovery
-│   ├── grpc.rs                 # tonic gRPC service impls
-│   ├── routing.rs              # Message routing actor
-│   └── nat.rs                  # NAT traversal (AutoNAT, relay)
-│
-├── wasm/                       # WASM Runtime
-│   ├── mod.rs                  # Runtime exports
-│   ├── runtime.rs              # Wasmtime component runtime
-│   ├── bindings.rs             # WIT-generated bindings
-│   ├── host.rs                 # Host function implementations
-│   └── state.rs                # State capture/restore
-│
-├── consensus/                  # Distributed Consensus
-│   ├── mod.rs                  # Consensus exports
-│   ├── raft.rs                 # openraft integration
-│   ├── state.rs                # Replicated state machine
-│   └── storage.rs              # RocksDB log storage
-│
-├── registry/                   # Service Discovery
-│   ├── mod.rs                  # Registry exports
-│   ├── agent_directory.rs      # Agent location service
-│   ├── service_registry.rs     # Service discovery
-│   └── health.rs               # Health checking
-│
-├── proto/                      # Protocol Buffers
-│   ├── fipa.proto              # Message definitions
-│   └── mod.rs                  # Generated code re-exports
-│
-└── bin/                        # Binaries
-    ├── agent_node.rs           # Main node binary
-    └── cli.rs                  # CLI management tool
-```
+The node — **not** any agent — is the resource manager: it loads agents, implements
+and gates the ABI, routes communication, and runs the platform agents. It is always
+**Rust source**. What varies per deployment is the embedded wasm engine, the ABI
+breadth, and the budgets:
+
+| | **normal node** | **IoT node** | **browser node** (future) |
+|---|---|---|---|
+| resource manager | Rust binary | Rust binary (small) | Rust → wasm, in-page |
+| wasm engine for agents | JIT (e.g. wasmtime) | small **interpreter** (e.g. wasmi) | the browser's wasm engine |
+| ABI breadth | full | limited (load-time fit) | full-ish (no FS) |
+| platform agents | AMS · DF · PA (+) | AMS · DF (minimal) | AMS · DF |
+| budgets | MB / megafuel | KB / kilofuel | tab limits |
+
+The same Rust node is the same reference monitor everywhere; only its *engine* and
+*ABI surface* shrink for constrained targets. This is why P5 (OS/transport-agnostic
+ABI) matters: the browser node is literally the Rust node compiled to wasm, hosting
+agent wasm modules.
 
 ---
 
-## Core Components
+## 5. Agents are block bundles
 
-### 1. Agent Actor
+An agent is a passive bundle. The node runs and gates each block.
 
-The `AgentActor` wraps a WASM agent and manages its lifecycle:
+| Block | Contents | Who runs it |
+|---|---|---|
+| **HEAD** | the **manifest** — identity, profile, brain kind, grants, budgets | node reads it **first, always** |
+| **WASM** | agent code (optional) | node's wasm engine |
+| **UNL** | the agent's vocabulary / system frame (decoded) | node decodes; feeds the brain |
+| **LLM** | model bytes **or** a reference (`ollama:…`, model id, endpoint) | node runs via `ReasoningBackend` |
+| **DATA** | static seed | node → `seed()` |
+| **STATE** | mutable durable state | node-owned, agent-scoped, quota'd |
+| **SIG** | signature over the bundle | node verifies before load |
 
-```rust
-pub struct AgentActor {
-    /// Agent identifier
-    agent_id: AgentId,
+A given agent uses *some* blocks: the Buyer is `HEAD+WASM`; an LLM agent is
+`HEAD+UNL+LLM(+STATE)`; an infrastructure agent is `HEAD+native(+STATE)`.
 
-    /// WASM runtime instance
-    runtime: WasmRuntime,
-
-    /// Active protocol conversations
-    conversations: HashMap<String, Box<dyn ProtocolStateMachine>>,
-
-    /// Incoming message queue
-    mailbox: VecDeque<AclMessage>,
-
-    /// Agent capabilities/permissions
-    capabilities: AgentCapabilities,
-
-    /// Reference to supervisor
-    supervisor: Addr<Supervisor>,
-
-    /// Reference to network actor
-    network: Addr<NetworkActor>,
-}
-```
-
-**Actor Messages:**
-
-| Message | Description |
-|---------|-------------|
-| `DeliverMessage` | Deliver an ACL message to the agent |
-| `CaptureState` | Capture agent state for migration |
-| `MigrateTo` | Initiate migration to another node |
-| `Shutdown` | Graceful shutdown request |
-
-### 2. Supervisor
-
-Manages agent lifecycle with restart strategies:
-
-```rust
-pub struct Supervisor {
-    /// Supervised agent actors
-    agents: HashMap<AgentId, Addr<AgentActor>>,
-
-    /// Restart strategy per agent
-    strategies: HashMap<AgentId, RestartStrategy>,
-
-    /// Failure counts for backoff
-    failure_counts: HashMap<AgentId, FailureRecord>,
-}
-
-pub enum RestartStrategy {
-    /// Always restart immediately
-    Immediate,
-
-    /// Restart with exponential backoff
-    Backoff { initial_ms: u64, max_ms: u64, multiplier: f64 },
-
-    /// Stop after N failures in time window
-    MaxFailures { count: u32, window_secs: u64 },
-
-    /// Never restart
-    None,
-}
-```
-
-### 3. Protocol State Machines
-
-Each FIPA protocol is implemented as a state machine:
-
-```rust
-pub trait ProtocolStateMachine: Send + Sync {
-    /// Get protocol type identifier
-    fn protocol_type(&self) -> ProtocolType;
-
-    /// Validate an incoming message
-    fn validate(&self, msg: &AclMessage) -> Result<(), ProtocolError>;
-
-    /// Process message and transition state
-    fn process(&mut self, msg: AclMessage) -> Result<ProcessResult, ProtocolError>;
-
-    /// Check if protocol is in terminal state
-    fn is_complete(&self) -> bool;
-
-    /// Serialize state for migration
-    fn serialize_state(&self) -> Vec<u8>;
-
-    /// Restore state after migration
-    fn restore_state(data: &[u8]) -> Result<Self, ProtocolError> where Self: Sized;
-}
-
-pub enum ProcessResult {
-    /// Continue waiting for messages
-    Continue,
-
-    /// Send response message
-    Respond(AclMessage),
-
-    /// Protocol completed successfully
-    Complete(CompletionData),
-
-    /// Protocol failed
-    Failed(String),
-}
-```
+The manifest is the **resource-management record** for the agent. See
+[`AGENT_HOST_ABI.md` §4](./AGENT_HOST_ABI.md) for its schema and the load sequence.
 
 ---
 
-## Network Architecture
+## 6. Identity
 
-### libp2p Configuration
+Identity follows the FIPA **Agent Identifier (AID)** — `{ name, addresses,
+resolvers }` — with `name` made a **UUID** so identity is location-independent and
+survives migration (addresses are resolved via AMS, never baked in).
 
-```rust
-pub struct NetworkConfig {
-    /// Listen addresses
-    pub listen_addrs: Vec<Multiaddr>,
+- **instance UUID** — the AID `name`, unique per *running* agent.
+- **type `{UUID, desc}`** — the *kind* of agent, carried in `HEAD`; many instances
+  share a type.
+- **friendly name** — display/logs only, never the identity.
 
-    /// Bootstrap peers for DHT
-    pub bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+Lifecycle:
 
-    /// Enable mDNS for local discovery
-    pub enable_mdns: bool,
+- **ephemeral / mobile** agents **mint** a fresh instance UUID at spawn
+  (`AgentId::spawn`);
+- **persistent infrastructure** agents **persist** their UUID
+  (`AgentId::load_or_mint`) so long-lived references (a held order naming the
+  seller) survive a restart.
 
-    /// Enable Kademlia DHT
-    pub enable_kademlia: bool,
-
-    /// Enable relay for NAT traversal
-    pub enable_relay: bool,
-
-    /// Node identity keypair
-    pub keypair: Keypair,
-}
-```
-
-**Protocols Used:**
-
-| Protocol | Purpose |
-|----------|---------|
-| Noise | Encryption and authentication |
-| Yamux | Stream multiplexing |
-| mDNS | Local network peer discovery |
-| Kademlia | Distributed hash table for wide-area discovery |
-| GossipSub | Pub/sub for broadcast messages |
-| Request-Response | Direct agent-to-agent messages |
-| AutoNAT | NAT type detection |
-| Relay | Fallback for NAT traversal |
-| DCUtR | Direct Connection Upgrade through Relay |
-
-### Message Flow
-
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Agent A     │     │  Network     │     │  Agent B     │
-│  (Node 1)    │     │  Layer       │     │  (Node 2)    │
-└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-       │                    │                    │
-       │ send_message()     │                    │
-       ├───────────────────>│                    │
-       │                    │ libp2p route       │
-       │                    ├───────────────────>│
-       │                    │                    │ DeliverMessage
-       │                    │                    ├─────────────>
-       │                    │                    │ process in WASM
-       │                    │<───────────────────┤ response
-       │                    │                    │
-       │<───────────────────┤                    │
-       │ receive_message()  │                    │
-       │                    │                    │
-```
+A UUID is *structured machine data*: it travels as a routing key (`from`/`to`) and
+inside **JSON bodies**, never as a UNL word (P7). Implementation: `identity.rs`
+(`AgentType`, `Header`, `AgentId`, `Aliases`).
 
 ---
 
-## WASM Runtime
+## 7. The message model
 
-### WIT Interface (WASI Preview 2)
+Every message is a triple:
 
-```wit
-package fipa:agent@0.2.0;
-
-interface messaging {
-    enum performative {
-        request, inform, query-if, query-ref, cfp, propose,
-        accept-proposal, reject-proposal, agree, refuse, failure,
-        inform-done, inform-result, not-understood, subscribe, cancel,
-    }
-
-    enum protocol-type {
-        request, query, request-when, contract-net,
-        iterated-contract-net, propose, brokering, recruiting,
-        subscribe, english-auction, dutch-auction,
-    }
-
-    record agent-id {
-        name: string,
-        addresses: list<string>,
-    }
-
-    record acl-message {
-        message-id: string,
-        performative: performative,
-        sender: agent-id,
-        receivers: list<agent-id>,
-        protocol: option<protocol-type>,
-        conversation-id: option<string>,
-        content: list<u8>,
-    }
-
-    send-message: func(message: acl-message) -> result<string, string>;
-    receive-message: func() -> option<acl-message>;
-    find-agents-by-service: func(service: string) -> result<list<agent-id>, string>;
-}
-
-interface migration {
-    record node-info {
-        id: string,
-        load: f32,
-        latency-ms: u32,
-        available-memory: u64,
-    }
-
-    get-current-node: func() -> string;
-    list-nodes: func() -> list<node-info>;
-    migrate-to: func(node-id: string) -> result<_, string>;
-}
-
-interface storage {
-    store: func(key: string, value: list<u8>) -> result<_, string>;
-    load: func(key: string) -> result<list<u8>, string>;
-    delete: func(key: string) -> result<_, string>;
-}
-
-interface logging {
-    enum log-level { trace, debug, info, warn, error }
-    log: func(level: log-level, message: string);
-}
-
-world agent {
-    import wasi:io/poll@0.2.0;
-    import wasi:clocks/monotonic-clock@0.2.0;
-    import messaging;
-    import migration;
-    import storage;
-    import logging;
-
-    export init: func();
-    export run: func() -> bool;
-    export shutdown: func();
-    export handle-message: func(message: messaging.acl-message) -> bool;
-}
+```
+(from, unl, body)
 ```
 
-### State Capture for Migration
+- **`from`** — the sender's instance UUID. It is **authenticated**: the node stamps
+  it from its own knowledge of the emitter; the agent never sets it. Intra-node,
+  the `Router` stamps `from` from the resolved sender (an `OutboundIntent` has no
+  sender field, so it is unforgeable). Cross-node authentication of `from` (signing)
+  is a planned upgrade — see [§12](#12-status-built-vs-planned).
+- **`unl`** — a UNL graph: the **human/semantic** content (a service name, a
+  request, an offer). This is what would "come from people."
+- **`body`** — JSON: **structured machine data** (UUIDs, amounts, addresses).
 
-```rust
-pub struct AgentSnapshot {
-    /// Agent identifier
-    pub agent_id: AgentId,
-
-    /// WASM module bytecode
-    pub wasm_module: Vec<u8>,
-
-    /// Linear memory snapshot
-    pub memory: Vec<u8>,
-
-    /// Global variable values
-    pub globals: Vec<GlobalValue>,
-
-    /// Active conversation states
-    pub conversations: Vec<ConversationSnapshot>,
-
-    /// Persistent storage data
-    pub storage: HashMap<String, Vec<u8>>,
-
-    /// Migration history
-    pub migration_history: Vec<NodeId>,
-
-    /// Cryptographic signature
-    pub signature: Option<Vec<u8>>,
-}
-```
+This split (P7) keeps UNL purely semantic and keeps machine identifiers out of the
+human content. FIPA ACL envelope fields (performative, conversation-id,
+in-reply-to, reply-by, protocol) are an **opt-in** layer on top — see the ABI spec.
 
 ---
 
-## Distributed Consensus
+## 8. Discovery and the platform agents
 
-### Raft Integration
+Two FIPA system agents provide discovery; a third provides escrow:
 
-The system uses openraft for consensus on shared state:
+- **AMS** (Agent Management System) — **white pages**: UUID → address. The agent
+  UUID is carried in the JSON body, not in UNL.
+- **DF** (Directory Facilitator) — **yellow pages**: a service (a UNL graph) →
+  provider UUIDs (in the JSON body; the provider is the authenticated `from`).
+- **PA** (Payment Agent) — escrow: `reserve` / `accept` / `deny` holds over a
+  durable ledger (sled), so a buyer and seller can transact without trusting each
+  other.
 
-```rust
-pub type NodeId = u64;
-
-pub struct FipaRaft {
-    raft: Raft<TypeConfig>,
-    network: Arc<RaftNetwork>,
-    storage: Arc<RaftStorage>,
-}
-
-/// State machine for replicated data
-pub struct StateMachine {
-    /// Agent directory: agent_id -> node_id
-    agent_directory: HashMap<String, NodeId>,
-
-    /// Service registry: service_name -> Vec<(agent_id, metadata)>
-    service_registry: HashMap<String, Vec<ServiceEntry>>,
-
-    /// Last applied log index
-    last_applied: LogId,
-}
-
-/// Commands that can be applied to state machine
-pub enum Command {
-    RegisterAgent { agent_id: String, node_id: NodeId },
-    DeregisterAgent { agent_id: String },
-    RegisterService { service: ServiceEntry },
-    DeregisterService { service_name: String, agent_id: String },
-    MigrateAgent { agent_id: String, from: NodeId, to: NodeId },
-}
-```
-
-### Consistency Guarantees
-
-| Operation | Consistency | Notes |
-|-----------|-------------|-------|
-| Find agent location | Linearizable | Via Raft read |
-| Register agent | Linearizable | Via Raft write |
-| Send message | At-most-once | Direct delivery |
-| Migration | Exactly-once | Two-phase with Raft |
+**Discovery is being promoted to typed, gated, async host-calls** (`find_service`,
+`locate`). These are a thin *façade*: the node satisfies them by routing to its own
+AMS/DF platform agents. Promotion does not replace AMS/DF — it puts a typed,
+least-privilege front door on them. (Today, agents reach AMS/DF by *sending them
+messages* directly; the host-call façade is planned — see [§12](#12-status-built-vs-planned).)
 
 ---
 
-## Security Model
+## 9. Node initialization
 
-### Capability-Based Permissions
+A node boots a small **platform** *before* any tenant agent, because the platform is
+what *backs* the discovery host-calls:
 
-Each agent declares capabilities that restrict its behavior:
-
-```rust
-pub struct AgentCapabilities {
-    /// Maximum memory in bytes
-    pub max_memory: u64,
-
-    /// Maximum execution time per call
-    pub max_execution_time: Duration,
-
-    /// Allowed protocols
-    pub allowed_protocols: HashSet<ProtocolType>,
-
-    /// Network access level
-    pub network_access: NetworkAccess,
-
-    /// Storage quota in bytes
-    pub storage_quota: u64,
-
-    /// Can this agent migrate?
-    pub migration_allowed: bool,
-
-    /// Can this agent spawn sub-agents?
-    pub spawn_allowed: bool,
-}
-
-pub enum NetworkAccess {
-    /// No network access
-    None,
-
-    /// Only local node agents
-    LocalOnly,
-
-    /// Specific nodes/agents allowed
-    Restricted(Vec<String>),
-
-    /// Full network access
-    Unrestricted,
-}
+```
+NODE BOOT
+ 1. load node config + node keypair/UUID        (the node has its own identity, for attestation)
+ 2. select profile:  normal | iot
+ 3. bring up PLATFORM agents in-process (native, trusted):
+        AMS (white pages) · DF (yellow pages) · [PA, … on a full node]
+        ── an IoT node ALSO loads AMS + DF, minimal ──  (so a local agent's find_service has an answer, even offline)
+ 4. wire routes (in-process for co-located AMS/DF; bootstrap addresses for remote peers)
+ 5. open transport (TCP today; browser channel later — same ABI)
+ 6. register node/self with the platform
+ ── platform is now live ──
+ 7. load TENANT agents from bundles:
+        read HEAD ─► verify SIG ─► gate (profile fit + grants) ─► instantiate brain ─► init() ─► seed()
 ```
 
-### Code Signing
-
-All agent packages are cryptographically signed:
-
-```rust
-pub struct AgentPackage {
-    /// The agent data
-    pub agent: AgentSnapshot,
-
-    /// SHA-256 hash of agent data
-    pub hash: [u8; 32],
-
-    /// Ed25519 signature of hash
-    pub signature: [u8; 64],
-
-    /// Signer's public key
-    pub public_key: [u8; 32],
-
-    /// Signature timestamp
-    pub timestamp: u64,
-}
-
-impl AgentPackage {
-    pub fn verify(&self) -> Result<(), SignatureError> {
-        // 1. Recompute hash
-        let computed_hash = sha256(&self.agent.serialize());
-        if computed_hash != self.hash {
-            return Err(SignatureError::HashMismatch);
-        }
-
-        // 2. Verify signature
-        let public_key = ed25519::PublicKey::from_bytes(&self.public_key)?;
-        let signature = ed25519::Signature::from_bytes(&self.signature)?;
-        public_key.verify(&self.hash, &signature)?;
-
-        Ok(())
-    }
-}
-```
-
-### WASM Sandboxing
-
-- Memory isolation: Each agent has separate linear memory
-- Resource limits: CPU time, memory, fuel metering
-- Controlled host access: Only allowed WIT imports available
-- No direct system calls: All I/O through host functions
+Consequence: an **IoT node is a self-contained mini-platform** — it carries its own
+AMS+DF so it works offline. Two agent classes result: **platform agents** (native,
+trusted, *back* the host-calls) and **tenant agents** (bundle-loaded, gated,
+*consume* them).
 
 ---
 
-## Message Formats
+## 10. Security model
 
-### Protocol Buffers Schema
+The security model is the reference monitor (P1/P2) plus least privilege (P3) plus
+the audit asymmetry (P6).
 
-```protobuf
-syntax = "proto3";
-package fipa.v1;
+### 10.1 The gates
 
-message AgentId {
-    string name = 1;
-    repeated string addresses = 2;
-}
+Four gates, all node-side:
 
-enum Performative {
-    PERFORMATIVE_UNSPECIFIED = 0;
-    PERFORMATIVE_REQUEST = 1;
-    PERFORMATIVE_INFORM = 2;
-    PERFORMATIVE_QUERY_IF = 3;
-    PERFORMATIVE_QUERY_REF = 4;
-    PERFORMATIVE_CFP = 5;
-    PERFORMATIVE_PROPOSE = 6;
-    PERFORMATIVE_ACCEPT_PROPOSAL = 7;
-    PERFORMATIVE_REJECT_PROPOSAL = 8;
-    PERFORMATIVE_AGREE = 9;
-    PERFORMATIVE_REFUSE = 10;
-    PERFORMATIVE_FAILURE = 11;
-    PERFORMATIVE_INFORM_DONE = 12;
-    PERFORMATIVE_INFORM_RESULT = 13;
-    PERFORMATIVE_NOT_UNDERSTOOD = 14;
-    PERFORMATIVE_SUBSCRIBE = 15;
-    PERFORMATIVE_CANCEL = 16;
-}
+1. **Load-time fit** — the node reads `HEAD` and matches declared `grants` against
+   the node profile. A wasm agent that needs `llm` is rejected at the door of an
+   IoT node, **before it runs**, reported to the *operator*. This is where a node
+   may genuinely link a *smaller* ABI (footprint) without the agent probing.
+2. **In-gate** — inbound `(from, unl, body)`: decode, authenticate `from`,
+   rate-limit, authorize delivery.
+3. **Out-gate** — every emitted message and host-call (`OutboundIntent`) is
+   validated, network-scoped, and rate-limited before it takes effect.
+4. **Runtime budget** — memory, fuel/CPU, storage quota, timer-slot count, message
+   rate. (Hard CPU/RAM caps for wasm are a planned upgrade; native agents run under
+   `catch_unwind` fault isolation today — see [§12](#12-status-built-vs-planned).)
 
-enum ProtocolType {
-    PROTOCOL_UNSPECIFIED = 0;
-    PROTOCOL_REQUEST = 1;
-    PROTOCOL_QUERY = 2;
-    PROTOCOL_CONTRACT_NET = 3;
-    PROTOCOL_SUBSCRIBE = 4;
-    PROTOCOL_ENGLISH_AUCTION = 5;
-    PROTOCOL_DUTCH_AUCTION = 6;
-}
+### 10.2 Uniform denials, no info leak
 
-message AclMessage {
-    string message_id = 1;
-    Performative performative = 2;
-    AgentId sender = 3;
-    repeated AgentId receivers = 4;
-    optional ProtocolType protocol = 5;
-    optional string conversation_id = 6;
-    optional string in_reply_to = 7;
-    optional int64 reply_by = 8;
-    optional string ontology = 9;
-    bytes content = 10;
-}
+Once an agent is admitted, **any** disallowed call returns the **same opaque
+`denied`** — whether the capability is absent-by-profile or ungranted-by-manifest.
+The agent cannot distinguish the reasons; it cannot probe the host. Load-time fit is
+operator-facing and trusted; runtime denial is agent-facing and opaque. Both hold at
+once because they happen at different times.
 
-message MessageEnvelope {
-    string source_node = 1;
-    string target_node = 2;
-    uint64 sequence = 3;
-    int64 timestamp = 4;
-    oneof payload {
-        AclMessage message = 5;
-        AgentMigration migration = 6;
-        ConsensusMessage consensus = 7;
-    }
-}
+### 10.3 Log rich, reply thin (P6)
 
-service FipaAgentService {
-    rpc SendMessage(AclMessage) returns (SendResponse);
-    rpc FindAgent(FindAgentRequest) returns (FindAgentResponse);
-    rpc MigrateAgent(AgentMigration) returns (MigrationResponse);
-    rpc HealthCheck(HealthRequest) returns (HealthResponse);
-}
-```
+| | audit/log channel (node-side, trusted) | agent reply (untrusted) |
+|---|---|---|
+| permission violation | agent UUID+type, node id, capability, exact call+args (or hashes), the rule that denied it, manifest grants, timestamp, correlation id | a single uniform `denied` |
+| failure (panic/trap/quota) | brain kind, fuel/mem at fault, panic payload or wasm trap, state ref | uniform terminal status; output discarded |
+
+The log is node-attributed and agent-unspoofable: an agent cannot forge or suppress
+its own violation record. A probing agent that tries every capability gets back an
+undifferentiated wall of `denied` — while the audit log captures the entire probe,
+which is itself the strongest abuse signal.
+
+### 10.4 Sandbox tiers
+
+- **wasm** — memory isolation by construction; resource caps via engine fuel/memory
+  limits (planned to be wired); host access only through granted imports.
+- **native** — agent crates set `#![forbid(unsafe_code)]`; every call runs under
+  `catch_unwind` so a panic is contained and the agent quarantined, not the node.
+  Hard CPU/RAM caps need a thread/process boundary (the remaining native upgrade).
 
 ---
 
-## API Reference
+## 11. The three brains — one seam
 
-### Public Rust API
+Three kinds of brain present the **same** lifecycle to the node, through the
+`AgentRuntime` seam (`init` / `config(from,unl,body)` / `take_sends` / `run` /
+`shutdown`). The rest of the node is brain-agnostic:
 
-```rust
-// Create a new node
-let config = NodeConfig::builder()
-    .node_id("node-1")
-    .listen_addr("/ip4/0.0.0.0/tcp/9000")
-    .enable_mdns(true)
-    .build();
+| Brain | Runtime | Use | Status |
+|---|---|---|---|
+| **wasm** | `WasmRuntime` | mobile / untrusted / portable agents | built |
+| **native** | `NativeRuntime<A>` | big, stationary agents (AMS/DF/PA) | built |
+| **llm** | `LlmRuntime` | the node runs the agent's LLM block as its brain | planned |
 
-let node = FipaNode::new(config).await?;
-
-// Spawn an agent
-let agent = node.spawn_agent(AgentConfig {
-    id: AgentId::new("my-agent"),
-    wasm_module: include_bytes!("agent.wasm").to_vec(),
-    capabilities: Capabilities::default(),
-}).await?;
-
-// Send a message
-agent.send(AclMessage {
-    performative: Performative::Request,
-    receiver: AgentId::new("other-agent"),
-    content: b"perform task X".to_vec(),
-    protocol: Some(ProtocolType::Request),
-    ..Default::default()
-}).await?;
-
-// Find agents by service
-let providers = node.find_service("data-processing").await?;
-
-// Migrate agent
-agent.migrate_to("node-2").await?;
-```
+`LlmRuntime` maps `config(from,unl,body)` → a `Prompt` built from (UNL system frame
++ STATE + inbound) → `unl_llm::ReasoningBackend::complete` → parsed into
+`OutboundIntent`s + state writes. This is literally "the LLM model or reference that
+the node runs," reusing `unl-llm` wholesale.
 
 ---
 
-## Deployment
+## 12. Status: built vs planned
 
-### Node Requirements
+**Built and verified today:**
 
-- **CPU:** 2+ cores recommended
-- **Memory:** 1GB minimum, 4GB+ for production
-- **Disk:** 10GB+ for RocksDB storage
-- **Network:** TCP ports for libp2p, gRPC
+- `unl-agent`: the `Agent` trait (`on_init`/`on_seed`/`on_message`) + `Ctx`, and the
+  wasm ABI (`init`/`run`/`config`/`deliver`/`alloc` exports, `send-unl` import).
+- `AgentRuntime` seam with `WasmRuntime` and `NativeRuntime` (fault-isolated).
+- Identity: `AgentId` (mint at spawn / persist for infra), `Aliases`.
+- Authenticated `from` **intra-node** via the `Router`.
+- Cross-node transport over TCP/IP (`process::node`): return-address caching,
+  bootstrap routes, synchronous `RESOLVE` to the AMS node, startup registration.
+- Platform agents: AMS, DF, PA (durable sled ledger), plus BS (seller) and a real
+  **wasm** Buyer (BA).
+- The full book-buy across 5 nodes, verified on loopback (`book-cluster`) and in
+  Docker over container IPs (`obj(bought, LtG)`).
+- UNL stack: `unl-core`, `unl-parser`, `unl-validator`, `unl-kb`, `unl-llm`,
+  `unl-fipa`, `unl-a2a`.
 
-### Configuration
+**Designed (this architecture) but not yet built:**
 
-```toml
-[node]
-id = "node-1"
-listen = ["/ip4/0.0.0.0/tcp/9000", "/ip4/0.0.0.0/udp/9000/quic-v1"]
+- The full **manifest** (HEAD beyond type/desc/name) and **load-time gating**.
+- **Profiles** (IoT vs normal) and the IoT node shape.
+- **Scheduling**: timer slots + `tick(timer_id, now_ms)`.
+- Host interfaces for wasm agents: **state, time, llm, crypto, spawn**, and
+  discovery as **typed async host-calls** (today agents message AMS/DF directly).
+- The **async upcall / reply-by-message** model.
+- **LlmRuntime**.
+- Hard **resource metering** (wasm fuel/memory caps; native thread/process caps).
+- Cross-node **signing** (bundle `SIG`, node keypair attestation, authenticated
+  `from` across nodes).
+- The **audit logging** channel (P6) as a first-class subsystem.
+- The **browser node**.
 
-[discovery]
-mdns = true
-kademlia = true
-bootstrap = [
-    "/ip4/192.168.1.100/tcp/9000/p2p/12D3KooW..."
-]
+---
 
-[consensus]
-enabled = true
-raft_dir = "/var/lib/fipa/raft"
-election_timeout_ms = 1000
-heartbeat_interval_ms = 100
+## 13. Glossary
 
-[wasm]
-max_memory_bytes = 67108864  # 64 MB
-max_execution_time_ms = 5000
-fuel_limit = 1000000000
+- **AID** — FIPA Agent Identifier `{ name, addresses, resolvers }`; here `name` is a UUID.
+- **AMS** — Agent Management System; white pages (UUID → address).
+- **DF** — Directory Facilitator; yellow pages (service → providers).
+- **PA** — Payment Agent; escrow.
+- **Brain** — an agent's logic block (wasm | native | llm). *Not* the node.
+- **Node** — the Rust resource manager / reference monitor that runs and gates agents.
+- **Manifest / HEAD** — the agent's resource-management record, read first.
+- **UNL** — Universal Networking Language; semantic graph content.
+- **Tenant agent** — a bundle-loaded, gated agent. **Platform agent** — a native, trusted system agent (AMS/DF/PA).
 
-[metrics]
-enabled = true
-prometheus_port = 9090
-```
+---
 
-### Docker
+## Appendix A: Future directions (not built)
 
-```dockerfile
-FROM rust:1.83-slim as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
+An earlier draft of this document specified a richer distributed platform. None of
+the following is implemented; it is recorded as a candidate roadmap, **not** a
+description of the system:
 
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/fipa-node /usr/local/bin/
-EXPOSE 9000 9090
-CMD ["fipa-node", "--config", "/etc/fipa/config.toml"]
-```
+- **Networking** — libp2p (mDNS + Kademlia discovery, NAT traversal, Noise/Yamux)
+  in place of, or beneath, the current hand-rolled TCP transport; gRPC/tonic for
+  typed RPC.
+- **Consensus** — openraft for a replicated agent directory and service registry
+  (linearizable `find`/`register`), with RocksDB-backed logs.
+- **Supervision** — an Actix-style supervisor tree with per-agent restart strategies
+  (immediate / backoff / max-failures / none).
+- **Mobility** — agent migration and cloning via signed state snapshots
+  (`doMove`/`doClone`), capturing linear memory, globals, conversation state, and
+  storage.
+- **Components** — WASI Preview 2 / the WebAssembly Component Model with WIT-typed
+  interfaces, in place of the current minimal `(ptr,len)` ABI.
+- **Federation** — multi-platform DF federation; MCP bridge so an external LLM can
+  drive the platform (see `PLAN_MCP_AGENT.md`).
+
+These should be adopted only deliberately, one at a time, measured against the
+governing principles in §2 — especially P5 (an OS/transport-agnostic ABI) and the
+small-agent/gating-node split.
 
 ---
 
 ## References
 
 - [FIPA Specifications](http://www.fipa.org/repository/)
+- [FIPA ACL](http://www.fipa.org/specs/fipa00061/) · [Agent Management](http://www.fipa.org/specs/fipa00023/)
+- [UNL](http://www.unlweb.net/)
 - [WebAssembly Component Model](https://github.com/WebAssembly/component-model)
-- [WASI Preview 2](https://github.com/WebAssembly/WASI/blob/main/preview2/README.md)
-- [libp2p](https://libp2p.io/)
-- [Raft Consensus](https://raft.github.io/)
-- [Actix Actor Framework](https://actix.rs/)
+- Companion: [`AGENT_HOST_ABI.md`](./AGENT_HOST_ABI.md), [`agents/AMS_DESIGN.md`](./agents/AMS_DESIGN.md), [`agents/DF_DESIGN.md`](./agents/DF_DESIGN.md), [`agents/PA_DESIGN.md`](./agents/PA_DESIGN.md)
