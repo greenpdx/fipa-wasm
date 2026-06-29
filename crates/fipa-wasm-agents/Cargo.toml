@@ -64,6 +64,7 @@ libp2p = { version = "0.56", features = [
 # WASM runtime - Component Model
 wasmtime = { version = "40", features = ["component-model", "async"] }
 wasmtime-wasi = "40"
+wasmi = "0.40"  # interpreter backend for the IoT profile (Engine seam, E2)
 
 # Consensus
 openraft = { version = "0.9", features = ["serde"] }
@@ -121,6 +122,7 @@ prost-build = "0.14"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.19"
+wat = "1"  # compile WAT → binary wasm for the wasmi backend tests
 criterion = { version = "0.8", features = ["async_tokio"] }
 proptest = "1.6"
 
