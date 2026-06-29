@@ -145,20 +145,34 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
 }
 
 /// A namespaced state handle: an agent's [`unl_agent::Kv`] confined to its own
-/// namespace, backed by the node's [`SledStore`] (R8 — keys cannot escape).
+/// namespace (R8 — keys cannot escape) and bounded by a byte quota (M4).
 struct ScopedKv {
     store: Arc<SledStore>,
     ns: String,
+    used: Arc<std::sync::atomic::AtomicU64>,
+    quota: u64,
 }
 impl unl_agent::Kv for ScopedKv {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.store.get(&self.ns, key).ok().flatten()
     }
     fn put(&self, key: &str, val: &[u8]) {
-        let _ = self.store.put(&self.ns, key, val);
+        use std::sync::atomic::Ordering::Relaxed;
+        let old = self.store.get(&self.ns, key).ok().flatten().map(|v| v.len() as u64).unwrap_or(0);
+        let projected = self.used.load(Relaxed).saturating_sub(old).saturating_add(val.len() as u64);
+        if projected > self.quota {
+            return; // quota exceeded → silent denial (the agent sees no write)
+        }
+        if self.store.put(&self.ns, key, val).is_ok() {
+            self.used.store(projected, Relaxed);
+        }
     }
     fn del(&self, key: &str) {
-        let _ = self.store.del(&self.ns, key);
+        use std::sync::atomic::Ordering::Relaxed;
+        let old = self.store.get(&self.ns, key).ok().flatten().map(|v| v.len() as u64).unwrap_or(0);
+        if self.store.del(&self.ns, key).is_ok() {
+            self.used.store(self.used.load(Relaxed).saturating_sub(old), Relaxed);
+        }
     }
 }
 
@@ -322,9 +336,25 @@ impl Node {
             return;
         }
         let Some(store) = self.store.clone() else { return };
-        let kv = Arc::new(ScopedKv { store, ns: uuid.to_string() });
+        let quota = self.agents.get(uuid).map(|m| m.grant.budget.state_kb.saturating_mul(1024)).unwrap_or(0);
+        let kv = Arc::new(ScopedKv {
+            store,
+            ns: uuid.to_string(),
+            used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quota,
+        });
         if let Some(m) = self.agents.get_mut(uuid) {
             m.runtime.set_state(kv);
+        }
+    }
+
+    /// Out-gate net-scope (M4): an agent with `net = "none"` may message only
+    /// co-located agents; `platform`/`any`/unset may reach the network (the node
+    /// resolves the address). Finer scoping (`node:<id>`) is a future refinement.
+    fn net_allows(&self, uuid: &str, to: &str) -> bool {
+        match self.agents.get(uuid).map(|m| m.grant.budget.net.as_str()) {
+            Some("none") => self.local_uuid(to).is_some(),
+            _ => true,
         }
     }
 
@@ -746,6 +776,10 @@ impl Node {
             };
             self.apply_timer_ops(&uuid, ops);
             for s in sends {
+                if !self.net_allows(&uuid, &s.receiver) {
+                    crate::flow!("[{}] ⛔ net-scope denied: '{}' → '{}'", self.label, uuid, s.receiver);
+                    continue;
+                }
                 let next = NodeMsg {
                     to: s.receiver,
                     from: uuid.clone(),
@@ -843,6 +877,9 @@ impl Node {
     /// via the executor, cross-node → sealed over Noise / sink.
     fn dispatch(&mut self, from: &str, sends: Vec<OutboundIntent>) {
         for s in sends {
+            if !self.net_allows(from, &s.receiver) {
+                continue;
+            }
             let next = NodeMsg {
                 to: s.receiver,
                 from: from.into(),
@@ -1033,6 +1070,35 @@ mod tests {
         n.pump(NodeMsg { to: "S".into(), from: "S".into(), unl: b"load".to_vec(), ..Default::default() });
         let got = rx.recv_timeout(Duration::from_secs(1)).expect("state load surfaced");
         assert_eq!(got.body, b"hello"); // persisted via the state capability
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn net_scope_none_sandboxes_to_local() {
+        let mut n = Node::new("seed", "s", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let mut m = wmanifest(&[]);
+        m.budget.net = "none".into();
+        n.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &m, None).unwrap();
+        assert!(!n.net_allows("W", "ams")); // net=none: cannot reach a remote/platform target
+        assert!(n.net_allows("W", "seed")); // a co-located agent → allowed
+        assert!(n.net_allows("seed", "ams")); // native full grant (net=platform) → allowed
+    }
+
+    #[test]
+    fn state_quota_caps_namespace_size() {
+        use unl_agent::Kv;
+        let dir = std::env::temp_dir().join(format!("m4-quota-{}", std::process::id()));
+        let store = std::sync::Arc::new(crate::adapters::SledStore::open(&dir).unwrap());
+        let kv = ScopedKv {
+            store,
+            ns: "A".into(),
+            used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quota: 8,
+        };
+        kv.put("k", b"12345678"); // exactly 8 bytes → fits
+        assert_eq!(kv.get("k"), Some(b"12345678".to_vec()));
+        kv.put("k2", b"x"); // would exceed the 8-byte quota → rejected
+        assert_eq!(kv.get("k2"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
