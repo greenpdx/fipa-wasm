@@ -285,6 +285,21 @@ which is itself the strongest abuse signal.
   `catch_unwind` so a panic is contained and the agent quarantined, not the node.
   Hard CPU/RAM caps need a thread/process boundary (the remaining native upgrade).
 
+### 10.5 Key custody and crypto
+
+Cryptographic private keys live **node-side**, in the keystore — never in an agent's
+sandbox. The `crypto` capability exposes operations (`sign`/`verify`/`random`), not
+secrets, so the node acts as a **signing oracle**: an agent compromise cannot leak a
+key. This is faster (native constant-time ed25519, one vetted implementation) and
+consistent with the node already holding LLM keys and cost.
+
+The oracle's one risk — an agent coaxing it to sign bytes meaningful elsewhere (a
+confused deputy) — is closed by **domain separation**: the node decides *what* is
+signed (it builds and signs message envelopes itself; the agent supplies only
+content), uses **per-purpose keys + domain tags**, and rate-limits and audits every
+`sign`. `random` is necessarily node-provided (wasm has no entropy source). Full
+treatment: [`AGENT_HOST_ABI.md` §7.2](./AGENT_HOST_ABI.md#72-crypto-key-custody-and-domain-separation).
+
 ---
 
 ## 11. The three brains — one seam

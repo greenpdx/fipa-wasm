@@ -198,7 +198,7 @@ out-gate.
 | **state** | `get(key) -> bytes`, `put(key, bytes)`, `del(key)` | **sync** | opt-in | agent-scoped namespace, quota |
 | **time** | `now() -> ms`, `mono() -> ns`, `timer_set(delay_ms, timer_id)`, `timer_cancel(timer_id)` | **sync** | opt-in | slot budget (§9) |
 | **llm** | `infer(prompt) -> request_id` | async | opt-in/heavy | cost budget; runs the LLM block |
-| **crypto** | `sign(bytes) -> sig`, `verify(id, bytes, sig) -> request_id`, `random(n) -> bytes` | sync (`sign`,`random`) / async (`verify`) | opt-in | uses agent keypair |
+| **crypto** | `sign(bytes) -> sig`, `verify(id, bytes, sig) -> request_id`, `random(n) -> bytes` | sync (`sign`,`random`) / async (`verify`) | opt-in | **key node-held**; domain-separated (§7.2) |
 | **spawn** | `spawn(bundle_ref) -> request_id` | async | heavy/gated | quota; child caps ⊆ parent |
 | **log** | `log(level, msg)` | sync | core | node-attributed, unspoofable |
 
@@ -235,6 +235,39 @@ The node always mediates: it checks the `llm` grant, meters the **cost budget**,
 holds the model and keys (the agent never sees them), logs the call, and for UNL
 agents **constrains and validates** the output (`unl-llm`: the model proposes, the
 validator disposes). **IoT denies `llm` outright.**
+
+### 7.2 Crypto: key custody and domain separation
+
+`crypto` keeps the **private key node-side** — in the keystore, never in the agent's
+sandbox. The agent holds only the *operations* (`sign`/`verify`/`random`), so an
+agent compromise or memory-disclosure bug cannot exfiltrate a key. The node is a
+**signing oracle** (the HSM / ssh-agent pattern): faster (native constant-time
+ed25519, one vetted implementation the node can patch) and consistent with the node
+already holding LLM keys and cost. In-wasm *agent* crypto is rejected precisely
+because it would leak a secret into the sandbox.
+
+This introduces a **confused-deputy** risk — an agent coaxing the oracle to sign
+bytes that mean something elsewhere (a forged attestation, a payment authorization).
+It is closed by a mandatory rule:
+
+- **The node controls *what* is signed, not just *whether*.** It never blind-signs
+  raw agent bytes with an identity key: for message authentication the *node* builds
+  the envelope (from, to, nonce, timestamp) and signs that; the agent supplies only
+  content fields.
+- **Per-purpose keys + a domain-separation tag** — identity ≠ message ≠ app-data
+  keys; the node prefixes a domain tag before signing.
+- `sign` is gated, **rate-limited, and audited** like any host-call.
+
+Notes:
+
+- **`verify` carries no secret** — safe to host; the node also fetches/caches trusted
+  public keys via AMS.
+- **`random` *must* be a host call** — wasm has no entropy source, so an in-wasm PRNG
+  is a real vulnerability (predictable keys/nonces). Host `random` supplies OS
+  entropy. This is a correctness fix, not just performance.
+- **Browser**: "host crypto" is the *node-wasm's* pure-Rust ed25519 (WebCrypto is
+  async and cannot satisfy a sync `sign`). The key-custody guarantee still holds; the
+  raw-speed win applies mainly to native profiles.
 
 ---
 
@@ -376,6 +409,9 @@ node can implement it.
 - **`net` scope grammar** — the precise syntax for `HEAD.budget.net`.
 - **Cross-node `from` signing** — how `crypto.sign` over an outbound message lets a
   *remote* node authenticate `from` (today only intra-node, via the `Router`).
+- **Key custody on migration** — node-held keys do not travel with a mobile agent; a
+  destination node needs a key-handoff, or per-node ephemeral keys plus attestation
+  (related to cross-node `from` signing, above).
 - **State migration** — whether `STATE` travels with a mobile agent and how it is
   re-bound on the destination node (ties to the migration roadmap in
   `ARCHITECTURE.md` Appendix A).
