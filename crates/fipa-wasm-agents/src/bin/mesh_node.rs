@@ -32,12 +32,26 @@ fn env(k: &str) -> Option<String> {
 fn env_or(k: &str, d: &str) -> String {
     env(k).unwrap_or_else(|| d.into())
 }
+fn env_usize(k: &str, default: usize) -> usize {
+    env(k).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 /// Build the hosted agent and the service it provides (for DF registration).
 fn build_agent(name: &str, data: &str) -> (Box<dyn AgentRuntime + Send>, Option<String>) {
     match name {
-        "df" => (Box::new(NativeRuntime::new(df_agent::Df::new())), None),
-        "ams" => (Box::new(NativeRuntime::new(ams_agent::Ams::new())), None),
+        "df" => {
+            // Registry limits are operator-programmable (DNS-scale → set high).
+            let df = df_agent::Df::new().with_limits(
+                env_usize("FIPA_MAX_SERVICES", df_agent::DEFAULT_MAX_SERVICES),
+                env_usize("FIPA_MAX_PROVIDERS", df_agent::DEFAULT_MAX_PROVIDERS_PER_SERVICE),
+            );
+            (Box::new(NativeRuntime::new(df)), None)
+        }
+        "ams" => {
+            let ams = ams_agent::Ams::new()
+                .with_limit(env_usize("FIPA_MAX_RECORDS", ams_agent::DEFAULT_MAX_RECORDS));
+            (Box::new(NativeRuntime::new(ams)), None)
+        }
         "pa" => {
             let mut pa = pa_agent::Pa::open(format!("{data}/pa")).expect("open PA store");
             if let Some(seed) = env("FIPA_SEED") {

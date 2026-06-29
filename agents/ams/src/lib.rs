@@ -51,16 +51,34 @@ use unl_agent::{Agent, Ctx};
 use unl_core::{NodeRef, Uci};
 use unl_parser::parse_sentence;
 
+/// R5/H4 **default** bind limit — bound AMS memory against bind flooding. Only a
+/// default: an operator can raise it (a DNS-scale white pages may hold millions)
+/// via [`Ams::with_limit`], or set `usize::MAX` for effectively unbounded.
+pub const DEFAULT_MAX_RECORDS: usize = 65536;
+
 /// The Agent Management System agent: an agent → address registry.
-#[derive(Default)]
 pub struct Ams {
     records: BTreeMap<String, String>,
     upstream: Option<String>,
+    max_records: usize,
+}
+
+impl Default for Ams {
+    fn default() -> Self {
+        Ams { records: BTreeMap::new(), upstream: None, max_records: DEFAULT_MAX_RECORDS }
+    }
 }
 
 impl Ams {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure the maximum number of bindings (DNS-scale deployments may set
+    /// this very high, or `usize::MAX` for effectively unbounded).
+    pub fn with_limit(mut self, max_records: usize) -> Self {
+        self.max_records = max_records;
+        self
     }
 
     /// Bind an address (authoritative). Construction/test helper.
@@ -107,8 +125,16 @@ impl Agent for Ams {
                 // the agent being bound, else the bind is refused (THREAT_MODEL C2).
                 match (json_field(body, "agent"), json_field(body, "address")) {
                     (Some(agent), Some(addr)) if agent == from => {
-                        self.records.insert(agent, addr);
-                        ctx.send(from, "obj(bound, agent)", Vec::new());
+                        let cap = self.max_records;
+                        let known = self.records.contains_key(&agent);
+                        let bound = if !known && self.records.len() >= cap {
+                            false // registry full — refuse a new agent (R5/H4)
+                        } else {
+                            self.records.insert(agent, addr);
+                            true
+                        };
+                        let verb = if bound { "bound" } else { "refuse" };
+                        ctx.send(from, format!("obj({verb}, agent)"), Vec::new());
                     }
                     _ => {
                         ctx.send(from, "obj(refuse, agent)", Vec::new());
@@ -208,6 +234,21 @@ mod tests {
         let out = run(&mut ams, "BA", "obj(locate, agent)", br#"{"agent":"ghost"}"#);
         assert_eq!(out[0].unl, "obj(at, agent)");
         assert!(json_field(&out[0].body, "address").is_none()); // no address ⇒ not found
+    }
+
+    #[test]
+    fn bind_is_capped() {
+        // small configured limit so the test is cheap
+        let mut ams = Ams::new().with_limit(8);
+        for i in 0..8 {
+            ams.bind(format!("a{i}"), "x");
+        }
+        // a brand-new agent is refused once the registry is full (R5/H4)
+        let out = run(&mut ams, "new", "obj(bind, agent)", br#"{"agent":"new","address":"1.2.3.4:9000"}"#);
+        assert_eq!(out[0].unl, "obj(refuse, agent)");
+        // an already-bound agent can still update itself even when full
+        let out = run(&mut ams, "a0", "obj(bind, agent)", br#"{"agent":"a0","address":"9.9.9.9:1"}"#);
+        assert_eq!(out[0].unl, "obj(bound, agent)");
     }
 
     #[test]
