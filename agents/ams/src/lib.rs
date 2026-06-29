@@ -59,13 +59,19 @@ pub const DEFAULT_MAX_RECORDS: usize = 65536;
 /// The Agent Management System agent: an agent → address registry.
 pub struct Ams {
     records: BTreeMap<String, String>,
+    epochs: BTreeMap<String, u64>, // R6: per-agent location epoch (monotonic, anti-fork)
     upstream: Option<String>,
     max_records: usize,
 }
 
 impl Default for Ams {
     fn default() -> Self {
-        Ams { records: BTreeMap::new(), upstream: None, max_records: DEFAULT_MAX_RECORDS }
+        Ams {
+            records: BTreeMap::new(),
+            epochs: BTreeMap::new(),
+            upstream: None,
+            max_records: DEFAULT_MAX_RECORDS,
+        }
     }
 }
 
@@ -81,9 +87,11 @@ impl Ams {
         self
     }
 
-    /// Bind an address (authoritative). Construction/test helper.
+    /// Bind an address (authoritative, epoch 0). Construction/test helper.
     pub fn bind(&mut self, agent: impl Into<String>, address: impl Into<String>) {
-        self.records.insert(agent.into(), address.into());
+        let agent = agent.into();
+        self.records.insert(agent.clone(), address.into());
+        self.epochs.insert(agent, 0);
     }
 
     /// Set the upstream AMS used for referrals. Construction/test helper.
@@ -126,13 +134,21 @@ impl Agent for Ams {
                 match (json_field(body, "agent"), json_field(body, "address")) {
                     (Some(agent), Some(addr)) if agent == from => {
                         let cap = self.max_records;
-                        let known = self.records.contains_key(&agent);
-                        let bound = if !known && self.records.len() >= cap {
-                            false // registry full — refuse a new agent (R5/H4)
-                        } else {
-                            self.records.insert(agent, addr);
-                            true
+                        let epoch = json_u64(body, "epoch").unwrap_or(0);
+                        let same_addr = self.records.get(&agent) == Some(&addr);
+                        let bound = match self.epochs.get(&agent).copied() {
+                            // new agent: subject only to the capacity cap (R5/H4)
+                            None => self.records.len() < cap,
+                            // existing: location is MONOTONIC — only a strictly higher
+                            // epoch may move it (R6 global arbiter); same-epoch must keep
+                            // the same address. A forked/replayed snapshot (same or lower
+                            // epoch, new address) is refused → no double-binding (H1).
+                            Some(ep0) => epoch > ep0 || (epoch == ep0 && same_addr),
                         };
+                        if bound {
+                            self.records.insert(agent.clone(), addr);
+                            self.epochs.insert(agent, epoch);
+                        }
                         let verb = if bound { "bound" } else { "refuse" };
                         ctx.send(from, format!("obj({verb}, agent)"), Vec::new());
                     }
@@ -183,6 +199,11 @@ fn inline_word(node: &NodeRef) -> Option<String> {
 fn json_field(body: &[u8], key: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get(key)?.as_str().map(str::to_string)
+}
+
+fn json_u64(body: &[u8], key: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get(key)?.as_u64()
 }
 
 #[cfg(test)]
@@ -237,6 +258,30 @@ mod tests {
     }
 
     #[test]
+    fn location_is_monotonic_anti_fork() {
+        // R6: an agent's location can only move forward by epoch. A forked/replayed
+        // snapshot (same epoch, new address) cannot re-bind a second copy (H1).
+        let mut ams = Ams::new();
+        let out = run(&mut ams, "X", "obj(bind, agent)", br#"{"agent":"X","address":"1.1.1.1:1","epoch":0}"#);
+        assert_eq!(out[0].unl, "obj(bound, agent)");
+
+        // a fork tries to re-bind X elsewhere at the SAME epoch → refused
+        let out = run(&mut ams, "X", "obj(bind, agent)", br#"{"agent":"X","address":"6.6.6.6:6","epoch":0}"#);
+        assert_eq!(out[0].unl, "obj(refuse, agent)");
+        assert_eq!(ams.address("X"), Some("1.1.1.1:1")); // location unmoved
+
+        // a legitimate migration bumps the epoch → accepted
+        let out = run(&mut ams, "X", "obj(bind, agent)", br#"{"agent":"X","address":"2.2.2.2:2","epoch":1}"#);
+        assert_eq!(out[0].unl, "obj(bound, agent)");
+        assert_eq!(ams.address("X"), Some("2.2.2.2:2"));
+
+        // a replay of the OLD epoch can no longer move it back
+        let out = run(&mut ams, "X", "obj(bind, agent)", br#"{"agent":"X","address":"1.1.1.1:1","epoch":0}"#);
+        assert_eq!(out[0].unl, "obj(refuse, agent)");
+        assert_eq!(ams.address("X"), Some("2.2.2.2:2"));
+    }
+
+    #[test]
     fn bind_is_capped() {
         // small configured limit so the test is cheap
         let mut ams = Ams::new().with_limit(8);
@@ -246,8 +291,9 @@ mod tests {
         // a brand-new agent is refused once the registry is full (R5/H4)
         let out = run(&mut ams, "new", "obj(bind, agent)", br#"{"agent":"new","address":"1.2.3.4:9000"}"#);
         assert_eq!(out[0].unl, "obj(refuse, agent)");
-        // an already-bound agent can still update itself even when full
-        let out = run(&mut ams, "a0", "obj(bind, agent)", br#"{"agent":"a0","address":"9.9.9.9:1"}"#);
+        // an already-bound agent can still re-register itself (same address,
+        // idempotent at the same epoch) even when full
+        let out = run(&mut ams, "a0", "obj(bind, agent)", br#"{"agent":"a0","address":"x","epoch":0}"#);
         assert_eq!(out[0].unl, "obj(bound, agent)");
     }
 
