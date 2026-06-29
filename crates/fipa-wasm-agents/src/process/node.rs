@@ -39,7 +39,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::adapters::{self, NodeCrypto, NodeNoise, SledStore, StateStore};
+use crate::adapters::{self, NodeCrypto, NodeNoise, NoiseSession, SledStore, StateStore};
 use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
 use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
 use rand::RngCore;
@@ -256,29 +256,40 @@ fn handle_conn(
     rz_tx: &Sender<(String, Sender<String>)>,
     mg_tx: &Sender<Vec<u8>>,
 ) {
-    s.set_read_timeout(Some(DIAL_TIMEOUT)).ok();
+    s.set_read_timeout(Some(DIAL_TIMEOUT)).ok(); // bound the handshake
     s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
     let Ok(mut sess) = noise.accept(&mut s) else { return };
-    let Ok((kind, payload)) = sess.recv(&mut s) else { return };
-    match kind {
-        KIND_MSG => {
-            if let Some(m) = decode_msg(&payload) {
-                let _ = in_tx.send(m);
-            }
-        }
-        KIND_MIGRATE => {
-            let _ = mg_tx.send(payload); // hand the move payload to the main loop
-        }
-        KIND_RESOLVE_REQ => {
-            let uuid = String::from_utf8_lossy(&payload).to_string();
-            let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-            if rz_tx.send((uuid, resp_tx)).is_ok() {
-                if let Ok(addr) = resp_rx.recv_timeout(DIAL_TIMEOUT) {
-                    let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
+    // After the handshake a KIND_MSG channel is persistent, so tolerate idle gaps
+    // between messages; a long idle just recycles the connection (sender re-dials).
+    s.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    loop {
+        let (kind, payload) = match sess.recv(&mut s) {
+            Ok(v) => v,
+            Err(_) => return, // idle timeout / EOF / error → close
+        };
+        match kind {
+            KIND_MSG => {
+                if let Some(m) = decode_msg(&payload) {
+                    let _ = in_tx.send(m);
                 }
+                // keep reading — the channel is persistent
             }
+            KIND_MIGRATE => {
+                let _ = mg_tx.send(payload); // hand the move payload to the main loop
+                return; // one-shot
+            }
+            KIND_RESOLVE_REQ => {
+                let uuid = String::from_utf8_lossy(&payload).to_string();
+                let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+                if rz_tx.send((uuid, resp_tx)).is_ok() {
+                    if let Ok(addr) = resp_rx.recv_timeout(DIAL_TIMEOUT) {
+                        let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
+                    }
+                }
+                return; // one-shot
+            }
+            _ => return,
         }
-        _ => {}
     }
 }
 
@@ -320,6 +331,7 @@ pub struct Node {
     audit: Option<Arc<dyn AuditSink>>,   // M6: forensic event sink (log rich)
     faults: HashMap<String, u32>,        // M6: consecutive fault count per agent
     quarantined: HashSet<String>,        // M6: agents stopped after repeated faults
+    conns: HashMap<String, (TcpStream, NoiseSession)>, // persistent KIND_MSG channels per peer
 }
 
 impl Node {
@@ -346,6 +358,7 @@ impl Node {
             audit: None,
             faults: HashMap::new(),
             quarantined: HashSet::new(),
+            conns: HashMap::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -1113,12 +1126,23 @@ impl Node {
         }
     }
 
-    /// Send one sealed message to `addr` over a fresh Noise channel — the R1
-    /// signed envelope travels inside the R2 encrypted, mutually-authenticated link.
-    fn send_to(&self, addr: &str, m: &NodeMsg) -> io::Result<()> {
+    /// Send one sealed message to `addr`, reusing a **persistent** Noise channel to
+    /// that peer when we have one (the handshake then amortizes over many messages);
+    /// a broken channel is transparently re-dialled. The R1 signed envelope travels
+    /// inside the R2 encrypted, mutually-authenticated link.
+    fn send_to(&mut self, addr: &str, m: &NodeMsg) -> io::Result<()> {
+        let frame = encode_msg(m);
+        if let Some((s, sess)) = self.conns.get_mut(addr) {
+            if sess.send(s, KIND_MSG, &frame).is_ok() {
+                return Ok(());
+            }
+            self.conns.remove(addr); // broken pipe → reconnect below
+        }
         let mut s = dial(addr)?;
         let mut sess = self.noise.connect(&mut s)?;
-        sess.send(&mut s, KIND_MSG, &encode_msg(m))
+        sess.send(&mut s, KIND_MSG, &frame)?;
+        self.conns.insert(addr.to_string(), (s, sess));
+        Ok(())
     }
 
     /// Find a recipient's address: bootstrap/cache, else ask the AMS node.
