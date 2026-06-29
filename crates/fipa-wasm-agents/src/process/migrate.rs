@@ -13,8 +13,16 @@
 //! the happy-path state transfer + signed snapshot + epoch arbiter are implemented.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adapters::{self, NodeCrypto};
+
+/// SHA-256 of `bytes` as lowercase hex — the content address of a wasm module.
+pub fn code_hash(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
 
 /// A signed, state-based migration payload for one wasm agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,9 +31,11 @@ pub struct AgentSnapshot {
     pub uuid: String,
     /// The new location epoch (strictly greater than the agent's current epoch).
     pub epoch: u64,
-    /// The agent's wasm module (Phase C will replace this with a content hash +
-    /// fetch-on-miss). Only wasm agents are mobile.
+    /// The agent's wasm module — may be **empty**, in which case the destination
+    /// fetches it by `code_hash` (CODE_FETCH). Only wasm agents are mobile.
     pub code: Vec<u8>,
+    /// Content address (SHA-256 hex) of the wasm module — always present, signed.
+    pub code_hash: String,
     /// The agent's serialized state (from the guest's `snapshot` export).
     pub state: Vec<u8>,
     /// Anti-replay nonce.
@@ -37,11 +47,14 @@ pub struct AgentSnapshot {
 }
 
 impl AgentSnapshot {
-    /// Build a snapshot signed by the origin node `key`.
+    /// Build a snapshot signed by the origin node `key`. The signature covers the
+    /// content `code_hash`, not the bytes — so an inlined or fetched module both
+    /// verify against the same signed hash.
     pub fn sealed(uuid: &str, epoch: u64, code: Vec<u8>, state: Vec<u8>, key: &NodeCrypto) -> Self {
         let mut s = AgentSnapshot {
             uuid: uuid.into(),
             epoch,
+            code_hash: code_hash(&code),
             code,
             state,
             nonce: key.nonce().to_vec(),
@@ -52,23 +65,28 @@ impl AgentSnapshot {
         s
     }
 
-    /// The bytes covered by the signature: every field except `sig`.
+    /// The bytes covered by the signature: every field except `sig` and the
+    /// (fetchable) `code` — the `code_hash` stands in for the module.
     fn signing_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(self.uuid.as_bytes());
         b.push(0);
         b.extend_from_slice(&self.epoch.to_be_bytes());
-        b.extend_from_slice(&self.code);
+        b.extend_from_slice(self.code_hash.as_bytes());
         b.extend_from_slice(&self.state);
         b.extend_from_slice(&self.nonce);
         b.extend_from_slice(&self.origin_pub);
         b
     }
 
-    /// Verify the origin signature (integrity + origin authenticity).
+    /// Verify the origin signature (integrity + origin authenticity), and that any
+    /// **inlined** code matches its content address.
     pub fn verify(&self) -> bool {
         if self.sig.len() != 64 || self.origin_pub.len() != 32 {
             return false;
+        }
+        if !self.code.is_empty() && code_hash(&self.code) != self.code_hash {
+            return false; // inlined module does not match its signed hash
         }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&self.origin_pub);
@@ -143,6 +161,10 @@ impl Handoff {
 pub struct MigratePayload {
     pub snapshot: AgentSnapshot,
     pub handoff: Handoff,
+    /// The origin node's address, so the destination can CODE_FETCH a module that
+    /// the snapshot left out.
+    #[serde(default)]
+    pub from_addr: String,
 }
 
 impl MigratePayload {

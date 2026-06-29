@@ -36,7 +36,7 @@ use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::adapters::{self, NodeCrypto, NodeNoise, NoiseSession, SledStore, StateStore};
@@ -46,12 +46,14 @@ use rand::RngCore;
 use std::collections::HashSet;
 use unl_agent::{InferReq, SpawnReq, TimerOp};
 
-use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
+use super::migrate::{code_hash, AgentSnapshot, Handoff, MigratePayload};
 
 const KIND_MSG: u8 = 1;
 const KIND_RESOLVE_REQ: u8 = 2;
 const KIND_RESOLVE_RESP: u8 = 3;
 const KIND_MIGRATE: u8 = 4;
+const KIND_CODE_FETCH: u8 = 5; // request a wasm module by content hash
+const KIND_CODE_BLOB: u8 = 6; // the module bytes (empty = unknown hash)
 
 /// A short dial timeout bounds connect/read/write so a slow or hostile peer cannot
 /// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3). The frame-size
@@ -255,6 +257,7 @@ fn handle_conn(
     in_tx: &Sender<NodeMsg>,
     rz_tx: &Sender<(String, Sender<String>)>,
     mg_tx: &Sender<Vec<u8>>,
+    code_store: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
 ) {
     s.set_read_timeout(Some(DIAL_TIMEOUT)).ok(); // bound the handshake
     s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
@@ -286,6 +289,12 @@ fn handle_conn(
                         let _ = sess.send(&mut s, KIND_RESOLVE_RESP, addr.as_bytes());
                     }
                 }
+                return; // one-shot
+            }
+            KIND_CODE_FETCH => {
+                let hash = String::from_utf8_lossy(&payload).to_string();
+                let code = code_store.lock().unwrap().get(&hash).cloned().unwrap_or_default();
+                let _ = sess.send(&mut s, KIND_CODE_BLOB, &code); // empty = unknown
                 return; // one-shot
             }
             _ => return,
@@ -332,6 +341,7 @@ pub struct Node {
     faults: HashMap<String, u32>,        // M6: consecutive fault count per agent
     quarantined: HashSet<String>,        // M6: agents stopped after repeated faults
     conns: HashMap<String, (TcpStream, NoiseSession)>, // persistent KIND_MSG channels per peer
+    code_store: Arc<Mutex<HashMap<String, Vec<u8>>>>,  // content-addressed wasm (CODE_FETCH)
 }
 
 impl Node {
@@ -359,6 +369,7 @@ impl Node {
             faults: HashMap::new(),
             quarantined: HashSet::new(),
             conns: HashMap::new(),
+            code_store: Arc::new(Mutex::new(HashMap::new())),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -644,16 +655,38 @@ impl Node {
         self.key.public_key()
     }
 
+    /// Cache a wasm module by its content hash (so this node can serve CODE_FETCH).
+    pub fn cache_code(&self, code: Vec<u8>) {
+        self.code_store.lock().unwrap().insert(code_hash(&code), code);
+    }
+
+    /// Fetch a wasm module by content `hash` from the peer at `addr`, verify it
+    /// content-addresses, and cache it. `None` if the peer lacks it.
+    pub fn fetch_code(&mut self, addr: &str, hash: &str) -> Option<Vec<u8>> {
+        let mut s = dial(addr).ok()?;
+        let mut sess = self.noise.connect(&mut s).ok()?;
+        sess.send(&mut s, KIND_CODE_FETCH, hash.as_bytes()).ok()?;
+        let (kind, code) = sess.recv(&mut s).ok()?;
+        if kind != KIND_CODE_BLOB || code.is_empty() || code_hash(&code) != hash {
+            return None;
+        }
+        self.cache_code(code.clone());
+        Some(code)
+    }
+
     /// Build the signed move payload (snapshot of code+state at epoch+1, plus a
-    /// handoff authorizing `dest_pub`) for a mobile agent — without sending it.
+    /// handoff authorizing `dest_pub`) for a mobile agent — without sending it. The
+    /// code is cached so the destination can CODE_FETCH it.
     pub fn build_migrate_payload(&mut self, uuid: &str, dest_pub: &[u8]) -> Option<Vec<u8>> {
-        let m = self.agents.get_mut(uuid)?;
-        let code = m.code.clone()?; // only wasm (mobile) agents have code
-        let epoch = m.epoch + 1;
-        let state = m.runtime.snapshot();
+        let (code, epoch, state) = {
+            let m = self.agents.get_mut(uuid)?;
+            let code = m.code.clone()?; // only wasm (mobile) agents have code
+            (code, m.epoch + 1, m.runtime.snapshot())
+        };
+        self.cache_code(code.clone());
         let snapshot = AgentSnapshot::sealed(uuid, epoch, code, state, &self.key);
         let handoff = Handoff::sealed(uuid, dest_pub.to_vec(), epoch, &self.key);
-        Some(MigratePayload { snapshot, handoff }.encode())
+        Some(MigratePayload { snapshot, handoff, from_addr: self.addr.clone() }.encode())
     }
 
     /// Migrate a mobile (wasm) agent to `dest_addr`, authorizing `dest_pub` to act
@@ -679,6 +712,7 @@ impl Node {
     /// the handoff so the AMS node can move the agent's authorized key.
     fn process_migrate(&mut self, payload: &[u8]) {
         let Some(mp) = MigratePayload::decode(payload) else { return };
+        let from_addr = mp.from_addr.clone();
         let (snap, ho) = (mp.snapshot, mp.handoff);
         if !snap.verify() || !ho.verify() {
             crate::flow!("[{}] ⛔ migrate: bad snapshot/handoff signature", self.label);
@@ -696,8 +730,21 @@ impl Node {
             crate::flow!("[{}] ⛔ migrate: replayed epoch {} for '{}'", self.label, snap.epoch, snap.uuid);
             return;
         }
+        // resolve the wasm: inline if present (cache it), else CODE_FETCH from origin
+        let code = if !snap.code.is_empty() {
+            self.cache_code(snap.code.clone());
+            snap.code.clone()
+        } else {
+            match self.fetch_code(&from_addr, &snap.code_hash) {
+                Some(c) => c,
+                None => {
+                    crate::flow!("[{}] ⛔ migrate: code unavailable (CODE_FETCH failed)", self.label);
+                    return;
+                }
+            }
+        };
         let caps = crate::proto::AgentCapabilities::default();
-        let mut rt = match WasmRuntime::new(&snap.code, &caps) {
+        let mut rt = match WasmRuntime::new(&code, &caps) {
             Ok(rt) => rt,
             Err(_) => {
                 crate::flow!("[{}] ⛔ migrate: code won't instantiate", self.label);
@@ -714,7 +761,7 @@ impl Node {
                 alias: snap.uuid.clone(),
                 runtime: Box::new(rt),
                 service: None,
-                code: Some(snap.code.clone()),
+                code: Some(code),
                 epoch: snap.epoch,
                 grant: Grant::full(), // TODO(M2): carry the manifest in the snapshot + re-fit
             },
@@ -841,15 +888,16 @@ impl Node {
                         continue; // drop (the connection closes) — bounded resource use
                     }
                     conns.fetch_add(1, Ordering::Relaxed);
-                    let (noise, in_tx, rz_tx, mg_tx, conns2) = (
+                    let (noise, in_tx, rz_tx, mg_tx, cs, conns2) = (
                         self.noise.clone(),
                         in_tx.clone(),
                         rz_tx.clone(),
                         mg_tx.clone(),
+                        self.code_store.clone(),
                         conns.clone(),
                     );
                     std::thread::spawn(move || {
-                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx);
+                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &cs);
                         conns2.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -1573,6 +1621,30 @@ mod tests {
         // iot offers no llm → load-time rejection, operator-facing
         let r = a.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::Llm]), None);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn code_fetch_serves_wasm_by_hash() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let code = COUNTER_WASM.as_bytes().to_vec();
+        let hash = code_hash(&code);
+        let src = Node::new("S", "s", &addr, Box::new(NativeRuntime::new(Ponger)));
+        src.cache_code(code.clone()); // origin caches the module by content hash
+        let sd = shutdown.clone();
+        let h = thread::spawn(move || {
+            let mut src = src;
+            src.serve(l, sd);
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut dst = Node::new("D", "d", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        assert_eq!(dst.fetch_code(&addr, &hash), Some(code.clone())); // fetched by content hash
+        assert_eq!(dst.fetch_code(&addr, "deadbeef00"), None); // unknown hash → nothing
+
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().ok();
     }
 
     #[test]
