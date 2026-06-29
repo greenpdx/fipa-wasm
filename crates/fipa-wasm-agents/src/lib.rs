@@ -32,6 +32,7 @@ pub mod consensus;
 pub mod content;
 pub mod identity;
 pub mod interplatform;
+pub mod manifest;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod network;
