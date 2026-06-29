@@ -42,7 +42,8 @@ use std::time::Duration;
 use crate::adapters::{self, NodeCrypto, NodeNoise, SledStore, StateStore};
 use crate::manifest::{Capability, Grant, Manifest, NodeProfile};
 use crate::wasm::{AgentRuntime, OutboundIntent, WasmRuntime};
-use unl_agent::TimerOp;
+use rand::RngCore;
+use unl_agent::{InferReq, TimerOp};
 
 use super::migrate::{AgentSnapshot, Handoff, MigratePayload};
 
@@ -176,6 +177,50 @@ impl unl_agent::Kv for ScopedKv {
     }
 }
 
+/// Domain tag separating agent-app signatures from the node's own envelope /
+/// migration signatures, so the signing oracle cannot be a confused deputy.
+const APP_DOMAIN: &[u8] = b"fipa:agent-app:v1\0";
+
+/// The crypto keyring handed to an agent with the `crypto` capability (M5): the
+/// node's Ed25519 key, used only behind a fixed application domain.
+struct NodeKeyring {
+    key: NodeCrypto,
+}
+impl unl_agent::Keyring for NodeKeyring {
+    fn sign(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut buf = APP_DOMAIN.to_vec();
+        buf.extend_from_slice(bytes);
+        self.key.sign(&buf).to_vec()
+    }
+    fn verify(&self, pubkey: &[u8], bytes: &[u8], sig: &[u8]) -> bool {
+        if pubkey.len() != 32 || sig.len() != 64 {
+            return false;
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(pubkey);
+        let mut sg = [0u8; 64];
+        sg.copy_from_slice(sig);
+        let mut buf = APP_DOMAIN.to_vec();
+        buf.extend_from_slice(bytes);
+        adapters::verify(&pk, &buf, &sg)
+    }
+    fn public_key(&self) -> Vec<u8> {
+        self.key.public_key().to_vec()
+    }
+    fn random(&self, n: usize) -> Vec<u8> {
+        let mut v = vec![0u8; n];
+        rand::rng().fill_bytes(&mut v);
+        v
+    }
+}
+
+/// A node-side inference backend — the `llm` capability runs the model on the
+/// agent's behalf (keys/cost/model stay node-side, `AGENT_HOST_ABI.md` §7.1). Sync;
+/// the node runs it off the main thread and delivers the result by message.
+pub trait LlmBackend: Send + Sync {
+    fn infer(&self, prompt: &str) -> Result<String, String>;
+}
+
 /// Wall-clock milliseconds since the Unix epoch (the scheduler's clock, M3).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -255,6 +300,8 @@ pub struct Node {
     profile: NodeProfile,                // M2: which capabilities this node offers
     timers: HashMap<String, HashMap<u64, u64>>, // M3: uuid -> timer_id -> deadline_ms
     store: Option<Arc<SledStore>>,       // M4: durable state backend (state capability)
+    llm: Option<Arc<dyn LlmBackend>>,    // M5: inference backend (llm capability)
+    pending_infers: Vec<(String, u64, String)>, // M5: (agent, req_id, prompt) to run
 }
 
 impl Node {
@@ -276,6 +323,8 @@ impl Node {
             profile: NodeProfile::normal(),
             timers: HashMap::new(),
             store: None,
+            llm: None,
+            pending_infers: Vec::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -305,6 +354,7 @@ impl Node {
             },
         );
         self.provision_state(uuid);
+        self.provision_crypto(uuid);
     }
 
     /// Set this node's profile (e.g. `NodeProfile::iot()`), which determines the
@@ -345,6 +395,38 @@ impl Node {
         });
         if let Some(m) = self.agents.get_mut(uuid) {
             m.runtime.set_state(kv);
+        }
+    }
+
+    /// Provide an inference backend for agents that hold the `llm` capability (M5).
+    pub fn set_llm(&mut self, backend: Arc<dyn LlmBackend>) {
+        self.llm = Some(backend);
+    }
+
+    /// If `uuid` holds the `Crypto` capability, hand the agent a domain-separated
+    /// keyring backed by the node key (M5).
+    fn provision_crypto(&mut self, uuid: &str) {
+        if !self.granted(uuid, Capability::Crypto) {
+            return;
+        }
+        let kr = Arc::new(NodeKeyring { key: self.key.clone() });
+        if let Some(m) = self.agents.get_mut(uuid) {
+            m.runtime.set_keyring(kr);
+        }
+    }
+
+    /// Queue an agent's inference requests (M5), gated by the `Llm` capability; the
+    /// serve loop runs them off-thread and delivers each result as a message.
+    fn apply_infer_reqs(&mut self, uuid: &str, reqs: Vec<InferReq>) {
+        if reqs.is_empty() {
+            return;
+        }
+        if !self.granted(uuid, Capability::Llm) {
+            crate::flow!("[{}] ⛔ infer denied for '{}' (no Llm grant)", self.label, uuid);
+            return;
+        }
+        for r in reqs {
+            self.pending_infers.push((uuid.to_string(), r.req_id, r.prompt));
         }
     }
 
@@ -397,6 +479,7 @@ impl Node {
             },
         );
         self.provision_state(uuid);
+        self.provision_crypto(uuid);
         Ok(())
     }
 
@@ -580,6 +663,7 @@ impl Node {
         let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
         let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
         let (mg_tx, mg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (llm_tx, llm_rx) = std::sync::mpsc::channel::<(String, u64, String)>();
         let conns = Arc::new(AtomicUsize::new(0));
 
         while !shutdown.load(Ordering::Relaxed) {
@@ -626,6 +710,32 @@ impl Node {
                     slots.remove(&id);
                 }
                 self.fire_tick(&uuid, id);
+            }
+
+            // 3d. Run pending inferences off the main thread (M5 llm — async).
+            if let Some(backend) = self.llm.clone() {
+                for (uuid, req_id, prompt) in std::mem::take(&mut self.pending_infers) {
+                    let (b, tx) = (backend.clone(), llm_tx.clone());
+                    std::thread::spawn(move || {
+                        let text = b.infer(&prompt).unwrap_or_else(|e| format!("error: {e}"));
+                        let _ = tx.send((uuid, req_id, text));
+                    });
+                }
+            } else {
+                self.pending_infers.clear(); // no backend → drop (no reply)
+            }
+
+            // 3e. Deliver completed inferences back as messages from "llm" (the
+            //     async reply-by-message model — the agent correlates by request_id).
+            while let Ok((uuid, req_id, text)) = llm_rx.try_recv() {
+                let body = serde_json::json!({ "request_id": req_id, "text": text }).to_string();
+                self.pump(NodeMsg {
+                    to: uuid,
+                    from: "llm".into(),
+                    unl: b"obj(inferred, x)".to_vec(),
+                    body: body.into_bytes(),
+                    ..Default::default()
+                });
             }
 
             // 4. Accept new connections; each is handshaked + read in its own thread
@@ -768,13 +878,18 @@ impl Node {
             if !m.from.is_empty() && !m.from_addr.is_empty() {
                 self.routes.insert(m.from.clone(), m.from_addr.clone());
             }
-            let (sends, ops) = {
+            let (sends, ops, infers) = {
                 let mounted = self.agents.get_mut(&uuid).expect("local uuid is mounted");
                 crate::flow!("[{}] ← {} : {}", mounted.alias, m.from, String::from_utf8_lossy(&m.unl));
                 let _ = mounted.runtime.config(&m.from, &m.unl, &m.body);
-                (mounted.runtime.take_sends(), mounted.runtime.take_timer_ops())
+                (
+                    mounted.runtime.take_sends(),
+                    mounted.runtime.take_timer_ops(),
+                    mounted.runtime.take_infer_reqs(),
+                )
             };
             self.apply_timer_ops(&uuid, ops);
+            self.apply_infer_reqs(&uuid, infers);
             for s in sends {
                 if !self.net_allows(&uuid, &s.receiver) {
                     crate::flow!("[{}] ⛔ net-scope denied: '{}' → '{}'", self.label, uuid, s.receiver);
@@ -864,12 +979,13 @@ impl Node {
     /// timers it (re-)armed.
     fn fire_tick(&mut self, uuid: &str, timer_id: u64) {
         let now = now_ms();
-        let (sends, ops) = {
+        let (sends, ops, infers) = {
             let Some(m) = self.agents.get_mut(uuid) else { return };
             let _ = m.runtime.tick(timer_id, now);
-            (m.runtime.take_sends(), m.runtime.take_timer_ops())
+            (m.runtime.take_sends(), m.runtime.take_timer_ops(), m.runtime.take_infer_reqs())
         };
         self.apply_timer_ops(uuid, ops);
+        self.apply_infer_reqs(uuid, infers);
         self.dispatch(uuid, sends);
     }
 
@@ -1071,6 +1187,67 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(1)).expect("state load surfaced");
         assert_eq!(got.body, b"hello"); // persisted via the state capability
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crypto_capability_signs_and_verifies() {
+        struct Signer;
+        impl Agent for Signer {
+            fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx) {
+                if unl.contains("sign") {
+                    match (ctx.sign(body), ctx.crypto_pubkey()) {
+                        (Some(sig), Some(pk)) => {
+                            let ok = ctx.verify(&pk, body, &sig);
+                            ctx.send("result", if ok { "obj(ok, x)" } else { "obj(bad, x)" }, Vec::new());
+                        }
+                        _ => ctx.send("result", "obj(denied, x)", Vec::new()),
+                    }
+                }
+            }
+        }
+        let mut n = Node::new("C", "c", "127.0.0.1:0", Box::new(NativeRuntime::new(Signer)));
+        let (tx, rx) = mpsc::channel();
+        n.set_sink(tx);
+        n.pump(NodeMsg { to: "C".into(), from: "C".into(), unl: b"sign".to_vec(), body: b"payload".to_vec(), ..Default::default() });
+        let got = rx.recv_timeout(Duration::from_secs(1)).expect("crypto result");
+        assert_eq!(String::from_utf8_lossy(&got.unl), "obj(ok, x)"); // node-held key signed + verified
+    }
+
+    #[test]
+    fn llm_capability_infers_async() {
+        struct Echo;
+        impl LlmBackend for Echo {
+            fn infer(&self, prompt: &str) -> Result<String, String> {
+                Ok(format!("REPLY:{prompt}"))
+            }
+        }
+        struct Asker;
+        impl Agent for Asker {
+            fn on_message(&mut self, unl: &str, body: &[u8], ctx: &mut Ctx) {
+                if unl.contains("ask") {
+                    ctx.infer(42, "hello"); // async — the reply arrives as a message from "llm"
+                } else if unl.contains("inferred") {
+                    ctx.send("result", "obj(got, x)", body.to_vec()); // surface the reply
+                }
+            }
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut n = Node::new("A", "a", &addr, Box::new(NativeRuntime::new(Asker)));
+        n.set_sink(tx);
+        n.set_llm(Arc::new(Echo));
+        let (ktx, krx) = mpsc::channel();
+        n.set_kick(krx);
+        let sd = shutdown.clone();
+        let h = thread::spawn(move || n.serve(l, sd));
+
+        ktx.send((b"obj(ask, x)".to_vec(), Vec::new())).unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(3)).expect("the async llm reply should surface");
+        assert!(String::from_utf8_lossy(&got.body).contains("REPLY:hello")); // request_id-correlated reply
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().ok();
     }
 
     #[test]

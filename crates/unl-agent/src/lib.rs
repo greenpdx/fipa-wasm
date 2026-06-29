@@ -55,6 +55,22 @@ pub trait Kv: Send + Sync {
     fn del(&self, key: &str);
 }
 
+/// The node-held signing oracle granted to an agent with the `crypto` capability
+/// (`AGENT_HOST_ABI.md` §7.2). The private key stays node-side; the agent only gets
+/// operations. Signatures are **domain-separated** by the host, so they cannot be
+/// confused with the node's own envelope/migration signatures (the confused-deputy
+/// defense). `random` is essential because wasm has no entropy source.
+pub trait Keyring: Send + Sync {
+    /// Sign `bytes` under the agent-application domain; returns the signature.
+    fn sign(&self, bytes: &[u8]) -> Vec<u8>;
+    /// Verify a signature produced by [`Keyring::sign`] under `pubkey`.
+    fn verify(&self, pubkey: &[u8], bytes: &[u8], sig: &[u8]) -> bool;
+    /// The public key counterparties verify against.
+    fn public_key(&self) -> Vec<u8>;
+    /// `n` bytes of cryptographically secure randomness (OS entropy).
+    fn random(&self, n: usize) -> Vec<u8>;
+}
+
 /// A timer request an agent makes via [`Ctx::set_timer`] / [`Ctx::cancel_timer`].
 /// The host schedules it (subject to the `Time` grant + slot budget) and later
 /// calls [`Agent::on_tick`] when it fires.
@@ -62,6 +78,15 @@ pub trait Kv: Send + Sync {
 pub enum TimerOp {
     Set { id: u64, delay_ms: u64 },
     Cancel { id: u64 },
+}
+
+/// An asynchronous inference request an agent makes via [`Ctx::infer`]. The host
+/// runs the model and delivers the result back as a normal message from `"llm"`
+/// carrying the agent-chosen `req_id` (the async reply-by-message model).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferReq {
+    pub req_id: u64,
+    pub prompt: String,
 }
 
 /// The per-call context handed to an agent: the sender of the current message,
@@ -73,6 +98,8 @@ pub struct Ctx {
     sends: Vec<Outgoing>,
     timers: Vec<TimerOp>,
     state: Option<std::sync::Arc<dyn Kv>>,
+    keyring: Option<std::sync::Arc<dyn Keyring>>,
+    infers: Vec<InferReq>,
 }
 
 impl Ctx {
@@ -142,6 +169,43 @@ impl Ctx {
         if let Some(s) = &self.state {
             s.del(key);
         }
+    }
+
+    /// Install the agent's crypto keyring (host-internal; only with `crypto`).
+    pub fn set_keyring(&mut self, k: std::sync::Arc<dyn Keyring>) {
+        self.keyring = Some(k);
+    }
+
+    /// Sign `bytes` (domain-separated, node-held key); `None` without `crypto`.
+    pub fn sign(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        Some(self.keyring.as_ref()?.sign(bytes))
+    }
+
+    /// Verify a signature from [`Ctx::sign`]; `false` without `crypto` or on mismatch.
+    pub fn verify(&self, pubkey: &[u8], bytes: &[u8], sig: &[u8]) -> bool {
+        self.keyring.as_ref().map(|k| k.verify(pubkey, bytes, sig)).unwrap_or(false)
+    }
+
+    /// This agent's signing public key (for counterparties); `None` without `crypto`.
+    pub fn crypto_pubkey(&self) -> Option<Vec<u8>> {
+        Some(self.keyring.as_ref()?.public_key())
+    }
+
+    /// `n` bytes of secure randomness; `None` without `crypto`.
+    pub fn random(&self, n: usize) -> Option<Vec<u8>> {
+        Some(self.keyring.as_ref()?.random(n))
+    }
+
+    /// Ask the host's model to run inference, correlated by `req_id`. The result
+    /// arrives later as a message from `"llm"` (async reply-by-message). Requires
+    /// the `llm` capability; otherwise no reply is ever delivered.
+    pub fn infer(&mut self, req_id: u64, prompt: impl Into<String>) {
+        self.infers.push(InferReq { req_id, prompt: prompt.into() });
+    }
+
+    /// Drain the inference requests emitted this call (host-internal).
+    pub fn take_infers(&mut self) -> Vec<InferReq> {
+        core::mem::take(&mut self.infers)
     }
 }
 

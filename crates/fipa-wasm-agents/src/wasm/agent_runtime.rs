@@ -54,6 +54,15 @@ pub trait AgentRuntime {
     /// Provision the agent's durable-state handle (the `state` capability; default:
     /// ignore). The node calls this at mount only when `State` is granted.
     fn set_state(&mut self, _kv: std::sync::Arc<dyn unl_agent::Kv>) {}
+
+    /// Provision the agent's crypto keyring (the `crypto` capability; default: ignore).
+    fn set_keyring(&mut self, _kr: std::sync::Arc<dyn unl_agent::Keyring>) {}
+
+    /// Drain the agent's inference requests this call (the `llm` capability; default:
+    /// none). Each is run by the host and replied to as a message from `"llm"`.
+    fn take_infer_reqs(&mut self) -> Vec<unl_agent::InferReq> {
+        Vec::new()
+    }
 }
 
 impl AgentRuntime for super::WasmRuntime {
@@ -100,11 +109,20 @@ pub struct NativeRuntime<A: Agent> {
     outbox: Vec<OutboundIntent>,
     timer_ops: Vec<unl_agent::TimerOp>,
     state: Option<std::sync::Arc<dyn unl_agent::Kv>>,
+    keyring: Option<std::sync::Arc<dyn unl_agent::Keyring>>,
+    infers: Vec<unl_agent::InferReq>,
 }
 
 impl<A: Agent> NativeRuntime<A> {
     pub fn new(agent: A) -> Self {
-        NativeRuntime { agent, outbox: Vec::new(), timer_ops: Vec::new(), state: None }
+        NativeRuntime {
+            agent,
+            outbox: Vec::new(),
+            timer_ops: Vec::new(),
+            state: None,
+            keyring: None,
+            infers: Vec::new(),
+        }
     }
 
     /// Run one agent call with **fault isolation**: a panic is caught so it can
@@ -114,10 +132,14 @@ impl<A: Agent> NativeRuntime<A> {
     /// `panic = "abort"` only a process boundary contains a faulting agent.)
     fn guarded(&mut self, call: impl FnOnce(&mut A, &mut Ctx)) -> Result<()> {
         let kv = self.state.clone();
+        let kr = self.keyring.clone();
         let agent = &mut self.agent;
         let mut ctx = Ctx::new();
         if let Some(s) = kv {
             ctx.set_state(s);
+        }
+        if let Some(k) = kr {
+            ctx.set_keyring(k);
         }
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(agent, &mut ctx)));
@@ -131,6 +153,7 @@ impl<A: Agent> NativeRuntime<A> {
                     });
                 }
                 self.timer_ops.extend(ctx.take_timers());
+                self.infers.extend(ctx.take_infers());
                 Ok(())
             }
             Err(_) => Err(anyhow::anyhow!("native agent panicked; output discarded")),
@@ -178,6 +201,14 @@ impl<A: Agent> AgentRuntime for NativeRuntime<A> {
 
     fn set_state(&mut self, kv: std::sync::Arc<dyn unl_agent::Kv>) {
         self.state = Some(kv);
+    }
+
+    fn set_keyring(&mut self, kr: std::sync::Arc<dyn unl_agent::Keyring>) {
+        self.keyring = Some(kr);
+    }
+
+    fn take_infer_reqs(&mut self) -> Vec<unl_agent::InferReq> {
+        std::mem::take(&mut self.infers)
     }
 }
 

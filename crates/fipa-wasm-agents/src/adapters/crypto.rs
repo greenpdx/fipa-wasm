@@ -12,6 +12,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 
 /// A node's Ed25519 keypair. Secret-side only.
+#[derive(Clone)]
 pub struct NodeCrypto {
     key: SigningKey,
 }
