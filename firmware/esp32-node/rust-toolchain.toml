@@ -1,0 +1,5 @@
+# RISC-V ESP targets build on stock nightly with build-std.
+# For Xtensa (classic ESP32 / S3) replace this with: channel = "esp"  (from espup).
+[toolchain]
+channel = "nightly-2024-09-01"
+components = ["rust-src"]

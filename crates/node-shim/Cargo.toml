@@ -1,0 +1,19 @@
+[package]
+name = "node-shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Minimal FIPA node-shim: agent + protocol in one binary, no wasm engine, for embedded (ESP32/esp-idf) targets"
+
+# Deliberately tiny dependency surface so the agent + shim link into a small
+# firmware: signing, Noise transport, hashing, entropy — nothing else. No tokio,
+# no serde, no wasm engine, no libp2p. The agent is native Rust compiled in.
+[dependencies]
+ed25519-dalek = "2.1"
+snow = "0.9"
+sha2 = "0.10"
+rand = "0.9"
+
+[[bin]]
+name = "shim-demo"
+path = "src/bin/shim_demo.rs"
