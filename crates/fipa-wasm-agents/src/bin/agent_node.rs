@@ -29,8 +29,8 @@ struct Args {
     #[arg(long, default_value = "node-1")]
     name: String,
 
-    /// gRPC listen address
-    #[arg(short, long, default_value = "0.0.0.0:9000")]
+    /// gRPC listen address (localhost by default; the gRPC surface is unauthenticated)
+    #[arg(short, long, default_value = "127.0.0.1:9000")]
     listen: String,
 
     /// Data directory

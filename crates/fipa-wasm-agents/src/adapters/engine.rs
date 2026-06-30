@@ -18,6 +18,13 @@ use anyhow::Result;
 
 use crate::wasm::OutboundIntent;
 
+/// Egress caps for the `send-unl` host call (audit M3): the largest single message
+/// a guest may emit, and the most intents one drain cycle may queue before the host
+/// stops accepting them — the queue is host-heap, outside the guest's memory cap, so
+/// without this a guest could amplify host allocation far beyond its own limit.
+pub const MAX_SEND_BYTES: usize = 1 << 20; // 1 MiB per message
+pub const MAX_QUEUED_SENDS: usize = 4096; // intents queued between drains
+
 /// Resource limits an engine enforces per agent (H3/R7).
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {

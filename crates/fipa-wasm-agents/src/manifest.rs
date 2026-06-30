@@ -143,6 +143,18 @@ pub enum FitError {
     OverBudget(&'static str),
 }
 
+/// Order network scopes so a request can be checked against a ceiling: `none` is
+/// narrowest, `any` is broadest, and everything bounded in between (`platform`, an
+/// explicit `node:<id>,…` allowlist) ranks the same — a request may not exceed the
+/// profile's ceiling rank (audit H4).
+fn net_rank(scope: &str) -> u8 {
+    match scope {
+        "none" => 0,
+        "any" => 2,
+        _ => 1, // "platform" or "node:<…>" — bounded reach
+    }
+}
+
 /// What a node profile provides: the capability set + budget ceilings.
 #[derive(Clone, Debug)]
 pub struct NodeProfile {
@@ -212,6 +224,9 @@ impl NodeProfile {
         if b.msg_per_s > self.ceiling.msg_per_s {
             return Err(FitError::OverBudget("msg_per_s"));
         }
+        if net_rank(&b.net) > net_rank(&self.ceiling.net) {
+            return Err(FitError::OverBudget("net")); // requested scope is broader than the ceiling
+        }
         let mut caps: HashSet<Capability> = m.grants.iter().copied().collect();
         caps.insert(Capability::Messaging); // core
         caps.insert(Capability::Log); // core
@@ -258,6 +273,18 @@ mod tests {
         let big = Budget { mem_kb: 999_999, ..Budget::default() };
         let err = NodeProfile::iot().fit(&manifest(&[Capability::State], big)).unwrap_err();
         assert_eq!(err, FitError::OverBudget("mem_kb"));
+    }
+
+    #[test]
+    fn net_scope_broader_than_the_ceiling_is_rejected() {
+        // IoT confines agents to "platform"; a request for "any" must not fit (H4).
+        // Every other field is within the IoT ceiling so only `net` can trip.
+        let wide = Budget { mem_kb: 64, fuel: 1, state_kb: 1, timers: 1, msg_per_s: 1, net: "any".into() };
+        let err = NodeProfile::iot().fit(&manifest(&[Capability::State], wide)).unwrap_err();
+        assert_eq!(err, FitError::OverBudget("net"));
+        // "none" fits the platform ceiling.
+        let ok = Budget { mem_kb: 64, fuel: 1, state_kb: 1, timers: 1, msg_per_s: 1, net: "none".into() };
+        assert!(NodeProfile::iot().fit(&manifest(&[Capability::State], ok)).is_ok());
     }
 
     #[test]

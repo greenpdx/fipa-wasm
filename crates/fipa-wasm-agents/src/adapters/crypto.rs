@@ -40,6 +40,7 @@ impl NodeCrypto {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, me.key.to_bytes())?; // the 32-byte secret seed
+        restrict_perms(path); // M9: owner-only — a node secret must not be world-readable
         Ok(me)
     }
 
@@ -59,6 +60,18 @@ impl NodeCrypto {
         rand::rng().fill_bytes(&mut n);
         n
     }
+}
+
+/// Restrict a freshly-written secret-key file to owner read/write (`0o600`) so a
+/// node secret persisted under a permissive umask is not left world-readable (M9).
+fn restrict_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Verify a detached Ed25519 signature. No secret needed — verification can happen

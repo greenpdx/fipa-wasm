@@ -269,81 +269,30 @@ impl FipaAgentService for FipaAgentServiceImpl {
         }
     }
 
-    /// Migrate an agent to this node
+    /// Migrate an agent to this node.
+    ///
+    /// **Retired (security).** This RPC spawned a caller-supplied wasm module with
+    /// caller-supplied capabilities and **no authentication** — unauthenticated RCE
+    /// (audit C1). Agent mobility now lives exclusively on the authenticated,
+    /// Noise-encrypted transport in `process::node` (signed snapshot + handoff +
+    /// epoch arbiter). This endpoint no longer spawns anything.
     async fn migrate_agent(
         &self,
-        request: Request<proto::AgentMigration>,
+        _request: Request<proto::AgentMigration>,
     ) -> Result<Response<proto::MigrationResponse>, Status> {
-        let migration = request.into_inner();
-
-        let agent_id = migration.agent_id
-            .ok_or_else(|| Status::invalid_argument("agent_id required"))?;
-
-        info!("Receiving migrated agent: {}", agent_id.name);
-
-        // Validate migration package
-        if migration.wasm_hash.is_empty() {
-            return Err(Status::invalid_argument("wasm_hash required"));
-        }
-
-        // Get WASM module (either from package or cache)
-        let wasm_module = if let Some(module) = migration.wasm_module {
-            module
-        } else {
-            // Try to fetch from cache by hash
-            return Err(Status::not_found("WASM module not provided and not in cache"));
-        };
-
-        // Spawn the agent
-        let config = crate::actor::AgentConfig {
-            id: agent_id.clone(),
-            wasm_module,
-            capabilities: migration.capabilities.unwrap_or_default(),
-            initial_state: migration.state,
-            restart_strategy: crate::actor::RestartStrategy::default(),
-        };
-
-        let spawn_result = self.state.supervisor
-            .send(crate::actor::SpawnAgent { config })
-            .await;
-
-        match spawn_result {
-            Ok(Ok(_addr)) => {
-                info!("Agent migrated successfully: {}", agent_id.name);
-                Ok(Response::new(proto::MigrationResponse {
-                    success: true,
-                    error: None,
-                    new_location: Some(self.state.node_id.clone()),
-                }))
-            }
-            Ok(Err(e)) => {
-                error!("Failed to spawn migrated agent: {}", e);
-                Ok(Response::new(proto::MigrationResponse {
-                    success: false,
-                    error: Some(e.to_string()),
-                    new_location: None,
-                }))
-            }
-            Err(e) => {
-                Err(Status::internal(format!("Supervisor error: {}", e)))
-            }
-        }
+        Err(Status::permission_denied(
+            "migration over gRPC is disabled; use the authenticated node transport",
+        ))
     }
 
-    /// Clone an agent to this node
+    /// Clone an agent to this node. Retired alongside `migrate_agent` (audit C1).
     async fn clone_agent(
         &self,
-        request: Request<proto::AgentMigration>,
+        _request: Request<proto::AgentMigration>,
     ) -> Result<Response<proto::MigrationResponse>, Status> {
-        let mut migration = request.into_inner();
-
-        // For cloning, generate a new unique agent ID
-        if let Some(ref mut agent_id) = migration.agent_id {
-            agent_id.name = format!("{}-clone-{}", agent_id.name, uuid::Uuid::new_v4());
-        }
-
-        // Reuse migrate logic
-        self.migrate_agent(Request::new(migration)).await
+        Err(Status::permission_denied(
+            "agent cloning over gRPC is disabled; use the authenticated node transport",
+        ))
     }
 
     /// Request WASM module by hash

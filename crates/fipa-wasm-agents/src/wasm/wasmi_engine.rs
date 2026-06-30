@@ -9,14 +9,14 @@
 //! fuel; a hard memory cap is a follow-up (wasmi modules are small on IoT).
 
 use anyhow::{anyhow, Result};
-use wasmi::{Caller, Config, Engine as WasmiCore, Extern, Linker, Module, Store, Val};
+use wasmi::{Caller, Config, Engine as WasmiCore, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
 
 use crate::adapters::{EngineModule, HostHooks, Limits};
 use crate::wasm::{AgentRuntime, OutboundIntent};
 
 /// An instantiated agent module on the wasmi interpreter.
 pub struct WasmiModule {
-    store: Store<()>,
+    store: Store<StoreLimits>,
     instance: wasmi::Instance,
     hooks: HostHooks,
     fuel: u64, // per-call CPU budget
@@ -33,26 +33,40 @@ impl crate::adapters::Engine for WasmiEngine {
         config.consume_fuel(true);
         let engine = WasmiCore::new(&config);
         let module = Module::new(&engine, code).map_err(|e| anyhow!("wasmi compile: {e}"))?;
-        let mut store = Store::new(&engine, ());
+        // Bound linear-memory growth (audit H6): wasmi otherwise honours only fuel,
+        // so a guest could `memory.grow` until the host is OOM-killed.
+        let limiter = StoreLimitsBuilder::new().memory_size(limits.mem_bytes).build();
+        let mut store = Store::new(&engine, limiter);
         store.set_fuel(limits.fuel).ok();
+        store.limiter(|lim| lim);
 
-        let mut linker = <Linker<()>>::new(&engine);
+        let mut linker = <Linker<StoreLimits>>::new(&engine);
         let sends = hooks.sends.clone();
         linker
             .func_wrap(
                 "fipa:agent/messaging",
                 "send-unl",
-                move |caller: Caller<()>, rp: i32, rl: i32, up: i32, ul: i32, bp: i32, bl: i32| {
+                move |caller: Caller<StoreLimits>, rp: i32, rl: i32, up: i32, ul: i32, bp: i32, bl: i32| {
                     let Some(Extern::Memory(mem)) = caller.get_export("memory") else { return };
                     let data = mem.data(&caller);
                     let slice = |ptr: i32, len: i32| -> Vec<u8> {
                         let s = ptr as usize;
-                        data.get(s..s + len as usize).map(<[u8]>::to_vec).unwrap_or_default()
+                        // saturating add: a negative/huge ptr or len can never overflow
+                        // into a panic or an out-of-range slice (audit M10).
+                        data.get(s..s.saturating_add(len as usize)).map(<[u8]>::to_vec).unwrap_or_default()
                     };
                     let receiver = String::from_utf8_lossy(&slice(rp, rl)).into_owned();
                     let unl = slice(up, ul);
                     let body = slice(bp, bl);
-                    sends.lock().unwrap().push(OutboundIntent { receiver, unl, body });
+                    // M3 — bound guest egress (see crate::adapters egress caps).
+                    if unl.len() + body.len() > crate::adapters::MAX_SEND_BYTES {
+                        return;
+                    }
+                    let mut guard = sends.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() >= crate::adapters::MAX_QUEUED_SENDS {
+                        return;
+                    }
+                    guard.push(OutboundIntent { receiver, unl, body });
                 },
             )
             .map_err(|e| anyhow!("wasmi link: {e}"))?;
@@ -87,7 +101,7 @@ impl AgentRuntime for WasmiModule {
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn run(&mut self) -> Result<bool> {
@@ -131,7 +145,7 @@ impl WasmiModule {
 
     /// Drain the messages the agent emitted via `send-unl` (the node's sink).
     pub fn take_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -237,5 +251,18 @@ mod tests {
         b.call_io("restore", &[&snap]).unwrap();
         b.refuel(limits().fuel);
         assert_eq!(b.call_packed("snapshot").unwrap(), vec![3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn wasmi_caps_linear_memory() {
+        // A module declaring 4 pages (256 KiB) cannot instantiate under a 64 KiB cap
+        // (H6 — wasmi otherwise ignores the memory limit).
+        let wat = r#"(module (memory (export "memory") 4) (func (export "init")))"#;
+        let wasm = wat::parse_str(wat).unwrap();
+        let tight = Limits { fuel: 1_000_000, mem_bytes: 64 * 1024 };
+        assert!(WasmiEngine.instantiate(&wasm, tight, HostHooks::default()).is_err());
+        // the same module fits under a generous cap
+        let roomy = Limits { fuel: 1_000_000, mem_bytes: 1024 * 1024 };
+        assert!(WasmiEngine.instantiate(&wasm, roomy, HostHooks::default()).is_ok());
     }
 }

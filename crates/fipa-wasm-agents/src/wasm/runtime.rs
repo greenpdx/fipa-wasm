@@ -45,6 +45,11 @@ impl WasmRuntime {
         config.wasm_component_model(true);
         config.async_support(false);
         config.consume_fuel(true);
+        // CPU is bounded by fuel: every guest instruction costs fuel and a runaway
+        // loop traps when the per-call budget is exhausted. A wall-clock epoch
+        // interrupt (audit L3) would only add value once a *blocking* host import
+        // exists (none do today — all host calls return immediately), and it needs a
+        // shared-engine watchdog; deferred until that architecture lands.
         let engine = Engine::new(&config)?;
         let module = Module::new(&engine, code)?;
         let host_state = HostState::new(capabilities.clone());
@@ -97,20 +102,32 @@ impl WasmRuntime {
                 let read = |caller: &Caller<'_, HostState>, ptr: i32, len: i32| -> Vec<u8> {
                     let data = memory.data(caller);
                     let start = ptr as usize;
-                    data.get(start..start + len as usize)
+                    // saturating add: a negative/huge ptr or len can never overflow
+                    // into a panic or an out-of-range slice (audit M10).
+                    data.get(start..start.saturating_add(len as usize))
                         .map(<[u8]>::to_vec)
                         .unwrap_or_default()
                 };
                 let receiver = String::from_utf8_lossy(&read(&caller, rp, rl)).into_owned();
                 let unl = read(&caller, up, ul);
                 let body = read(&caller, bp, bl);
+                // M3 — bound a guest's egress: a single message can't exceed 1 MiB and a
+                // single call can't queue more than MAX_QUEUED_SENDS intents, so a guest
+                // cannot amplify host-heap use beyond its own (capped) memory.
+                if unl.len() + body.len() > crate::adapters::MAX_SEND_BYTES {
+                    return;
+                }
+                let mut guard = sends.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() >= crate::adapters::MAX_QUEUED_SENDS {
+                    return;
+                }
                 crate::flow!(
                     "wasm: ← agent emitted send-unl → '{}' (unl={} bytes, body={} bytes)",
                     receiver,
                     unl.len(),
                     body.len()
                 );
-                sends.lock().unwrap().push(OutboundIntent { receiver, unl, body });
+                guard.push(OutboundIntent { receiver, unl, body });
             },
         )?;
 
@@ -242,7 +259,7 @@ impl WasmRuntime {
     /// validates each against the receiver's vocabulary, packages it, and
     /// transmits it.
     pub fn take_unl_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Capture the agent's state via its `snapshot` export (state-based migration).

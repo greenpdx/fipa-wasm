@@ -104,7 +104,10 @@ impl Default for SecurityConfig {
             lockout_duration_secs: 300, // 5 minutes
             policy_file: None,
             trusted_cas: vec![],
-            allow_self_signed: true, // For development
+            // M11 — fail closed: do not accept self-signed certs by default. This
+            // module is not yet wired into the node's gate; harden the default now so
+            // it cannot go live fail-open.
+            allow_self_signed: false,
         }
     }
 }
