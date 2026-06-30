@@ -58,7 +58,15 @@ impl crate::adapters::Engine for WasmiEngine {
                     let receiver = String::from_utf8_lossy(&slice(rp, rl)).into_owned();
                     let unl = slice(up, ul);
                     let body = slice(bp, bl);
-                    sends.lock().unwrap().push(OutboundIntent { receiver, unl, body });
+                    // M3 — bound guest egress (see crate::adapters egress caps).
+                    if unl.len() + body.len() > crate::adapters::MAX_SEND_BYTES {
+                        return;
+                    }
+                    let mut guard = sends.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() >= crate::adapters::MAX_QUEUED_SENDS {
+                        return;
+                    }
+                    guard.push(OutboundIntent { receiver, unl, body });
                 },
             )
             .map_err(|e| anyhow!("wasmi link: {e}"))?;

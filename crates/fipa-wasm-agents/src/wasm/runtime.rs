@@ -106,13 +106,23 @@ impl WasmRuntime {
                 let receiver = String::from_utf8_lossy(&read(&caller, rp, rl)).into_owned();
                 let unl = read(&caller, up, ul);
                 let body = read(&caller, bp, bl);
+                // M3 — bound a guest's egress: a single message can't exceed 1 MiB and a
+                // single call can't queue more than MAX_QUEUED_SENDS intents, so a guest
+                // cannot amplify host-heap use beyond its own (capped) memory.
+                if unl.len() + body.len() > crate::adapters::MAX_SEND_BYTES {
+                    return;
+                }
+                let mut guard = sends.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() >= crate::adapters::MAX_QUEUED_SENDS {
+                    return;
+                }
                 crate::flow!(
                     "wasm: ← agent emitted send-unl → '{}' (unl={} bytes, body={} bytes)",
                     receiver,
                     unl.len(),
                     body.len()
                 );
-                sends.lock().unwrap().push(OutboundIntent { receiver, unl, body });
+                guard.push(OutboundIntent { receiver, unl, body });
             },
         )?;
 

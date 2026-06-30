@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -256,7 +256,7 @@ fn now_ms() -> u64 {
 fn handle_conn(
     mut s: TcpStream,
     noise: &NodeNoise,
-    in_tx: &Sender<NodeMsg>,
+    in_tx: &SyncSender<NodeMsg>,
     rz_tx: &Sender<(String, Sender<String>)>,
     mg_tx: &Sender<(Vec<u8>, Sender<bool>)>,
     mg_fin_tx: &Sender<(String, bool)>,
@@ -276,15 +276,32 @@ fn handle_conn(
     // After the handshake a KIND_MSG channel is persistent, so tolerate idle gaps
     // between messages; a long idle just recycles the connection (sender re-dials).
     s.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut frames = 0u32;
+    let mut window = std::time::Instant::now();
     loop {
         let (kind, payload) = match sess.recv(&mut s) {
             Ok(v) => v,
             Err(_) => return, // idle timeout / EOF / error → close
         };
+        // M1 — per-connection frame-rate cap: an abusive peer that floods frames has
+        // its connection dropped rather than driving unbounded work in the main loop.
+        if window.elapsed() >= Duration::from_secs(1) {
+            window = std::time::Instant::now();
+            frames = 0;
+        }
+        frames += 1;
+        if frames > 500 {
+            return;
+        }
         match kind {
             KIND_MSG => {
+                // M1 — cheap structural pre-filter so a flood of malformed frames is
+                // dropped in this (parallel) connection thread, never queued; full
+                // signature verification + TOFU still run in the main loop.
                 if let Some(m) = decode_msg(&payload) {
-                    let _ = in_tx.send(m);
+                    if m.sig.len() == 64 && m.sender_pub.len() == 32 && !adapters::is_reserved_sender(&m.from) {
+                        let _ = in_tx.send(m);
+                    }
                 }
                 // keep reading — the channel is persistent
             }
@@ -371,6 +388,8 @@ pub struct Node {
     noise_allow: Option<HashSet<Vec<u8>>>, // C2a: if set, only these peer static keys may connect
     prepared: HashMap<String, Handoff>, // migrated agents mounted-but-suspended, awaiting commit (H3)
     msg_window: HashMap<String, (u64, u32)>, // H5: per-agent egress rate window (start_ms, count)
+    nonce_seen: HashSet<(String, Vec<u8>)>, // M5: (from, nonce) replay guard for wire messages
+    nonce_order: std::collections::VecDeque<(String, Vec<u8>)>, // M5: eviction order for nonce_seen
 }
 
 impl Node {
@@ -402,6 +421,8 @@ impl Node {
             noise_allow: None,
             prepared: HashMap::new(),
             msg_window: HashMap::new(),
+            nonce_seen: HashSet::new(),
+            nonce_order: std::collections::VecDeque::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -513,7 +534,11 @@ impl Node {
             crate::flow!("[{}] ⛔ infer denied for '{}' (no Llm grant)", self.label, uuid);
             return;
         }
-        for r in reqs {
+        const MAX_INFER_PER_CALL: usize = 16; // M2: bound a single agent's burst
+        if reqs.len() > MAX_INFER_PER_CALL {
+            self.audit(uuid, "denied:infer-burst", &format!("{} requests", reqs.len()));
+        }
+        for r in reqs.into_iter().take(MAX_INFER_PER_CALL) {
             self.pending_infers.push((uuid.to_string(), r.req_id, r.prompt));
         }
     }
@@ -880,7 +905,11 @@ impl Node {
                 return false;
             }
         }
-        if self.seen.get(&snap.uuid).is_some_and(|&e| snap.epoch <= e) {
+        // Replay guard: reject a non-advancing epoch, consulting both the in-memory
+        // and the durable (M4) record so a captured payload cannot re-mount after a
+        // restart wiped `seen`.
+        let last = self.seen.get(&snap.uuid).copied().or_else(|| self.persisted_seen(&snap.uuid));
+        if last.is_some_and(|e| snap.epoch <= e) {
             crate::flow!("[{}] ⛔ migrate: replayed epoch {} for '{}'", self.label, snap.epoch, snap.uuid);
             return false;
         }
@@ -903,6 +932,13 @@ impl Node {
             self.cache_code(snap.code.clone());
             snap.code.clone()
         } else {
+            // SSRF guard (M6): only CODE_FETCH-dial an address we already know as a
+            // route, so an attacker-supplied `from_addr` cannot make us connect to an
+            // arbitrary (e.g. internal) host. The content hash is verified by fetch_code.
+            if from_addr.is_empty() || !self.routes.values().any(|a| a == &from_addr) {
+                crate::flow!("[{}] ⛔ migrate: CODE_FETCH to unknown address refused", self.label);
+                return false;
+            }
             match self.fetch_code(&from_addr, &snap.code_hash) {
                 Some(c) => c,
                 None => {
@@ -960,6 +996,7 @@ impl Node {
             _ => return, // unknown or already committed
         };
         self.seen.insert(uuid.to_string(), epoch);
+        self.persist_seen(uuid, epoch); // M4: survive a restart
         crate::flow!("[{}] ⇇ migrated '{}' committed (epoch {})", self.label, uuid, epoch);
         if let Some(ho) = self.prepared.remove(uuid) {
             if self.routes.contains_key("ams") {
@@ -988,6 +1025,24 @@ impl Node {
         crate::flow!("[{}] ⛔ migrated '{}' aborted (no commit)", self.label, uuid);
     }
 
+    /// Persist a committed migration epoch so the replay guard survives a restart
+    /// (M4): an in-memory `seen` alone lets a captured payload re-mount after a crash.
+    fn persist_seen(&self, uuid: &str, epoch: u64) {
+        if let Some(store) = &self.store {
+            let _ = store.put("_migrate_seen", uuid, &epoch.to_be_bytes());
+        }
+    }
+
+    /// The durably-recorded last migration epoch for `uuid`, if any (M4).
+    fn persisted_seen(&self, uuid: &str) -> Option<u64> {
+        let bytes = self.store.as_ref()?.get("_migrate_seen", uuid).ok().flatten()?;
+        (bytes.len() == 8).then(|| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            u64::from_be_bytes(b)
+        })
+    }
+
     /// Stamp `sender_pub`/`nonce` and sign a message with this node's key (R1).
     fn seal(&self, m: &mut NodeMsg) {
         m.sender_pub = self.key.public_key().to_vec();
@@ -1009,13 +1064,20 @@ impl Node {
         use std::sync::atomic::AtomicUsize;
         const MAX_CONNS: usize = 64; // bound concurrent handshakes under a flood
 
+        const MAX_PER_IP: usize = 8; // bound connections from any single source (M8)
+        const MAX_INFLIGHT_INFER: usize = 32; // bound concurrent llm worker threads (M2)
+
         listener.set_nonblocking(true).ok();
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
+        // Bounded inbound queue (M1): a flooding peer blocks on send (backpressure)
+        // instead of growing node memory without limit.
+        let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<NodeMsg>(1024);
         let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
         let (mg_tx, mg_rx) = std::sync::mpsc::channel::<(Vec<u8>, Sender<bool>)>();
         let (mg_fin_tx, mg_fin_rx) = std::sync::mpsc::channel::<(String, bool)>(); // (uuid, commit?)
         let (llm_tx, llm_rx) = std::sync::mpsc::channel::<(String, u64, String)>();
         let conns = Arc::new(AtomicUsize::new(0));
+        let infl = Arc::new(AtomicUsize::new(0)); // in-flight inferences (M2)
+        let per_ip = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new())); // M8
         let allow = self.noise_allow.clone().map(Arc::new); // C2a: shared per-connection
 
         while !shutdown.load(Ordering::Relaxed) {
@@ -1078,13 +1140,21 @@ impl Node {
                 self.fire_tick(&uuid, id);
             }
 
-            // 3d. Run pending inferences off the main thread (M5 llm — async).
+            // 3d. Run pending inferences off the main thread (llm — async). M2: bound
+            //     concurrent worker threads; anything over the cap stays queued for a
+            //     later iteration rather than spawning unbounded threads.
             if let Some(backend) = self.llm.clone() {
                 for (uuid, req_id, prompt) in std::mem::take(&mut self.pending_infers) {
-                    let (b, tx) = (backend.clone(), llm_tx.clone());
+                    if infl.load(Ordering::Relaxed) >= MAX_INFLIGHT_INFER {
+                        self.pending_infers.push((uuid, req_id, prompt)); // re-queue; retry next loop
+                        continue;
+                    }
+                    infl.fetch_add(1, Ordering::Relaxed);
+                    let (b, tx, infl2) = (backend.clone(), llm_tx.clone(), infl.clone());
                     std::thread::spawn(move || {
                         let text = b.infer(&prompt).unwrap_or_else(|e| format!("error: {e}"));
                         let _ = tx.send((uuid, req_id, text));
+                        infl2.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
             } else {
@@ -1111,8 +1181,18 @@ impl Node {
                     if conns.load(Ordering::Relaxed) >= MAX_CONNS {
                         continue; // drop (the connection closes) — bounded resource use
                     }
+                    // M8 — per-source-IP cap: a single host cannot pin all the slots.
+                    let ip = s.peer_addr().ok().map(|a| a.ip());
+                    if let Some(ip) = ip {
+                        let mut map = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+                        let c = map.entry(ip).or_insert(0);
+                        if *c >= MAX_PER_IP {
+                            continue; // too many from this IP → drop
+                        }
+                        *c += 1;
+                    }
                     conns.fetch_add(1, Ordering::Relaxed);
-                    let (noise, in_tx, rz_tx, mg_tx, mg_fin_tx, cs, conns2, al) = (
+                    let (noise, in_tx, rz_tx, mg_tx, mg_fin_tx, cs, conns2, al, pip) = (
                         self.noise.clone(),
                         in_tx.clone(),
                         rz_tx.clone(),
@@ -1121,10 +1201,20 @@ impl Node {
                         self.code_store.clone(),
                         conns.clone(),
                         allow.clone(),
+                        per_ip.clone(),
                     );
                     std::thread::spawn(move || {
                         handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &mg_fin_tx, &cs, al);
                         conns2.fetch_sub(1, Ordering::Relaxed);
+                        if let Some(ip) = ip {
+                            let mut map = pip.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(c) = map.get_mut(&ip) {
+                                *c -= 1;
+                                if *c == 0 {
+                                    map.remove(&ip);
+                                }
+                            }
+                        }
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1153,6 +1243,23 @@ impl Node {
                 msg.from
             );
             return;
+        }
+        // M5 — reject a replayed envelope: a (from, nonce) pair seen before is a
+        // re-sent, still-valid message (the signed nonce gives per-message freshness).
+        if !msg.nonce.is_empty() {
+            let key = (msg.from.clone(), msg.nonce.clone());
+            if self.nonce_seen.contains(&key) {
+                self.audit(&msg.from, "replay", "duplicate nonce");
+                crate::flow!("[{}] ⛔ replayed envelope from '{}'", self.label, msg.from);
+                return;
+            }
+            self.nonce_seen.insert(key.clone());
+            self.nonce_order.push_back(key);
+            if self.nonce_order.len() > 8192 {
+                if let Some(old) = self.nonce_order.pop_front() {
+                    self.nonce_seen.remove(&old);
+                }
+            }
         }
         self.pump(msg);
     }
@@ -1996,6 +2103,25 @@ mod tests {
         assert!(n.wire_admit(&m3) && n.authorize(&m3));
         // B is now the owner: a further message under B (no handoff) is fine
         assert!(n.authorize(&sign(&kb, "X", Vec::new())));
+    }
+
+    #[test]
+    fn replayed_envelope_is_dropped() {
+        // A signed wire message delivered once must not be re-delivered when the same
+        // (from, nonce) envelope is replayed (audit M5).
+        let (tx, rx) = mpsc::channel();
+        let mut n = Node::new("N", "n", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        n.set_sink(tx);
+        let k = NodeCrypto::generate();
+        let mut m = NodeMsg { to: "N".into(), from: "X".into(), unl: b"obj(ping, x)".to_vec(), ..Default::default() };
+        m.sender_pub = k.public_key().to_vec();
+        m.nonce = k.nonce().to_vec();
+        m.sig = k.sign(&signing_bytes(&m)).to_vec();
+
+        n.accept_wire(m.clone()); // delivered → Ponger replies pong (no route to X → sink)
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        n.accept_wire(m); // exact replay → dropped
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     // ── Phase-1 security regressions (audit C2 / H1) ──────────────────────

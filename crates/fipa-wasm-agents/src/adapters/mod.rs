@@ -12,7 +12,7 @@ pub mod engine;
 pub mod noise;
 pub mod store;
 pub use crypto::{verify, NodeCrypto};
-pub use engine::{Engine, EngineModule, HostHooks, Limits};
+pub use engine::{Engine, EngineModule, HostHooks, Limits, MAX_QUEUED_SENDS, MAX_SEND_BYTES};
 pub use noise::{NodeNoise, NoiseSession};
 pub use store::SledStore;
 
