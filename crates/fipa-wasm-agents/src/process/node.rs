@@ -259,10 +259,18 @@ fn handle_conn(
     rz_tx: &Sender<(String, Sender<String>)>,
     mg_tx: &Sender<(Vec<u8>, Sender<bool>)>,
     code_store: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    allow: Option<Arc<HashSet<Vec<u8>>>>,
 ) {
     s.set_read_timeout(Some(DIAL_TIMEOUT)).ok(); // bound the handshake
     s.set_write_timeout(Some(DIAL_TIMEOUT)).ok();
     let Ok(mut sess) = noise.accept(&mut s) else { return };
+    // C2a — enforce the Noise peer allowlist (if configured) before any frame is
+    // accepted, so an unknown peer cannot reach the migrate / message handlers.
+    if let Some(set) = &allow {
+        if !set.contains(sess.peer_static()) {
+            return;
+        }
+    }
     // After the handshake a KIND_MSG channel is persistent, so tolerate idle gaps
     // between messages; a long idle just recycles the connection (sender re-dials).
     s.set_read_timeout(Some(Duration::from_secs(60))).ok();
@@ -319,6 +327,7 @@ struct Mounted {
     code: Option<Vec<u8>>, // wasm bytes for a mobile agent; None for native templates
     epoch: u64,            // this agent's location epoch (R6)
     grant: Grant,          // M2: the agent's effective capability authority
+    manifest: Option<Manifest>, // the signed manifest, carried on migration to re-fit (H1)
 }
 
 /// A node: one **or more** local agents, a TCP address, a routing table, and the
@@ -348,6 +357,7 @@ pub struct Node {
     quarantined: HashSet<String>,        // M6: agents stopped after repeated faults
     conns: HashMap<String, (TcpStream, NoiseSession)>, // persistent KIND_MSG channels per peer
     code_store: Arc<Mutex<HashMap<String, Vec<u8>>>>,  // content-addressed wasm (CODE_FETCH)
+    noise_allow: Option<HashSet<Vec<u8>>>, // C2a: if set, only these peer static keys may connect
 }
 
 impl Node {
@@ -376,9 +386,19 @@ impl Node {
             quarantined: HashSet::new(),
             conns: HashMap::new(),
             code_store: Arc::new(Mutex::new(HashMap::new())),
+            noise_allow: None,
         };
         node.mount(uuid, alias, agent, None);
         node
+    }
+
+    /// Restrict inbound connections to an allowlist of peer Noise static keys (C2a).
+    /// Once any peer is allowed, the allowlist is enforced and unknown peers are
+    /// dropped right after the handshake. With no allowlist set, any peer may
+    /// connect (development default) and authority still rests on the signed
+    /// envelope + migration origin checks.
+    pub fn allow_noise_peer(&mut self, peer_static: &[u8]) {
+        self.noise_allow.get_or_insert_with(HashSet::new).insert(peer_static.to_vec());
     }
 
     /// Mount an additional agent (a multi-agent / "platform" node). The agent from
@@ -402,6 +422,7 @@ impl Node {
                 code: None,
                 epoch: 0,
                 grant: Grant::full(), // native = trusted infra template
+                manifest: None,       // native agents are stationary (not mobile)
             },
         );
         self.provision_state(uuid);
@@ -569,27 +590,7 @@ impl Node {
             .profile
             .fit(manifest)
             .map_err(|e| anyhow::anyhow!("manifest does not fit node profile: {e:?}"))?;
-        // Select the wasm engine by node profile: the wasmi interpreter on an IoT
-        // node, wasmtime otherwise — the same agent ABI runs on either (E2).
-        let runtime: Box<dyn AgentRuntime + Send> = if self.profile.profile == Profile::Iot {
-            let limits = Limits {
-                fuel: grant.budget.fuel,
-                mem_bytes: grant.budget.mem_kb.saturating_mul(1024) as usize,
-            };
-            let mut m = WasmiEngine.instantiate(&code, limits, HostHooks::default())?;
-            m.init()?;
-            Box::new(m)
-        } else {
-            let caps = crate::proto::AgentCapabilities {
-                max_memory_bytes: grant.budget.mem_kb.saturating_mul(1024),
-                max_execution_time_ms: (grant.budget.fuel / 1_000_000).max(1),
-                storage_quota_bytes: grant.budget.state_kb.saturating_mul(1024),
-                ..Default::default()
-            };
-            let mut rt = WasmRuntime::new(&code, &caps)?;
-            rt.call_init()?;
-            Box::new(rt)
-        };
+        let runtime = self.instantiate_agent(&code, &grant)?;
         self.aliases.insert(alias.into(), uuid.into());
         self.agents.insert(
             uuid.into(),
@@ -601,11 +602,39 @@ impl Node {
                 code: Some(code),
                 epoch: 0,
                 grant,
+                manifest: Some(manifest.clone()),
             },
         );
         self.provision_state(uuid);
         self.provision_crypto(uuid);
         Ok(())
+    }
+
+    /// Instantiate (and `init`) a wasm agent under `grant`, selecting the engine by
+    /// node profile: the wasmi interpreter on an IoT node, wasmtime otherwise — the
+    /// same agent ABI runs on either (E2). The wasm engine caps are derived from the
+    /// granted budget, so both `mount_wasm` and the migration path are sandboxed by
+    /// the *fitted* budget rather than defaults (audit H1).
+    fn instantiate_agent(&self, code: &[u8], grant: &Grant) -> anyhow::Result<Box<dyn AgentRuntime + Send>> {
+        if self.profile.profile == Profile::Iot {
+            let limits = Limits {
+                fuel: grant.budget.fuel,
+                mem_bytes: grant.budget.mem_kb.saturating_mul(1024) as usize,
+            };
+            let mut m = WasmiEngine.instantiate(code, limits, HostHooks::default())?;
+            m.init()?;
+            Ok(Box::new(m))
+        } else {
+            let caps = crate::proto::AgentCapabilities {
+                max_memory_bytes: grant.budget.mem_kb.saturating_mul(1024),
+                max_execution_time_ms: (grant.budget.fuel / 1_000_000).max(1),
+                storage_quota_bytes: grant.budget.state_kb.saturating_mul(1024),
+                ..Default::default()
+            };
+            let mut rt = WasmRuntime::new(code, &caps)?;
+            rt.call_init()?;
+            Ok(Box::new(rt))
+        }
     }
 
     /// Use a persisted node key at `path` (mint+persist on first run) instead of an
@@ -697,13 +726,14 @@ impl Node {
     /// handoff authorizing `dest_pub`) for a mobile agent — without sending it. The
     /// code is cached so the destination can CODE_FETCH it.
     pub fn build_migrate_payload(&mut self, uuid: &str, dest_pub: &[u8]) -> Option<Vec<u8>> {
-        let (code, epoch, state) = {
+        let (code, epoch, state, manifest_json) = {
             let m = self.agents.get_mut(uuid)?;
             let code = m.code.clone()?; // only wasm (mobile) agents have code
-            (code, m.epoch + 1, m.runtime.snapshot())
+            let manifest_json = m.manifest.as_ref()?.to_json(); // mobile agents carry a manifest
+            (code, m.epoch + 1, m.runtime.snapshot(), manifest_json)
         };
         self.cache_code(code.clone());
-        let snapshot = AgentSnapshot::sealed(uuid, epoch, code, state, &self.key);
+        let snapshot = AgentSnapshot::sealed(uuid, epoch, code, state, manifest_json, &self.key);
         let handoff = Handoff::sealed(uuid, dest_pub.to_vec(), epoch, &self.key);
         Some(MigratePayload { snapshot, handoff, from_addr: self.addr.clone() }.encode())
     }
@@ -751,10 +781,46 @@ impl Node {
             crate::flow!("[{}] ⛔ migrate: handoff not for me / inconsistent", self.label);
             return;
         }
+        // C2 — reject reserved system ids and refuse to overwrite a locally-born
+        // (non-migrated) agent, so an unauthenticated peer cannot hijack an identity.
+        if adapters::is_reserved_sender(&snap.uuid) {
+            crate::flow!("[{}] ⛔ migrate: reserved id '{}' refused", self.label, snap.uuid);
+            return;
+        }
+        if self.agents.contains_key(&snap.uuid) && !self.seen.contains_key(&snap.uuid) {
+            crate::flow!("[{}] ⛔ migrate: '{}' collides with a local agent", self.label, snap.uuid);
+            return;
+        }
+        // C2 — origin authenticity: the snapshot must be signed by the agent's
+        // currently-authorized node key. A known key MUST match; first sighting is
+        // TOFU-accepted only behind the Noise peer allowlist (enforced at accept).
+        // TODO(attestation): replace first-sighting TOFU with an authoritative AMS
+        // key lookup (MOBILITY §7) — staged follow-up behind this same check.
+        if let Some(known) = self.keys.get(&snap.uuid).copied() {
+            if known.as_slice() != snap.origin_pub.as_slice() {
+                self.audit(&snap.uuid, "migrate:bad-origin", "origin key != authorized key");
+                crate::flow!("[{}] ⛔ migrate: origin key ≠ authorized key for '{}'", self.label, snap.uuid);
+                return;
+            }
+        }
         if self.seen.get(&snap.uuid).is_some_and(|&e| snap.epoch <= e) {
             crate::flow!("[{}] ⛔ migrate: replayed epoch {} for '{}'", self.label, snap.epoch, snap.uuid);
             return;
         }
+        // H1 — re-fit the carried manifest against THIS node's profile; migration
+        // never inherits authority and never runs at Grant::full().
+        let Some(manifest) = Manifest::from_json(&snap.manifest) else {
+            crate::flow!("[{}] ⛔ migrate: missing/invalid manifest", self.label);
+            return;
+        };
+        let grant = match self.profile.fit(&manifest) {
+            Ok(g) => g,
+            Err(e) => {
+                self.audit(&snap.uuid, "migrate:unfit", &format!("{e:?}"));
+                crate::flow!("[{}] ⛔ migrate: manifest does not fit node profile: {e:?}", self.label);
+                return;
+            }
+        };
         // resolve the wasm: inline if present (cache it), else CODE_FETCH from origin
         let code = if !snap.code.is_empty() {
             self.cache_code(snap.code.clone());
@@ -768,29 +834,35 @@ impl Node {
                 }
             }
         };
-        let caps = crate::proto::AgentCapabilities::default();
-        let mut rt = match WasmRuntime::new(&code, &caps) {
+        let mut runtime = match self.instantiate_agent(&code, &grant) {
             Ok(rt) => rt,
             Err(_) => {
                 crate::flow!("[{}] ⛔ migrate: code won't instantiate", self.label);
                 return;
             }
         };
-        let _ = rt.call_init();
-        rt.call_restore(&snap.state);
+        runtime.restore(&snap.state);
+        // Pin the origin key for this agent (first sighting) so a later migration
+        // under a different key is rejected as impersonation.
+        let mut origin = [0u8; 32];
+        origin.copy_from_slice(&snap.origin_pub);
+        self.keys.entry(snap.uuid.clone()).or_insert(origin);
         self.aliases.insert(snap.uuid.clone(), snap.uuid.clone());
         self.agents.insert(
             snap.uuid.clone(),
             Mounted {
                 uuid: snap.uuid.clone(),
                 alias: snap.uuid.clone(),
-                runtime: Box::new(rt),
+                runtime,
                 service: None,
                 code: Some(code),
                 epoch: snap.epoch,
-                grant: Grant::full(), // TODO(M2): carry the manifest in the snapshot + re-fit
+                grant,
+                manifest: Some(manifest),
             },
         );
+        self.provision_state(&snap.uuid);
+        self.provision_crypto(&snap.uuid);
         self.seen.insert(snap.uuid.clone(), snap.epoch);
         crate::flow!("[{}] ⇇ migrated '{}' arrived (epoch {})", self.label, snap.uuid, snap.epoch);
 
@@ -832,6 +904,7 @@ impl Node {
         let (mg_tx, mg_rx) = std::sync::mpsc::channel::<(Vec<u8>, Sender<bool>)>();
         let (llm_tx, llm_rx) = std::sync::mpsc::channel::<(String, u64, String)>();
         let conns = Arc::new(AtomicUsize::new(0));
+        let allow = self.noise_allow.clone().map(Arc::new); // C2a: shared per-connection
 
         while !shutdown.load(Ordering::Relaxed) {
             // 1. Local kickoff injections (trusted, in-process — never the wire).
@@ -916,16 +989,17 @@ impl Node {
                         continue; // drop (the connection closes) — bounded resource use
                     }
                     conns.fetch_add(1, Ordering::Relaxed);
-                    let (noise, in_tx, rz_tx, mg_tx, cs, conns2) = (
+                    let (noise, in_tx, rz_tx, mg_tx, cs, conns2, al) = (
                         self.noise.clone(),
                         in_tx.clone(),
                         rz_tx.clone(),
                         mg_tx.clone(),
                         self.code_store.clone(),
                         conns.clone(),
+                        allow.clone(),
                     );
                     std::thread::spawn(move || {
-                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &cs);
+                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &cs, al);
                         conns2.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -1763,5 +1837,77 @@ mod tests {
         assert!(n.wire_admit(&m3) && n.authorize(&m3));
         // B is now the owner: a further message under B (no handoff) is fine
         assert!(n.authorize(&sign(&kb, "X", Vec::new())));
+    }
+
+    // ── Phase-1 security regressions (audit C2 / H1) ──────────────────────
+
+    #[test]
+    fn migrated_agent_lands_with_a_fitted_grant_not_full() {
+        use crate::manifest::Capability;
+        // The agent requests only State; on arrival it must hold State + core, and
+        // NOT the full grant the old code handed every migrated agent (H1).
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::State]), None)
+            .unwrap();
+        let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let payload = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+        b.process_migrate(&payload);
+        assert!(b.agents.contains_key("CTR"));
+        assert!(b.granted("CTR", Capability::State)); // requested → granted
+        assert!(b.granted("CTR", Capability::Messaging)); // core
+        assert!(!b.granted("CTR", Capability::Crypto)); // NOT Grant::full() anymore
+        assert!(!b.granted("CTR", Capability::Llm));
+        assert!(!b.granted("CTR", Capability::Spawn));
+    }
+
+    #[test]
+    fn migration_refuses_a_manifest_that_does_not_fit_the_destination() {
+        use crate::manifest::{Capability, NodeProfile};
+        // Source (normal) hosts an Llm-granted agent; the IoT destination offers no
+        // Llm, so the re-fit must reject the migration (H1 — no authority inheritance).
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[Capability::Llm]), None)
+            .unwrap();
+        let mut dst = Node::new("seed-d", "d", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        dst.set_profile(NodeProfile::iot());
+        let payload = a.build_migrate_payload("CTR", &dst.node_pub()).unwrap();
+        dst.process_migrate(&payload);
+        assert!(!dst.agents.contains_key("CTR")); // Llm doesn't fit IoT → refused
+    }
+
+    #[test]
+    fn migration_refuses_a_reserved_uuid() {
+        // A self-signed payload (attacker key) for the reserved id "ams" must be
+        // refused even though its signatures verify (C2 — no system-agent hijack).
+        let attacker = NodeCrypto::generate();
+        let mut dst = Node::new("seed-d", "d", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let manifest = wmanifest(&[]).to_json();
+        let snap =
+            AgentSnapshot::sealed("ams", 1, COUNTER_WASM.as_bytes().to_vec(), Vec::new(), manifest, &attacker);
+        let ho = Handoff::sealed("ams", dst.node_pub().to_vec(), 1, &attacker);
+        let payload = MigratePayload { snapshot: snap, handoff: ho, from_addr: dst.addr.clone() }.encode();
+        dst.process_migrate(&payload);
+        assert!(!dst.agents.contains_key("ams"));
+    }
+
+    #[test]
+    fn migration_refuses_an_origin_key_change() {
+        // First migration pins CTR's origin key; a later self-signed payload under a
+        // different key (even at a higher epoch) is rejected as impersonation (C2).
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
+        let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let p1 = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+        b.process_migrate(&p1);
+        assert!(b.agents.contains_key("CTR")); // first sighting accepted, origin pinned
+
+        let attacker = NodeCrypto::generate();
+        let manifest = wmanifest(&[]).to_json();
+        let snap =
+            AgentSnapshot::sealed("CTR", 99, COUNTER_WASM.as_bytes().to_vec(), Vec::new(), manifest, &attacker);
+        let ho = Handoff::sealed("CTR", b.node_pub().to_vec(), 99, &attacker);
+        let p2 = MigratePayload { snapshot: snap, handoff: ho, from_addr: b.addr.clone() }.encode();
+        b.process_migrate(&p2);
+        assert_eq!(b.seen.get("CTR"), Some(&1)); // epoch-99 impostor rejected; pin held
     }
 }

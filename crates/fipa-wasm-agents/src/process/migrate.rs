@@ -24,6 +24,14 @@ pub fn code_hash(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Length-prefix a field into the signing buffer so adjacent variable-length
+/// fields cannot be re-split to forge an equivalent message (audit L1 — canonical
+/// encoding). Every signed field is framed `[u32 BE len][bytes]`.
+fn put(b: &mut Vec<u8>, field: &[u8]) {
+    b.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    b.extend_from_slice(field);
+}
+
 /// A signed, state-based migration payload for one wasm agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSnapshot {
@@ -36,6 +44,11 @@ pub struct AgentSnapshot {
     pub code: Vec<u8>,
     /// Content address (SHA-256 hex) of the wasm module — always present, signed.
     pub code_hash: String,
+    /// The agent's signed manifest (JSON). The destination re-fits it against its
+    /// own node profile to derive the grant — migration never inherits authority
+    /// (audit H1). Empty only for legacy/native payloads, which are refused.
+    #[serde(default)]
+    pub manifest: Vec<u8>,
     /// The agent's serialized state (from the guest's `snapshot` export).
     pub state: Vec<u8>,
     /// Anti-replay nonce.
@@ -50,12 +63,20 @@ impl AgentSnapshot {
     /// Build a snapshot signed by the origin node `key`. The signature covers the
     /// content `code_hash`, not the bytes — so an inlined or fetched module both
     /// verify against the same signed hash.
-    pub fn sealed(uuid: &str, epoch: u64, code: Vec<u8>, state: Vec<u8>, key: &NodeCrypto) -> Self {
+    pub fn sealed(
+        uuid: &str,
+        epoch: u64,
+        code: Vec<u8>,
+        state: Vec<u8>,
+        manifest: Vec<u8>,
+        key: &NodeCrypto,
+    ) -> Self {
         let mut s = AgentSnapshot {
             uuid: uuid.into(),
             epoch,
             code_hash: code_hash(&code),
             code,
+            manifest,
             state,
             nonce: key.nonce().to_vec(),
             origin_pub: key.public_key().to_vec(),
@@ -66,16 +87,19 @@ impl AgentSnapshot {
     }
 
     /// The bytes covered by the signature: every field except `sig` and the
-    /// (fetchable) `code` — the `code_hash` stands in for the module.
+    /// (fetchable) `code` — the `code_hash` stands in for the module. Every field
+    /// is length-prefixed under a version tag so no two distinct snapshots can
+    /// share one signature (audit L1).
     fn signing_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(self.uuid.as_bytes());
-        b.push(0);
+        b.extend_from_slice(b"fipa:migrate:v2\0");
+        put(&mut b, self.uuid.as_bytes());
         b.extend_from_slice(&self.epoch.to_be_bytes());
-        b.extend_from_slice(self.code_hash.as_bytes());
-        b.extend_from_slice(&self.state);
-        b.extend_from_slice(&self.nonce);
-        b.extend_from_slice(&self.origin_pub);
+        put(&mut b, self.code_hash.as_bytes());
+        put(&mut b, &self.manifest);
+        put(&mut b, &self.state);
+        put(&mut b, &self.nonce);
+        put(&mut b, &self.origin_pub);
         b
     }
 
@@ -135,10 +159,10 @@ impl Handoff {
 
     fn signing_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(self.agent.as_bytes());
-        b.push(0);
-        b.extend_from_slice(&self.from_pub);
-        b.extend_from_slice(&self.to_pub);
+        b.extend_from_slice(b"fipa:handoff:v2\0");
+        put(&mut b, self.agent.as_bytes());
+        put(&mut b, &self.from_pub);
+        put(&mut b, &self.to_pub);
         b.extend_from_slice(&self.epoch.to_be_bytes());
         b
     }
@@ -183,7 +207,7 @@ mod tests {
     #[test]
     fn snapshot_sign_verify_roundtrip() {
         let k = NodeCrypto::generate();
-        let snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa, 0xbb], vec![0, 0, 0, 7], &k);
+        let snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa, 0xbb], vec![0, 0, 0, 7], b"{}".to_vec(), &k);
         assert!(snap.verify());
         let back = AgentSnapshot::decode(&snap.encode()).unwrap();
         assert!(back.verify());
@@ -195,11 +219,14 @@ mod tests {
     #[test]
     fn tampered_snapshot_is_rejected() {
         let k = NodeCrypto::generate();
-        let mut snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![0, 0, 0, 7], &k);
+        let mut snap = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![0, 0, 0, 7], b"{}".to_vec(), &k);
         snap.state = vec![9, 9, 9, 9]; // tamper with the state after signing
         assert!(!snap.verify());
-        let mut snap2 = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![7], &k);
+        let mut snap2 = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![7], b"{}".to_vec(), &k);
         snap2.code = vec![0xff]; // tamper with the code after signing
         assert!(!snap2.verify());
+        let mut snap3 = AgentSnapshot::sealed("CTR", 1, vec![0xaa], vec![7], b"{\"grants\":[]}".to_vec(), &k);
+        snap3.manifest = b"{\"grants\":[\"crypto\"]}".to_vec(); // tamper with the manifest
+        assert!(!snap3.verify());
     }
 }

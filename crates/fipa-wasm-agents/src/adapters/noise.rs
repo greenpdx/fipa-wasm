@@ -87,7 +87,9 @@ impl NodeNoise {
         hs.read_message(&msg, &mut buf).map_err(noise_err)?;
         let n = hs.write_message(&[], &mut buf).map_err(noise_err)?; // -> s, se
         write_blob(s, &buf[..n])?;
-        Ok(NoiseSession { ts: hs.into_transport_mode().map_err(noise_err)? })
+        let ts = hs.into_transport_mode().map_err(noise_err)?;
+        let remote_static = ts.get_remote_static().map(<[u8]>::to_vec).unwrap_or_default();
+        Ok(NoiseSession { ts, remote_static })
     }
 
     /// Run the XX handshake as the responder (the accepting side).
@@ -103,16 +105,27 @@ impl NodeNoise {
         write_blob(s, &buf[..n])?;
         let msg = read_blob(s)?; // <- s, se
         hs.read_message(&msg, &mut buf).map_err(noise_err)?;
-        Ok(NoiseSession { ts: hs.into_transport_mode().map_err(noise_err)? })
+        let ts = hs.into_transport_mode().map_err(noise_err)?;
+        let remote_static = ts.get_remote_static().map(<[u8]>::to_vec).unwrap_or_default();
+        Ok(NoiseSession { ts, remote_static })
     }
 }
 
 /// An established encrypted channel. Frames are `[kind][payload]`, encrypted.
 pub struct NoiseSession {
     ts: TransportState,
+    /// The peer's static Noise public key (X25519), captured at handshake — the
+    /// channel identity a node pins against an allowlist (C2a).
+    remote_static: Vec<u8>,
 }
 
 impl NoiseSession {
+    /// The peer's static Noise public key, or an empty slice if the pattern did
+    /// not carry one (XX always does once the handshake completes).
+    pub fn peer_static(&self) -> &[u8] {
+        &self.remote_static
+    }
+
     pub fn send(&mut self, s: &mut TcpStream, kind: u8, payload: &[u8]) -> io::Result<()> {
         if payload.len() + 1 > MAX_PLAIN {
             return Err(io::Error::new(
