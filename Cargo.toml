@@ -10,6 +10,8 @@
 resolver = "3"
 members = [
     "crates/fipa-wasm-agents",
+    "crates/node-core",
+    "crates/node-shim",
     "crates/unl-core",
     "crates/unl-parser",
     "crates/unl-kb",
@@ -25,6 +27,12 @@ members = [
     "agents/ba",
     "agents/bs",
     "xtask",
+]
+
+# The ESP32 firmware builds only for the *-esp-espidf target with the esp toolchain;
+# keep it out of the host workspace so `cargo build` at the root doesn't try it.
+exclude = [
+    "firmware/esp32-node",
 ]
 
 [workspace.package]
@@ -51,3 +59,14 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+
+# Size-optimized profile for the embedded node-shim firmware (and its host proxy):
+# optimize for size, abort on panic (no unwinder), strip symbols. Mirrors the
+# settings an ESP32 release image would use.
+[profile.min]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

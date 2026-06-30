@@ -103,6 +103,10 @@ derive_more = { version = "2.0", features = ["display", "from", "into"] }
 # UNL semantic content language (the unl-* stack). unl-fipa pulls
 # unl-core/parser/validator/kb/a2a transitively; the others are referenced
 # directly by the content/unl bridge. None of these pull the LLM/HTTP stack.
+# Shared node transport primitives (wire codec + Ed25519 + Noise), also used by
+# the embedded node-shim — one implementation, no duplication.
+node-core = { path = "../node-core" }
+
 unl-fipa = { path = "../unl-fipa" }
 unl-core = { path = "../unl-core" }
 unl-kb = { path = "../unl-kb" }

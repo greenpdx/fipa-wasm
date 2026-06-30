@@ -1,0 +1,19 @@
+# ESP32-C3 (RISC-V) by default — the easiest Rust-on-ESP target (stock toolchain,
+# no Xtensa fork). For classic ESP32 / ESP32-S3 (Xtensa) switch `target` to
+# xtensa-esp32-espidf / xtensa-esp32s3-espidf, install the "esp" channel with
+# espup, and set MCU accordingly.
+[build]
+target = "riscv32imc-esp-espidf"
+
+[target.riscv32imc-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32c3"
+# Pin the IDF version embuild fetches/builds against.
+ESP_IDF_VERSION = "v5.2.2"

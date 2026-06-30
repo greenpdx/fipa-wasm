@@ -1,0 +1,27 @@
+[package]
+name = "esp32-node"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# Standalone (not a workspace member): esp-idf deps only build for the
+# *-esp-espidf target, so this must be built from inside this directory with the
+# esp toolchain installed (see README.md). It path-depends on the shared shim.
+[dependencies]
+node-shim = { path = "../../crates/node-shim" }
+esp-idf-svc = "0.49"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.32"
+
+# Size-first release image. esp-idf manages panic behaviour; opt-z + LTO keep the
+# app side of the image small (the bulk of flash is the esp-idf/Wi-Fi baseline).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = "z"

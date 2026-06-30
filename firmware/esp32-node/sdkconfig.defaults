@@ -1,0 +1,24 @@
+# Size/RAM tuning to keep the whole device under ~400 KB SRAM with Wi-Fi up. The
+# app + shim are tiny; this trims the esp-idf baseline (Wi-Fi buffers + lwIP), which
+# is where the RAM actually goes. Adjust to your traffic — fewer/smaller buffers =
+# less RAM but lower throughput.
+
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_NEWLIB_NANO_FORMAT=y
+
+# Main task stack (the shim run loop runs here).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Wi-Fi buffers — the biggest RAM consumer. These are conservative.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# lwIP — one or two concurrent sockets is plenty for a leaf node.
+CONFIG_LWIP_MAX_SOCKETS=4
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6

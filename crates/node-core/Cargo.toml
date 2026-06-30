@@ -1,0 +1,22 @@
+[package]
+name = "node-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shared FIPA node transport primitives: signed message envelope (R1), Ed25519 identity, and Noise XX channel (R2). Used by both the full node and the embedded node-shim."
+
+# The wire primitives both the server-class node (fipa-wasm-agents) and the
+# embedded node-shim build on. Crypto + Noise + hashing + entropy only — no async
+# runtime, no serde, no wasm.
+[dependencies]
+ed25519-dalek = "2.1"
+rand = "0.9"
+
+# snow with default-features off drops its default-resolver (which bundles AES-GCM
+# + SHA-2 we never use); we supply a custom resolver for the ChaChaPoly/BLAKE2s/
+# X25519 suite from these crates instead (the same ones snow's resolver uses).
+snow = { version = "0.9", default-features = false }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+curve25519-dalek = "4.1"
+rand_core = { version = "0.6", features = ["getrandom"] }
