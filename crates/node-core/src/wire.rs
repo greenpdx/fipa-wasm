@@ -1,5 +1,5 @@
-//! The signed message envelope and its length-prefixed codec (R1) — identical wire
-//! format to the full node, so a shim device and a hosted node interoperate.
+//! The signed message envelope and its length-prefixed codec (R1). The exact wire
+//! format both the full node and the embedded shim speak.
 
 /// A message in flight between nodes. `from_addr` is the sender's return address;
 /// `nonce`/`sig`/`sender_pub` authenticate it.
@@ -10,13 +10,13 @@ pub struct NodeMsg {
     pub from_addr: String,
     pub unl: Vec<u8>,
     pub body: Vec<u8>,
+    /// Anti-replay nonce (16 bytes when signed).
     pub nonce: Vec<u8>,
+    /// Ed25519 signature over [`signing_bytes`] (64 bytes when signed).
     pub sig: Vec<u8>,
+    /// The signing node's public key (32 bytes when signed).
     pub sender_pub: Vec<u8>,
 }
-
-/// Frame kind: an application message (the only kind the shim needs).
-pub const KIND_MSG: u8 = 1;
 
 fn put(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
@@ -24,6 +24,8 @@ fn put(buf: &mut Vec<u8>, b: &[u8]) {
 }
 
 fn get(buf: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+    // checked arithmetic: a length near usize::MAX cannot wrap past the bounds
+    // check into an out-of-range slice on a 32-bit target.
     if p.checked_add(4)? > buf.len() {
         return None;
     }
@@ -75,4 +77,34 @@ pub fn signing_bytes(m: &NodeMsg) -> Vec<u8> {
     put(&mut b, &m.nonce);
     put(&mut b, &m.sender_pub);
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_roundtrips() {
+        let m = NodeMsg {
+            to: "dst".into(),
+            from: "src".into(),
+            from_addr: "127.0.0.1:9".into(),
+            unl: b"obj(ping, x)".to_vec(),
+            body: b"payload".to_vec(),
+            nonce: vec![1; 16],
+            sig: vec![2; 64],
+            sender_pub: vec![3; 32],
+        };
+        let back = decode_msg(&encode_msg(&m)).unwrap();
+        assert_eq!(back.to, m.to);
+        assert_eq!(back.body, m.body);
+        assert_eq!(back.sender_pub, m.sender_pub);
+        // signing bytes exclude the signature
+        assert_eq!(signing_bytes(&m), signing_bytes(&back));
+    }
+
+    #[test]
+    fn truncated_input_is_rejected_not_panicked() {
+        assert!(decode_msg(&[0, 0, 0, 9, 1, 2]).is_none()); // claims 9 bytes, has 2
+    }
 }

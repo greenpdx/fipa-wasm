@@ -8,9 +8,12 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::agent::{Agent, Ctx, Outgoing};
-use crate::crypto::{verify, NodeCrypto};
-use crate::noise::NodeNoise;
-use crate::wire::{decode_msg, encode_msg, signing_bytes, NodeMsg, KIND_MSG};
+use node_core::crypto::{verify, NodeCrypto};
+use node_core::noise::NodeNoise;
+use node_core::wire::{decode_msg, encode_msg, signing_bytes, NodeMsg};
+
+/// Frame kind: an application message (the only kind a leaf device needs).
+const KIND_MSG: u8 = 1;
 
 /// The node shim: identity, return address, learned routes, and the TOFU key table.
 pub struct Shim {

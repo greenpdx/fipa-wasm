@@ -10,6 +10,7 @@
 resolver = "3"
 members = [
     "crates/fipa-wasm-agents",
+    "crates/node-core",
     "crates/node-shim",
     "crates/unl-core",
     "crates/unl-parser",
