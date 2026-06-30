@@ -15,6 +15,7 @@
 
 pub mod crypto;
 pub mod noise;
+mod resolver;
 pub mod wire;
 
 pub use crypto::{verify, NodeCrypto};

@@ -49,7 +49,9 @@ pub struct NodeNoise {
 
 impl NodeNoise {
     pub fn generate() -> Self {
-        let kp = Builder::new(params()).generate_keypair().expect("noise keypair");
+        let kp = Builder::with_resolver(params(), Box::new(crate::resolver::ShimResolver))
+            .generate_keypair()
+            .expect("noise keypair");
         NodeNoise { private: kp.private }
     }
 
@@ -81,7 +83,7 @@ impl NodeNoise {
 
     /// Run the XX handshake as the initiator (the dialing side).
     pub fn connect(&self, s: &mut TcpStream) -> io::Result<NoiseSession> {
-        let mut hs = Builder::new(params())
+        let mut hs = Builder::with_resolver(params(), Box::new(crate::resolver::ShimResolver))
             .local_private_key(&self.private)
             .build_initiator()
             .map_err(noise_err)?;
@@ -99,7 +101,7 @@ impl NodeNoise {
 
     /// Run the XX handshake as the responder (the accepting side).
     pub fn accept(&self, s: &mut TcpStream) -> io::Result<NoiseSession> {
-        let mut hs = Builder::new(params())
+        let mut hs = Builder::with_resolver(params(), Box::new(crate::resolver::ShimResolver))
             .local_private_key(&self.private)
             .build_responder()
             .map_err(noise_err)?;
