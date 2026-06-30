@@ -97,7 +97,9 @@ impl WasmRuntime {
                 let read = |caller: &Caller<'_, HostState>, ptr: i32, len: i32| -> Vec<u8> {
                     let data = memory.data(caller);
                     let start = ptr as usize;
-                    data.get(start..start + len as usize)
+                    // saturating add: a negative/huge ptr or len can never overflow
+                    // into a panic or an out-of-range slice (audit M10).
+                    data.get(start..start.saturating_add(len as usize))
                         .map(<[u8]>::to_vec)
                         .unwrap_or_default()
                 };

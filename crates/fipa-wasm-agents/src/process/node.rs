@@ -370,6 +370,7 @@ pub struct Node {
     code_store: Arc<Mutex<HashMap<String, Vec<u8>>>>,  // content-addressed wasm (CODE_FETCH)
     noise_allow: Option<HashSet<Vec<u8>>>, // C2a: if set, only these peer static keys may connect
     prepared: HashMap<String, Handoff>, // migrated agents mounted-but-suspended, awaiting commit (H3)
+    msg_window: HashMap<String, (u64, u32)>, // H5: per-agent egress rate window (start_ms, count)
 }
 
 impl Node {
@@ -400,6 +401,7 @@ impl Node {
             code_store: Arc::new(Mutex::new(HashMap::new())),
             noise_allow: None,
             prepared: HashMap::new(),
+            msg_window: HashMap::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -585,6 +587,30 @@ impl Node {
             Some("none") => self.local_uuid(to).is_some(),
             _ => true,
         }
+    }
+
+    /// Per-agent egress rate limit (the `msg_per_s` budget, audit H5). A sliding
+    /// one-second window keyed on the *sending* agent; over budget → the message is
+    /// dropped (and audited), never emitted. Native/infra agents (no manifest) are
+    /// trusted and not throttled.
+    fn rate_allows(&mut self, uuid: &str) -> bool {
+        let limit = match self.agents.get(uuid) {
+            Some(m) if m.manifest.is_some() => m.grant.budget.msg_per_s,
+            _ => return true, // native/infra or unknown → not rate-limited
+        };
+        if limit == 0 {
+            return true;
+        }
+        let now = now_ms();
+        let slot = self.msg_window.entry(uuid.to_string()).or_insert((now, 0));
+        if now.saturating_sub(slot.0) >= 1000 {
+            *slot = (now, 0); // new window
+        }
+        if slot.1 >= limit {
+            return false;
+        }
+        slot.1 += 1;
+        true
     }
 
     /// Mount a **mobile wasm agent** from its module bytes + `manifest` (HEAD) — only
@@ -1249,6 +1275,11 @@ impl Node {
             self.apply_infer_reqs(&uuid, infers);
             self.apply_spawn_reqs(&uuid, spawns);
             for s in sends {
+                if !self.rate_allows(&uuid) {
+                    self.audit(&uuid, "denied:rate", &s.receiver);
+                    crate::flow!("[{}] ⛔ msg-rate denied for '{}'", self.label, uuid);
+                    continue;
+                }
                 if !self.net_allows(&uuid, &s.receiver) {
                     self.audit(&uuid, "denied:net", &s.receiver);
                     crate::flow!("[{}] ⛔ net-scope denied: '{}' → '{}'", self.label, uuid, s.receiver);
@@ -1363,6 +1394,10 @@ impl Node {
     /// via the executor, cross-node → sealed over Noise / sink.
     fn dispatch(&mut self, from: &str, sends: Vec<OutboundIntent>) {
         for s in sends {
+            if !self.rate_allows(from) {
+                self.audit(from, "denied:rate", &s.receiver);
+                continue;
+            }
             if !self.net_allows(from, &s.receiver) {
                 continue;
             }
@@ -1689,6 +1724,23 @@ mod tests {
         assert!(!n.net_allows("W", "ams")); // net=none: cannot reach a remote/platform target
         assert!(n.net_allows("W", "seed")); // a co-located agent → allowed
         assert!(n.net_allows("seed", "ams")); // native full grant (net=platform) → allowed
+    }
+
+    #[test]
+    fn msg_rate_is_capped_per_window() {
+        let mut n = Node::new("seed", "s", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let mut m = wmanifest(&[]);
+        m.budget.msg_per_s = 3; // tiny egress budget
+        n.mount_wasm("W", "w", COUNTER_WASM.as_bytes().to_vec(), &m, None).unwrap();
+        // the first 3 emits in the window pass; the 4th is throttled (H5)
+        assert!(n.rate_allows("W"));
+        assert!(n.rate_allows("W"));
+        assert!(n.rate_allows("W"));
+        assert!(!n.rate_allows("W"));
+        // a native/infra agent (no manifest) is trusted and never throttled
+        for _ in 0..100 {
+            assert!(n.rate_allows("seed"));
+        }
     }
 
     #[test]
