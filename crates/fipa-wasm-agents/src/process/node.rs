@@ -54,7 +54,8 @@ const KIND_RESOLVE_RESP: u8 = 3;
 const KIND_MIGRATE: u8 = 4;
 const KIND_CODE_FETCH: u8 = 5; // request a wasm module by content hash
 const KIND_CODE_BLOB: u8 = 6; // the module bytes (empty = unknown hash)
-const KIND_MIGRATE_ACK: u8 = 7; // destination confirms it mounted the migrated agent
+const KIND_MIGRATE_ACK: u8 = 7; // destination confirms it mounted the migrated agent (prepared)
+const KIND_MIGRATE_COMMIT: u8 = 8; // source activates the prepared agent once it has tombstoned
 
 /// A short dial timeout bounds connect/read/write so a slow or hostile peer cannot
 /// stall a handler (R4; partial mitigation of `THREAT_MODEL.md` H3). The frame-size
@@ -258,6 +259,7 @@ fn handle_conn(
     in_tx: &Sender<NodeMsg>,
     rz_tx: &Sender<(String, Sender<String>)>,
     mg_tx: &Sender<(Vec<u8>, Sender<bool>)>,
+    mg_fin_tx: &Sender<(String, bool)>,
     code_store: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
     allow: Option<Arc<HashSet<Vec<u8>>>>,
 ) {
@@ -287,10 +289,18 @@ fn handle_conn(
                 // keep reading — the channel is persistent
             }
             KIND_MIGRATE => {
+                // Decode the uuid up front (payload is moved into the channel) so the
+                // finalize step can name the prepared agent.
+                let uuid = MigratePayload::decode(&payload).map(|mp| mp.snapshot.uuid).unwrap_or_default();
                 let (resp_tx, resp_rx) = std::sync::mpsc::channel();
                 if mg_tx.send((payload, resp_tx)).is_ok() {
                     if let Ok(true) = resp_rx.recv_timeout(Duration::from_secs(5)) {
-                        let _ = sess.send(&mut s, KIND_MIGRATE_ACK, b""); // confirm mount
+                        // Prepared — confirm so the source tombstones, then await the
+                        // COMMIT that activates us. No COMMIT (timeout/EOF) → abort.
+                        let _ = sess.send(&mut s, KIND_MIGRATE_ACK, b"");
+                        s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+                        let commit = matches!(sess.recv(&mut s), Ok((KIND_MIGRATE_COMMIT, _)));
+                        let _ = mg_fin_tx.send((uuid, commit));
                     }
                 }
                 return; // one-shot
@@ -328,6 +338,7 @@ struct Mounted {
     epoch: u64,            // this agent's location epoch (R6)
     grant: Grant,          // M2: the agent's effective capability authority
     manifest: Option<Manifest>, // the signed manifest, carried on migration to re-fit (H1)
+    active: bool,          // false while a migrated agent is prepared but not yet committed (H3/H4)
 }
 
 /// A node: one **or more** local agents, a TCP address, a routing table, and the
@@ -358,6 +369,7 @@ pub struct Node {
     conns: HashMap<String, (TcpStream, NoiseSession)>, // persistent KIND_MSG channels per peer
     code_store: Arc<Mutex<HashMap<String, Vec<u8>>>>,  // content-addressed wasm (CODE_FETCH)
     noise_allow: Option<HashSet<Vec<u8>>>, // C2a: if set, only these peer static keys may connect
+    prepared: HashMap<String, Handoff>, // migrated agents mounted-but-suspended, awaiting commit (H3)
 }
 
 impl Node {
@@ -387,6 +399,7 @@ impl Node {
             conns: HashMap::new(),
             code_store: Arc::new(Mutex::new(HashMap::new())),
             noise_allow: None,
+            prepared: HashMap::new(),
         };
         node.mount(uuid, alias, agent, None);
         node
@@ -423,6 +436,7 @@ impl Node {
                 epoch: 0,
                 grant: Grant::full(), // native = trusted infra template
                 manifest: None,       // native agents are stationary (not mobile)
+                active: true,
             },
         );
         self.provision_state(uuid);
@@ -603,6 +617,7 @@ impl Node {
                 epoch: 0,
                 grant,
                 manifest: Some(manifest.clone()),
+                active: true,
             },
         );
         self.provision_state(uuid);
@@ -730,7 +745,9 @@ impl Node {
             let m = self.agents.get_mut(uuid)?;
             let code = m.code.clone()?; // only wasm (mobile) agents have code
             let manifest_json = m.manifest.as_ref()?.to_json(); // mobile agents carry a manifest
-            (code, m.epoch + 1, m.runtime.snapshot(), manifest_json)
+            let epoch = m.epoch + 1;
+            m.epoch = epoch; // persist the bump so a retried migration advances past `seen` (H3)
+            (code, epoch, m.runtime.snapshot(), manifest_json)
         };
         self.cache_code(code.clone());
         let snapshot = AgentSnapshot::sealed(uuid, epoch, code, state, manifest_json, &self.key);
@@ -746,18 +763,48 @@ impl Node {
         let payload = self
             .build_migrate_payload(uuid, dest_pub)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "agent not mobile / absent"))?;
+        // Suspend the local agent for the whole handoff so it never runs concurrently
+        // with the destination's (prepared) copy — no double execution / fork (H4).
+        if let Some(m) = self.agents.get_mut(uuid) {
+            m.active = false;
+        }
+        match self.send_migration(dest_addr, &payload) {
+            Ok(()) => {
+                // The destination has prepared the agent and we have told it to
+                // commit; tombstone the local copy (no loss — see send_migration).
+                if let Some(m) = self.agents.remove(uuid) {
+                    self.aliases.remove(&m.alias);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // The move did not complete: resume the local agent (no loss, no fork —
+                // the destination never activates without our COMMIT).
+                if let Some(m) = self.agents.get_mut(uuid) {
+                    m.active = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The migration exchange (source side). Send the signed payload, await the
+    /// destination's prepare-ACK with a timeout **strictly greater** than the
+    /// destination's mount budget so a busy destination cannot time us out into a
+    /// fork (H3), then send the COMMIT that activates the prepared agent. Returns
+    /// `Ok` only once the destination has acknowledged the prepared mount; the
+    /// caller then tombstones. On any error the caller resumes the local agent, and
+    /// the destination — having received no COMMIT — aborts its prepared copy.
+    fn send_migration(&self, dest_addr: &str, payload: &[u8]) -> io::Result<()> {
         let mut s = dial(dest_addr)?;
+        s.set_read_timeout(Some(Duration::from_secs(8))).ok(); // > the destination's 5s wait (H3)
         let mut sess = self.noise.connect(&mut s)?;
-        sess.send(&mut s, KIND_MIGRATE, &payload)?;
-        // Crash-safety: tombstone the local copy only after the destination confirms
-        // it mounted the agent (KIND_MIGRATE_ACK); otherwise the agent is kept (no loss).
+        sess.send(&mut s, KIND_MIGRATE, payload)?;
         let (kind, _) = sess.recv(&mut s)?;
         if kind != KIND_MIGRATE_ACK {
             return Err(io::Error::new(io::ErrorKind::Other, "migration not acknowledged"));
         }
-        if let Some(m) = self.agents.remove(uuid) {
-            self.aliases.remove(&m.alias);
-        }
+        sess.send(&mut s, KIND_MIGRATE_COMMIT, b"")?;
         Ok(())
     }
 
@@ -765,13 +812,17 @@ impl Node {
     /// this node, guard against replay (epoch must advance), instantiate the wasm
     /// from the carried code, restore state, mount it, and re-bind at AMS carrying
     /// the handoff so the AMS node can move the agent's authorized key.
-    fn process_migrate(&mut self, payload: &[u8]) {
-        let Some(mp) = MigratePayload::decode(payload) else { return };
+    /// Returns `true` only when *this* payload mounts (prepares) an agent, so the
+    /// ACK reflects an actual mount rather than the mere presence of some agent with
+    /// that uuid (H2). The agent is mounted **suspended** and is not activated (nor
+    /// re-bound at AMS, nor recorded in `seen`) until [`Node::commit_migrated`].
+    fn process_migrate(&mut self, payload: &[u8]) -> bool {
+        let Some(mp) = MigratePayload::decode(payload) else { return false };
         let from_addr = mp.from_addr.clone();
         let (snap, ho) = (mp.snapshot, mp.handoff);
         if !snap.verify() || !ho.verify() {
             crate::flow!("[{}] ⛔ migrate: bad snapshot/handoff signature", self.label);
-            return;
+            return false;
         }
         if ho.to_pub != self.key.public_key()
             || ho.agent != snap.uuid
@@ -779,17 +830,17 @@ impl Node {
             || ho.from_pub != snap.origin_pub
         {
             crate::flow!("[{}] ⛔ migrate: handoff not for me / inconsistent", self.label);
-            return;
+            return false;
         }
         // C2 — reject reserved system ids and refuse to overwrite a locally-born
         // (non-migrated) agent, so an unauthenticated peer cannot hijack an identity.
         if adapters::is_reserved_sender(&snap.uuid) {
             crate::flow!("[{}] ⛔ migrate: reserved id '{}' refused", self.label, snap.uuid);
-            return;
+            return false;
         }
         if self.agents.contains_key(&snap.uuid) && !self.seen.contains_key(&snap.uuid) {
             crate::flow!("[{}] ⛔ migrate: '{}' collides with a local agent", self.label, snap.uuid);
-            return;
+            return false;
         }
         // C2 — origin authenticity: the snapshot must be signed by the agent's
         // currently-authorized node key. A known key MUST match; first sighting is
@@ -800,25 +851,25 @@ impl Node {
             if known.as_slice() != snap.origin_pub.as_slice() {
                 self.audit(&snap.uuid, "migrate:bad-origin", "origin key != authorized key");
                 crate::flow!("[{}] ⛔ migrate: origin key ≠ authorized key for '{}'", self.label, snap.uuid);
-                return;
+                return false;
             }
         }
         if self.seen.get(&snap.uuid).is_some_and(|&e| snap.epoch <= e) {
             crate::flow!("[{}] ⛔ migrate: replayed epoch {} for '{}'", self.label, snap.epoch, snap.uuid);
-            return;
+            return false;
         }
         // H1 — re-fit the carried manifest against THIS node's profile; migration
         // never inherits authority and never runs at Grant::full().
         let Some(manifest) = Manifest::from_json(&snap.manifest) else {
             crate::flow!("[{}] ⛔ migrate: missing/invalid manifest", self.label);
-            return;
+            return false;
         };
         let grant = match self.profile.fit(&manifest) {
             Ok(g) => g,
             Err(e) => {
                 self.audit(&snap.uuid, "migrate:unfit", &format!("{e:?}"));
                 crate::flow!("[{}] ⛔ migrate: manifest does not fit node profile: {e:?}", self.label);
-                return;
+                return false;
             }
         };
         // resolve the wasm: inline if present (cache it), else CODE_FETCH from origin
@@ -830,7 +881,7 @@ impl Node {
                 Some(c) => c,
                 None => {
                     crate::flow!("[{}] ⛔ migrate: code unavailable (CODE_FETCH failed)", self.label);
-                    return;
+                    return false;
                 }
             }
         };
@@ -838,7 +889,7 @@ impl Node {
             Ok(rt) => rt,
             Err(_) => {
                 crate::flow!("[{}] ⛔ migrate: code won't instantiate", self.label);
-                return;
+                return false;
             }
         };
         runtime.restore(&snap.state);
@@ -859,22 +910,56 @@ impl Node {
                 epoch: snap.epoch,
                 grant,
                 manifest: Some(manifest),
+                active: false, // prepared: not live until the source COMMITs (H3/H4)
             },
         );
         self.provision_state(&snap.uuid);
         self.provision_crypto(&snap.uuid);
-        self.seen.insert(snap.uuid.clone(), snap.epoch);
-        crate::flow!("[{}] ⇇ migrated '{}' arrived (epoch {})", self.label, snap.uuid, snap.epoch);
+        // Stash the handoff for the AMS re-bind that happens at commit; `seen` and
+        // the AMS binding are deferred so an aborted prepare leaves no trace.
+        self.prepared.insert(snap.uuid.clone(), ho);
+        crate::flow!("[{}] ⇉ migrated '{}' prepared (epoch {})", self.label, snap.uuid, snap.epoch);
+        true
+    }
 
-        // Re-bind at AMS, carrying the handoff so the AMS node moves the TOFU key.
-        if self.routes.contains_key("ams") {
-            let ho_json = serde_json::to_value(&ho).unwrap_or_default();
-            let body = serde_json::json!({
-                "agent": snap.uuid, "address": self.addr, "epoch": snap.epoch, "handoff": ho_json
-            })
-            .to_string();
-            self.send_as(&snap.uuid, "ams", b"obj(bind, agent)", body.as_bytes());
+    /// Finalize a prepared migration: activate the agent, record the epoch in the
+    /// replay guard, and re-bind it at AMS carrying the handoff (H3). Called when the
+    /// source confirms — by COMMIT — that it has tombstoned its copy.
+    fn commit_migrated(&mut self, uuid: &str) {
+        let epoch = match self.agents.get_mut(uuid) {
+            Some(m) if !m.active => {
+                m.active = true;
+                m.epoch
+            }
+            _ => return, // unknown or already committed
+        };
+        self.seen.insert(uuid.to_string(), epoch);
+        crate::flow!("[{}] ⇇ migrated '{}' committed (epoch {})", self.label, uuid, epoch);
+        if let Some(ho) = self.prepared.remove(uuid) {
+            if self.routes.contains_key("ams") {
+                let ho_json = serde_json::to_value(&ho).unwrap_or_default();
+                let body = serde_json::json!({
+                    "agent": uuid, "address": self.addr, "epoch": epoch, "handoff": ho_json
+                })
+                .to_string();
+                self.send_as(uuid, "ams", b"obj(bind, agent)", body.as_bytes());
+            }
         }
+    }
+
+    /// Discard a prepared migration that the source never committed (the source
+    /// timed out, errored, or chose to keep its copy) — leaving no trace, so a clean
+    /// retry can prepare again.
+    fn abort_prepared(&mut self, uuid: &str) {
+        match self.agents.get(uuid) {
+            Some(m) if !m.active => {}
+            _ => return, // unknown or already committed — never tear down a live agent
+        }
+        if let Some(m) = self.agents.remove(uuid) {
+            self.aliases.remove(&m.alias);
+        }
+        self.prepared.remove(uuid);
+        crate::flow!("[{}] ⛔ migrated '{}' aborted (no commit)", self.label, uuid);
     }
 
     /// Stamp `sender_pub`/`nonce` and sign a message with this node's key (R1).
@@ -902,6 +987,7 @@ impl Node {
         let (in_tx, in_rx) = std::sync::mpsc::channel::<NodeMsg>();
         let (rz_tx, rz_rx) = std::sync::mpsc::channel::<(String, Sender<String>)>();
         let (mg_tx, mg_rx) = std::sync::mpsc::channel::<(Vec<u8>, Sender<bool>)>();
+        let (mg_fin_tx, mg_fin_rx) = std::sync::mpsc::channel::<(String, bool)>(); // (uuid, commit?)
         let (llm_tx, llm_rx) = std::sync::mpsc::channel::<(String, u64, String)>();
         let conns = Arc::new(AtomicUsize::new(0));
         let allow = self.noise_allow.clone().map(Arc::new); // C2a: shared per-connection
@@ -930,12 +1016,23 @@ impl Node {
                 let _ = resp.send(addr);
             }
 
-            // 3b. Migrated agents handed over by a connection thread; confirm mount
-            //     so the source can safely tombstone (crash-safety).
+            // 3b. Migrated agents handed over by a connection thread; ACK only if
+            //     THIS payload actually prepared a mount (H2), so a rejected/replayed
+            //     payload never elicits a spurious ACK that would tombstone the source.
             while let Ok((payload, resp)) = mg_rx.try_recv() {
-                let uuid = MigratePayload::decode(&payload).map(|mp| mp.snapshot.uuid).unwrap_or_default();
-                self.process_migrate(&payload);
-                let _ = resp.send(!uuid.is_empty() && self.agents.contains_key(&uuid));
+                let mounted = self.process_migrate(&payload);
+                let _ = resp.send(mounted);
+            }
+
+            // 3b'. Finalize a prepared migration once the source decides: commit
+            //      (activate + AMS re-bind) on COMMIT, else abort (drop the prepared
+            //      copy). The agent is live on exactly one node across the handoff.
+            while let Ok((uuid, commit)) = mg_fin_rx.try_recv() {
+                if commit {
+                    self.commit_migrated(&uuid);
+                } else {
+                    self.abort_prepared(&uuid);
+                }
             }
 
             // 3c. Fire any due timers (M3 scheduling — agent autonomy).
@@ -989,17 +1086,18 @@ impl Node {
                         continue; // drop (the connection closes) — bounded resource use
                     }
                     conns.fetch_add(1, Ordering::Relaxed);
-                    let (noise, in_tx, rz_tx, mg_tx, cs, conns2, al) = (
+                    let (noise, in_tx, rz_tx, mg_tx, mg_fin_tx, cs, conns2, al) = (
                         self.noise.clone(),
                         in_tx.clone(),
                         rz_tx.clone(),
                         mg_tx.clone(),
+                        mg_fin_tx.clone(),
                         self.code_store.clone(),
                         conns.clone(),
                         allow.clone(),
                     );
                     std::thread::spawn(move || {
-                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &cs, al);
+                        handle_conn(s, &noise, &in_tx, &rz_tx, &mg_tx, &mg_fin_tx, &cs, al);
                         conns2.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -1125,6 +1223,11 @@ impl Node {
                 self.audit(&uuid, "quarantined", "message dropped");
                 continue;
             }
+            // A migrated agent that is prepared-but-not-committed is not yet live
+            // (H3/H4): hold delivery until it commits or is aborted.
+            if !self.agents.get(&uuid).map(|m| m.active).unwrap_or(false) {
+                continue;
+            }
             // Cache the sender's return address so replies have a route.
             if !m.from.is_empty() && !m.from_addr.is_empty() {
                 self.routes.insert(m.from.clone(), m.from_addr.clone());
@@ -1237,6 +1340,9 @@ impl Node {
         let now = now_ms();
         let (result, sends, ops, infers, spawns) = {
             let Some(m) = self.agents.get_mut(uuid) else { return };
+            if !m.active {
+                return; // a prepared-but-uncommitted migrated agent does not tick (H4)
+            }
             let result = m.runtime.tick(timer_id, now);
             (
                 result,
@@ -1803,13 +1909,14 @@ mod tests {
         let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
         let payload = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
 
-        b.process_migrate(&payload);
+        assert!(b.process_migrate(&payload)); // prepared (suspended)
+        b.commit_migrated("CTR"); // finalize: activate + record the epoch
         // B now hosts CTR with the migrated state (n = 3)
         assert_eq!(b.agents.get_mut("CTR").unwrap().runtime.snapshot(), vec![3, 0, 0, 0]);
         assert_eq!(b.seen.get("CTR"), Some(&1));
 
-        // a replay of the same epoch is rejected (E)
-        b.process_migrate(&payload);
+        // a replay of the same epoch is rejected (E) — and does not prepare a mount
+        assert!(!b.process_migrate(&payload));
         assert_eq!(b.seen.get("CTR"), Some(&1));
     }
 
@@ -1898,7 +2005,8 @@ mod tests {
         a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
         let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
         let p1 = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
-        b.process_migrate(&p1);
+        assert!(b.process_migrate(&p1));
+        b.commit_migrated("CTR");
         assert!(b.agents.contains_key("CTR")); // first sighting accepted, origin pinned
 
         let attacker = NodeCrypto::generate();
@@ -1907,7 +2015,44 @@ mod tests {
             AgentSnapshot::sealed("CTR", 99, COUNTER_WASM.as_bytes().to_vec(), Vec::new(), manifest, &attacker);
         let ho = Handoff::sealed("CTR", b.node_pub().to_vec(), 99, &attacker);
         let p2 = MigratePayload { snapshot: snap, handoff: ho, from_addr: b.addr.clone() }.encode();
-        b.process_migrate(&p2);
+        assert!(!b.process_migrate(&p2)); // impostor key → not prepared
         assert_eq!(b.seen.get("CTR"), Some(&1)); // epoch-99 impostor rejected; pin held
+    }
+
+    // ── Phase-2 two-phase migration (audit H2 / H3 / H4) ──────────────────
+
+    #[test]
+    fn a_prepared_migration_does_not_run_until_committed() {
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
+        let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let payload = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+        assert!(b.process_migrate(&payload)); // prepared, suspended
+        assert!(b.agents.contains_key("CTR"));
+        assert!(!b.agents.get("CTR").unwrap().active); // not live yet (H4)
+
+        // Delivery to a prepared agent is held — its state must not advance.
+        b.pump(NodeMsg { to: "CTR".into(), from: "CTR".into(), unl: b"inc".to_vec(), ..Default::default() });
+        assert_eq!(b.agents.get_mut("CTR").unwrap().runtime.snapshot(), vec![0, 0, 0, 0]);
+
+        b.commit_migrated("CTR");
+        assert!(b.agents.get("CTR").unwrap().active);
+        b.pump(NodeMsg { to: "CTR".into(), from: "CTR".into(), unl: b"inc".to_vec(), ..Default::default() });
+        assert_eq!(b.agents.get_mut("CTR").unwrap().runtime.snapshot(), vec![1, 0, 0, 0]); // now it runs
+    }
+
+    #[test]
+    fn an_aborted_migration_leaves_no_trace_and_allows_retry() {
+        let mut a = Node::new("seed-a", "a", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        a.mount_wasm("CTR", "ctr", COUNTER_WASM.as_bytes().to_vec(), &wmanifest(&[]), None).unwrap();
+        let mut b = Node::new("seed-b", "b", "127.0.0.1:0", Box::new(NativeRuntime::new(Ponger)));
+        let payload = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+        assert!(b.process_migrate(&payload));
+        b.abort_prepared("CTR");
+        assert!(!b.agents.contains_key("CTR")); // prepared mount torn down
+        assert!(b.seen.get("CTR").is_none()); // no replay-guard trace left behind
+        // A clean retry (epoch bumped) prepares again.
+        let payload2 = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
+        assert!(b.process_migrate(&payload2));
     }
 }
