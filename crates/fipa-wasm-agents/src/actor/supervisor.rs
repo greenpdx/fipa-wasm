@@ -271,8 +271,10 @@ impl Supervisor {
 
                 let agent_id = agent_id.clone();
                 ctx.run_later(delay, move |actor, ctx| {
-                    if let Some(supervised) = actor.agents.get(&agent_id.name) {
-                        // Attempt restart
+                    // Remove the failed entry first (L5): spawn_agent refuses a name
+                    // that already exists, so leaving the Failed record in place wedged
+                    // every restart into "already exists".
+                    if let Some(supervised) = actor.agents.remove(&agent_id.name) {
                         let config = supervised.config.clone();
                         match actor.spawn_agent(config, ctx) {
                             Ok(_) => {

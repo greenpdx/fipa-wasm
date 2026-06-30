@@ -45,6 +45,11 @@ impl WasmRuntime {
         config.wasm_component_model(true);
         config.async_support(false);
         config.consume_fuel(true);
+        // CPU is bounded by fuel: every guest instruction costs fuel and a runaway
+        // loop traps when the per-call budget is exhausted. A wall-clock epoch
+        // interrupt (audit L3) would only add value once a *blocking* host import
+        // exists (none do today — all host calls return immediately), and it needs a
+        // shared-engine watchdog; deferred until that architecture lands.
         let engine = Engine::new(&config)?;
         let module = Module::new(&engine, code)?;
         let host_state = HostState::new(capabilities.clone());
@@ -254,7 +259,7 @@ impl WasmRuntime {
     /// validates each against the receiver's vocabulary, packages it, and
     /// transmits it.
     pub fn take_unl_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Capture the agent's state via its `snapshot` export (state-based migration).

@@ -86,12 +86,14 @@ fn put(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(b);
 }
 fn get(buf: &[u8], p: &mut usize) -> Option<Vec<u8>> {
-    if *p + 4 > buf.len() {
+    // checked arithmetic: a length near usize::MAX cannot wrap past the bounds check
+    // into an out-of-range slice on a 32-bit target (audit L6).
+    if p.checked_add(4)? > buf.len() {
         return None;
     }
     let n = u32::from_be_bytes(buf[*p..*p + 4].try_into().ok()?) as usize;
     *p += 4;
-    if *p + n > buf.len() {
+    if p.checked_add(n)? > buf.len() {
         return None;
     }
     let v = buf[*p..*p + n].to_vec();
@@ -334,7 +336,7 @@ fn handle_conn(
             }
             KIND_CODE_FETCH => {
                 let hash = String::from_utf8_lossy(&payload).to_string();
-                let code = code_store.lock().unwrap().get(&hash).cloned().unwrap_or_default();
+                let code = code_store.lock().unwrap_or_else(|e| e.into_inner()).get(&hash).cloned().unwrap_or_default();
                 let _ = sess.send(&mut s, KIND_CODE_BLOB, &code); // empty = unknown
                 return; // one-shot
             }
@@ -771,7 +773,7 @@ impl Node {
 
     /// Cache a wasm module by its content hash (so this node can serve CODE_FETCH).
     pub fn cache_code(&self, code: Vec<u8>) {
-        self.code_store.lock().unwrap().insert(code_hash(&code), code);
+        self.code_store.lock().unwrap_or_else(|e| e.into_inner()).insert(code_hash(&code), code);
     }
 
     /// Fetch a wasm module by content `hash` from the peer at `addr`, verify it
@@ -1299,7 +1301,12 @@ impl Node {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.body) else { return false };
         let Some(ho_val) = v.get("handoff") else { return false };
         let Ok(ho) = serde_json::from_value::<Handoff>(ho_val.clone()) else { return false };
+        // L4 — tie the handoff to the bind it rides on: its epoch must match the
+        // bind's epoch, so a once-valid handoff cannot be replayed onto a different
+        // bind. (When the bind carries no epoch, fall back to the handoff's own.)
+        let bind_epoch = v.get("epoch").and_then(|e| e.as_u64()).unwrap_or(ho.epoch);
         ho.verify()
+            && ho.epoch == bind_epoch
             && ho.agent == m.from
             && ho.from_pub.as_slice() == &from_key[..]
             && ho.to_pub.as_slice() == &to_key[..]
@@ -2232,5 +2239,31 @@ mod tests {
         // A clean retry (epoch bumped) prepares again.
         let payload2 = a.build_migrate_payload("CTR", &b.node_pub()).unwrap();
         assert!(b.process_migrate(&payload2));
+    }
+
+    #[test]
+    fn handoff_with_mismatched_epoch_is_rejected() {
+        // A handoff authorizes a key change only for the bind epoch it rides on; a
+        // bind body claiming a different epoch must be rejected (audit L4).
+        let mut n = dummy_node();
+        let (ka, kb) = (NodeCrypto::generate(), NodeCrypto::generate());
+        let sign = |k: &NodeCrypto, from: &str, body: Vec<u8>| {
+            let mut m = NodeMsg { to: "ams".into(), from: from.into(), body, ..Default::default() };
+            m.sender_pub = k.public_key().to_vec();
+            m.nonce = k.nonce().to_vec();
+            m.sig = k.sign(&signing_bytes(&m)).to_vec();
+            m
+        };
+        let m1 = sign(&ka, "X", Vec::new());
+        assert!(n.wire_admit(&m1) && n.authorize(&m1)); // X owned by A (TOFU)
+
+        let ho = Handoff::sealed("X", kb.public_key().to_vec(), 1, &ka); // handoff at epoch 1
+        let bad = serde_json::json!({ "epoch": 2, "handoff": serde_json::to_value(&ho).unwrap() }).to_string();
+        let m2 = sign(&kb, "X", bad.into_bytes());
+        assert!(n.wire_admit(&m2) && !n.authorize(&m2)); // bind epoch 2 ≠ handoff epoch 1 → rejected
+
+        let good = serde_json::json!({ "epoch": 1, "handoff": serde_json::to_value(&ho).unwrap() }).to_string();
+        let m3 = sign(&kb, "X", good.into_bytes());
+        assert!(n.wire_admit(&m3) && n.authorize(&m3)); // epochs match → accepted
     }
 }

@@ -101,7 +101,7 @@ impl AgentRuntime for WasmiModule {
     }
 
     fn take_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn run(&mut self) -> Result<bool> {
@@ -145,7 +145,7 @@ impl WasmiModule {
 
     /// Drain the messages the agent emitted via `send-unl` (the node's sink).
     pub fn take_sends(&mut self) -> Vec<OutboundIntent> {
-        std::mem::take(&mut *self.hooks.sends.lock().unwrap())
+        std::mem::take(&mut *self.hooks.sends.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
